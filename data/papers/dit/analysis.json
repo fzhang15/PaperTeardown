@@ -1,0 +1,332 @@
+{
+  "chapters": [
+    {
+      "id": "the-problem",
+      "title": "The Problem: Why Replace U-Net with a Transformer?",
+      "narrative": "Diffusion models had achieved state-of-the-art image synthesis by 2022, but nearly all of them shared the same backbone: the U-Net, a convolutional architecture with skip connections designed for pixel-level prediction. The U-Net works well, but it has a fundamental limitation — it doesn't follow transformer scaling laws.\n\nThe transformer hypothesis is straightforward: given sufficient compute, transformers consistently outperform convolutional networks as model size grows. This had been demonstrated in language (GPT), vision classification (ViT), and video — but not yet in generative modeling.\n\nDiT (Diffusion Transformers) asks a simple question: if we replace the U-Net backbone with a Vision Transformer, does the same scaling behavior emerge? The answer turns out to be yes. DiT models exhibit a clear negative correlation between FID score and compute (Gflops) — larger models consistently generate better images.\n\nThe approach builds on Latent Diffusion Models (LDMs), which operate in the compressed latent space of a pretrained VAE rather than in pixel space. This is crucial: a 256×256 image becomes a 32×32×4 latent, making it tractable for a pure transformer that treats every spatial location as a token.\n\nThe main architectural challenge is conditioning: diffusion models must accept two conditioning signals — the noise timestep t and (for class-conditional generation) a class label y. DiT's solution is adaptive layer norm zero (adaLN-Zero), which we'll examine in detail in Chapter 5.",
+      "code_blocks": []
+    },
+    {
+      "id": "latent-diffusion",
+      "title": "Latent Diffusion: Working in Compressed Space",
+      "narrative": "DiT doesn't operate on raw pixels — it operates on latents produced by a frozen VAE (variational autoencoder). This design choice, inherited from Stable Diffusion's Latent Diffusion Model framework, is what makes transformer-based diffusion tractable.\n\nThe VAE compresses 256×256 RGB images (3 channels) down to 32×32 latents (4 channels) — a spatial compression factor of 8×. This means DiT processes a sequence of (32/patch_size)² tokens instead of 256² tokens. With patch_size=2, that's only 256 tokens — comparable to a small ViT, not a massive sequence model.\n\nDuring training, each image is encoded once per step by the frozen VAE encoder. The resulting latent is then noised at a random timestep t and passed to DiT for denoising. The 0.18215 scale factor is a dataset-specific normalization constant that brings the VAE latents to roughly unit variance — important for stable diffusion training.\n\nThe diffusion process itself (noise schedule, loss computation) is handled by a GaussianDiffusion scheduler adapted from OpenAI's guided-diffusion codebase. DiT just has to predict the noise (epsilon) added at each timestep.",
+      "code_blocks": [
+        {
+          "label": "Model setup: latent size derived from VAE compression",
+          "source": "    # Create model:\n    assert args.image_size % 8 == 0, \"Image size must be divisible by 8 (for the VAE encoder).\"\n    latent_size = args.image_size // 8\n    model = DiT_models[args.model](\n        input_size=latent_size,\n        num_classes=args.num_classes\n    )\n    # Note that parameter initialization is done within the DiT constructor\n    ema = deepcopy(model).to(device)  # Create an EMA of the model for use after training\n    requires_grad(ema, False)\n    model = DDP(model.to(device), device_ids=[rank])\n    diffusion = create_diffusion(timestep_respacing=\"\")  # default: 1000 steps, linear noise schedule\n    vae = AutoencoderKL.from_pretrained(f\"stabilityai/sd-vae-ft-{args.vae}\").to(device)",
+          "source_start_line": 139,
+          "file_path": "train.py",
+          "annotations": [
+            {
+              "start_line": 141,
+              "end_line": 141,
+              "explanation": "The VAE compresses images at 8× spatial resolution. A 256×256 image becomes a 32×32 latent. DiT's input_size is set to this latent resolution, not the pixel resolution.",
+              "concept_tag": "embedding"
+            },
+            {
+              "start_line": 150,
+              "end_line": 151,
+              "explanation": "Two separate components: GaussianDiffusion handles the noise schedule and loss computation, while the pretrained VAE (from Stable Diffusion) handles pixel↔latent conversion. The VAE is frozen throughout training.",
+              "concept_tag": "other:diffusion"
+            }
+          ]
+        },
+        {
+          "label": "Training loop: VAE encoding and diffusion loss",
+          "source": "        for x, y in loader:\n            x = x.to(device)\n            y = y.to(device)\n            with torch.no_grad():\n                # Map input images to latent space + normalize latents:\n                x = vae.encode(x).latent_dist.sample().mul_(0.18215)\n            t = torch.randint(0, diffusion.num_timesteps, (x.shape[0],), device=device)\n            model_kwargs = dict(y=y)\n            loss_dict = diffusion.training_losses(model, x, t, model_kwargs)\n            loss = loss_dict[\"loss\"].mean()\n            opt.zero_grad()\n            loss.backward()\n            opt.step()\n            update_ema(ema, model.module)",
+          "source_start_line": 198,
+          "file_path": "train.py",
+          "annotations": [
+            {
+              "start_line": 201,
+              "end_line": 203,
+              "explanation": "Images are encoded once per step under no_grad — the VAE is completely frozen. The 0.18215 scalar normalizes latent values to roughly unit variance, which is important for stable diffusion training.",
+              "concept_tag": "other:diffusion"
+            },
+            {
+              "start_line": 204,
+              "end_line": 206,
+              "explanation": "A random timestep is sampled uniformly for each image. training_losses() adds noise at that timestep and computes the MSE between DiT's predicted noise and the actual noise added.",
+              "concept_tag": "loss"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "patchify-positional",
+      "title": "From Image to Sequence: Patchify and Positional Embedding",
+      "narrative": "Like ViT, DiT's first step is to convert the 2D spatial latent into a 1D sequence of tokens. This is done by PatchEmbed — a single strided convolution that splits the latent into non-overlapping patches and projects each patch to the model's hidden dimension.\n\nFor the default DiT-XL/2 configuration: the latent is 32×32×4, patch_size=2. PatchEmbed splits this into 16×16=256 patches of size 2×2×4=16 values each, then projects each 16-value patch to a 1152-dimensional token vector. The result is a sequence of 256 tokens.\n\nPositional embedding tells each token where it is in the 2D grid. DiT uses fixed 2D sin-cos positional embeddings (the same scheme as MAE), not learned embeddings. Fixed embeddings have a key advantage: they generalize to different spatial resolutions without retraining.\n\nThe 2D embedding is constructed by separately computing 1D sin-cos embeddings for each axis (height, width) and concatenating them. For each position (i,j), the first half of the embedding dimensions encode row i, and the second half encode column j.",
+      "code_blocks": [
+        {
+          "label": "DiT embedder initialization: PatchEmbed + fixed positional embedding",
+          "source": "        self.x_embedder = PatchEmbed(input_size, patch_size, in_channels, hidden_size, bias=True)\n        self.t_embedder = TimestepEmbedder(hidden_size)\n        self.y_embedder = LabelEmbedder(num_classes, hidden_size, class_dropout_prob)\n        num_patches = self.x_embedder.num_patches\n        # Will use fixed sin-cos embedding:\n        self.pos_embed = nn.Parameter(torch.zeros(1, num_patches, hidden_size), requires_grad=False)\n\n        self.blocks = nn.ModuleList([\n            DiTBlock(hidden_size, num_heads, mlp_ratio=mlp_ratio) for _ in range(depth)\n        ])\n        self.final_layer = FinalLayer(hidden_size, patch_size, self.out_channels)\n        self.initialize_weights()",
+          "source_start_line": 169,
+          "file_path": "models.py",
+          "annotations": [
+            {
+              "start_line": 169,
+              "end_line": 169,
+              "explanation": "PatchEmbed (from timm) implements the patch projection as a Conv2d with kernel_size=stride=patch_size. This splits the latent into non-overlapping patches and projects each to hidden_size dimensions, turning a 2D spatial grid into a 1D token sequence.",
+              "concept_tag": "embedding"
+            },
+            {
+              "start_line": 173,
+              "end_line": 174,
+              "explanation": "The positional embedding is a fixed (non-learnable) parameter. requires_grad=False means it won't be updated by the optimizer. It's initialized with zeros here and filled with sin-cos values in initialize_weights().",
+              "concept_tag": "embedding"
+            }
+          ]
+        },
+        {
+          "label": "2D sin-cos positional embedding construction",
+          "source": "def get_2d_sincos_pos_embed(embed_dim, grid_size, cls_token=False, extra_tokens=0):\n    \"\"\"\n    grid_size: int of the grid height and width\n    return:\n    pos_embed: [grid_size*grid_size, embed_dim] or [1+grid_size*grid_size, embed_dim] (w/ or w/o cls_token)\n    \"\"\"\n    grid_h = np.arange(grid_size, dtype=np.float32)\n    grid_w = np.arange(grid_size, dtype=np.float32)\n    grid = np.meshgrid(grid_w, grid_h)  # here w goes first\n    grid = np.stack(grid, axis=0)\n\n    grid = grid.reshape([2, 1, grid_size, grid_size])\n    pos_embed = get_2d_sincos_pos_embed_from_grid(embed_dim, grid)\n    if cls_token and extra_tokens > 0:\n        pos_embed = np.concatenate([np.zeros([extra_tokens, embed_dim]), pos_embed], axis=0)\n    return pos_embed",
+          "source_start_line": 274,
+          "file_path": "models.py",
+          "annotations": [
+            {
+              "start_line": 280,
+              "end_line": 283,
+              "explanation": "A 2D grid of (row, col) coordinates is constructed using meshgrid. Note 'w goes first' in meshgrid but the axes are stacked as [h, w] — this is the standard convention and matches how the 1D embeddings are split.",
+              "concept_tag": "embedding"
+            },
+            {
+              "start_line": 286,
+              "end_line": 286,
+              "explanation": "The 2D grid is decomposed into two 1D sequences (height axis and width axis) and each gets its own independent sin-cos embedding. The two halves are concatenated to form the final embed_dim-dimensional position vector for each patch.",
+              "concept_tag": "embedding"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "conditioning-embeddings",
+      "title": "Conditioning: Timestep and Class Embeddings",
+      "narrative": "Every DiT block needs to know two things: (1) how noisy the input is (timestep t), and (2) what class of image to generate (label y). Both are embedded into the same hidden_size-dimensional vector space so they can be combined by simple addition.\n\nThe timestep embedding follows the sinusoidal scheme from the original Transformer paper and DDPM. A scalar timestep t is expanded into a high-dimensional vector by computing cosine and sine values at geometrically spaced frequencies. This continuous embedding ensures that nearby timesteps produce similar representations, which helps the model interpolate smoothly across noise levels.\n\nThe class label embedding is simpler — a standard learned nn.Embedding table. But it has a twist: during training, labels are randomly dropped with probability dropout_prob (default 10%). Dropped labels are replaced with a special 'null' token. This implements Classifier-Free Guidance (CFG) training, where the model learns both conditional and unconditional generation simultaneously.\n\nBoth embeddings are projected to hidden_size via an MLP, producing two vectors of the same shape. In DiT.forward(), they're simply added: c = t_emb + y_emb. This combined conditioning vector c is what each DiTBlock conditions on.",
+      "code_blocks": [
+        {
+          "label": "TimestepEmbedder: sinusoidal frequencies → MLP → hidden vector",
+          "source": "class TimestepEmbedder(nn.Module):\n    \"\"\"\n    Embeds scalar timesteps into vector representations.\n    \"\"\"\n    def __init__(self, hidden_size, frequency_embedding_size=256):\n        super().__init__()\n        self.mlp = nn.Sequential(\n            nn.Linear(frequency_embedding_size, hidden_size, bias=True),\n            nn.SiLU(),\n            nn.Linear(hidden_size, hidden_size, bias=True),\n        )\n        self.frequency_embedding_size = frequency_embedding_size\n\n    @staticmethod\n    def timestep_embedding(t, dim, max_period=10000):\n        \"\"\"\n        Create sinusoidal timestep embeddings.\n        :param t: a 1-D Tensor of N indices, one per batch element.\n                          These may be fractional.\n        :param dim: the dimension of the output.\n        :param max_period: controls the minimum frequency of the embeddings.\n        :return: an (N, D) Tensor of positional embeddings.\n        \"\"\"\n        # https://github.com/openai/glide-text2im/blob/main/glide_text2im/nn.py\n        half = dim // 2\n        freqs = torch.exp(\n            -math.log(max_period) * torch.arange(start=0, end=half, dtype=torch.float32) / half\n        ).to(device=t.device)\n        args = t[:, None].float() * freqs[None]\n        embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)\n        if dim % 2:\n            embedding = torch.cat([embedding, torch.zeros_like(embedding[:, :1])], dim=-1)\n        return embedding\n\n    def forward(self, t):\n        t_freq = self.timestep_embedding(t, self.frequency_embedding_size)\n        t_emb = self.mlp(t_freq)\n        return t_emb",
+          "source_start_line": 27,
+          "file_path": "models.py",
+          "annotations": [
+            {
+              "start_line": 33,
+              "end_line": 37,
+              "explanation": "A two-layer MLP expands from frequency_embedding_size (256) to hidden_size. The intermediate SiLU activation is used throughout DiT. This MLP is what makes the timestep embedding task-specific — the sinusoidal part is fixed, but the MLP is learned.",
+              "concept_tag": "linear"
+            },
+            {
+              "start_line": 52,
+              "end_line": 54,
+              "explanation": "Frequencies decay geometrically with base 10000 — low dimensions encode slow (coarse) time variation, high dimensions encode fast (fine) variation. This gives the model multi-scale sensitivity to the noise level.",
+              "concept_tag": "embedding"
+            },
+            {
+              "start_line": 55,
+              "end_line": 56,
+              "explanation": "The outer product of t and freqs gives a matrix of phase angles. Concatenating cos and sin produces a 2×(dim/2) = dim dimensional vector per timestep. This encoding is injective — every scalar t maps to a unique vector.",
+              "concept_tag": "embedding"
+            }
+          ]
+        },
+        {
+          "label": "LabelEmbedder: class lookup table with CFG dropout",
+          "source": "class LabelEmbedder(nn.Module):\n    \"\"\"\n    Embeds class labels into vector representations. Also handles label dropout for classifier-free guidance.\n    \"\"\"\n    def __init__(self, num_classes, hidden_size, dropout_prob):\n        super().__init__()\n        use_cfg_embedding = dropout_prob > 0\n        self.embedding_table = nn.Embedding(num_classes + use_cfg_embedding, hidden_size)\n        self.num_classes = num_classes\n        self.dropout_prob = dropout_prob\n\n    def token_drop(self, labels, force_drop_ids=None):\n        \"\"\"\n        Drops labels to enable classifier-free guidance.\n        \"\"\"\n        if force_drop_ids is None:\n            drop_ids = torch.rand(labels.shape[0], device=labels.device) < self.dropout_prob\n        else:\n            drop_ids = force_drop_ids == 1\n        labels = torch.where(drop_ids, self.num_classes, labels)\n        return labels\n\n    def forward(self, labels, train, force_drop_ids=None):\n        use_dropout = self.dropout_prob > 0\n        if (train and use_dropout) or (force_drop_ids is not None):\n            labels = self.token_drop(labels, force_drop_ids)\n        embeddings = self.embedding_table(labels)\n        return embeddings",
+          "source_start_line": 67,
+          "file_path": "models.py",
+          "annotations": [
+            {
+              "start_line": 73,
+              "end_line": 74,
+              "explanation": "An extra embedding slot at index num_classes is reserved as the 'null' class for unconditional generation. When dropout_prob > 0, the embedding table has num_classes+1 entries — the last one is the null embedding.",
+              "concept_tag": "embedding"
+            },
+            {
+              "start_line": 82,
+              "end_line": 86,
+              "explanation": "During training, each label is independently dropped with probability dropout_prob. Dropped labels become the null token (index num_classes). This forces the model to learn unconditional generation, enabling Classifier-Free Guidance at inference time.",
+              "concept_tag": "dropout"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "adaln-zero",
+      "title": "adaLN-Zero: DiT's Core Conditioning Mechanism",
+      "narrative": "The central question in designing a diffusion transformer is: how should the model incorporate the conditioning information (timestep + class) at each layer? DiT explores several options — cross-attention, in-context conditioning (appending c as tokens), and adaptive layer norm — and finds that adaLN-Zero is both the most parameter-efficient and the best-performing.\n\nThe idea is elegant: instead of having LayerNorm learn its own affine parameters (scale γ and bias β), we remove those learnable parameters entirely (elementwise_affine=False) and replace them with conditioning-dependent values computed from c. This is called adaptive LayerNorm (adaLN).\n\nDiT takes this one step further with adaLN-Zero: each block also produces gate values that scale the residual connection. And critically, the entire adaLN module (both the shift/scale and the gates) is initialized to output zero. This means every DiTBlock starts as a pure skip connection — the output equals the input, and the block's contribution grows gradually as training proceeds.\n\nThe modulate() helper is the core primitive: it applies a conditioning-dependent shift and scale to the LayerNorm output. The use of (1 + scale) rather than just scale means that a zero-initialized scale leaves the input unchanged, preserving the zero-init stability property.",
+      "code_blocks": [
+        {
+          "label": "modulate(): the conditioning primitive",
+          "source": "def modulate(x, shift, scale):\n    return x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)",
+          "source_start_line": 19,
+          "file_path": "models.py",
+          "annotations": [
+            {
+              "start_line": 19,
+              "end_line": 20,
+              "explanation": "Applies conditioning-dependent affine transformation to normalized activations. The (1 + scale) formulation is critical: when scale=0 (as after zero-init), the operation reduces to x + shift, and if shift=0 too, it's pure identity. This guarantees every block starts as a skip connection.",
+              "concept_tag": "normalization"
+            }
+          ]
+        },
+        {
+          "label": "DiTBlock: transformer block with adaLN-Zero conditioning",
+          "source": "class DiTBlock(nn.Module):\n    \"\"\"\n    A DiT block with adaptive layer norm zero (adaLN-Zero) conditioning.\n    \"\"\"\n    def __init__(self, hidden_size, num_heads, mlp_ratio=4.0, **block_kwargs):\n        super().__init__()\n        self.norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)\n        self.attn = Attention(hidden_size, num_heads=num_heads, qkv_bias=True, **block_kwargs)\n        self.norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)\n        mlp_hidden_dim = int(hidden_size * mlp_ratio)\n        approx_gelu = lambda: nn.GELU(approximate=\"tanh\")\n        self.mlp = Mlp(in_features=hidden_size, hidden_features=mlp_hidden_dim, act_layer=approx_gelu, drop=0)\n        self.adaLN_modulation = nn.Sequential(\n            nn.SiLU(),\n            nn.Linear(hidden_size, 6 * hidden_size, bias=True)\n        )\n\n    def forward(self, x, c):\n        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(c).chunk(6, dim=1)\n        x = x + gate_msa.unsqueeze(1) * self.attn(modulate(self.norm1(x), shift_msa, scale_msa))\n        x = x + gate_mlp.unsqueeze(1) * self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp))\n        return x",
+          "source_start_line": 101,
+          "file_path": "models.py",
+          "annotations": [
+            {
+              "start_line": 107,
+              "end_line": 109,
+              "explanation": "Both LayerNorm layers have elementwise_affine=False — all learnable scale/shift is removed. The conditioning network (adaLN_modulation) provides ALL scale and shift values, giving it complete control over the normalization behavior.",
+              "concept_tag": "normalization"
+            },
+            {
+              "start_line": 113,
+              "end_line": 116,
+              "explanation": "A single linear layer projects the conditioning vector c to 6×hidden_size values, providing three parameters per sublayer (attention and MLP): shift, scale, and gate. One projection serves the whole block — this is more parameter-efficient than cross-attention.",
+              "concept_tag": "linear"
+            },
+            {
+              "start_line": 119,
+              "end_line": 121,
+              "explanation": "gate_msa and gate_mlp are scalar multipliers on each residual branch. When zero-initialized, the entire block output is zero — the block starts as a skip connection. As training progresses, gates learn to scale up the contribution of each sublayer.",
+              "concept_tag": "residual"
+            }
+          ]
+        },
+        {
+          "label": "Zero initialization of adaLN modulation layers",
+          "source": "        # Zero-out adaLN modulation layers in DiT blocks:\n        for block in self.blocks:\n            nn.init.constant_(block.adaLN_modulation[-1].weight, 0)\n            nn.init.constant_(block.adaLN_modulation[-1].bias, 0)\n\n        # Zero-out output layers:\n        nn.init.constant_(self.final_layer.adaLN_modulation[-1].weight, 0)\n        nn.init.constant_(self.final_layer.adaLN_modulation[-1].bias, 0)\n        nn.init.constant_(self.final_layer.linear.weight, 0)\n        nn.init.constant_(self.final_layer.linear.bias, 0)",
+          "source_start_line": 206,
+          "file_path": "models.py",
+          "annotations": [
+            {
+              "start_line": 206,
+              "end_line": 209,
+              "explanation": "Zero-initializing the last linear layer of adaLN_modulation ensures all shift, scale, and gate values start at zero. Combined with the (1+scale) formulation in modulate(), every block begins as an identity function — a deep network initialized as a shallow one.",
+              "concept_tag": "normalization"
+            },
+            {
+              "start_line": 211,
+              "end_line": 215,
+              "explanation": "The final layer's output projection is also zeroed. This means the model initially predicts zero noise for every input — a conservative starting point that avoids exploding loss on the first training step.",
+              "concept_tag": "other:initialization"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "final-layer-unpatchify",
+      "title": "The Final Layer: Predicting Noise in Patch Space",
+      "narrative": "After the transformer backbone processes the token sequence, a final prediction head converts each token back into a patch of predicted noise (or noise + variance, if learn_sigma=True).\n\nThe FinalLayer applies one more round of adaLN conditioning before the linear projection. This final conditioning step ensures that the output space itself is conditioned on the noise level and class — not just the internal representations.\n\nThe output channels are: patch_size × patch_size × out_channels per token. For DiT-XL/2 with learn_sigma=True: 2 × 2 × 8 = 32 values per token (4 latent channels × 2 for mean + log-variance of the predicted noise distribution).\n\nThe unpatchify operation is the inverse of patch embedding: it rearranges the flat patch predictions back into a spatial grid. Each token's predicted patch values are placed at the correct (i,j) position to reconstruct the full 32×32×8 output, which the diffusion scheduler uses to compute the training loss.",
+      "code_blocks": [
+        {
+          "label": "FinalLayer: adaLN + linear projection to patch pixels",
+          "source": "class FinalLayer(nn.Module):\n    \"\"\"\n    The final layer of DiT.\n    \"\"\"\n    def __init__(self, hidden_size, patch_size, out_channels):\n        super().__init__()\n        self.norm_final = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)\n        self.linear = nn.Linear(hidden_size, patch_size * patch_size * out_channels, bias=True)\n        self.adaLN_modulation = nn.Sequential(\n            nn.SiLU(),\n            nn.Linear(hidden_size, 2 * hidden_size, bias=True)\n        )\n\n    def forward(self, x, c):\n        shift, scale = self.adaLN_modulation(c).chunk(2, dim=1)\n        x = modulate(self.norm_final(x), shift, scale)\n        x = self.linear(x)\n        return x",
+          "source_start_line": 125,
+          "file_path": "models.py",
+          "annotations": [
+            {
+              "start_line": 131,
+              "end_line": 132,
+              "explanation": "The linear maps each hidden_size token to patch_size²×out_channels values. For DiT-XL/2 with learn_sigma=True: 2×2×8=32 values per token (4 latent channels, 2 each for predicted noise mean and log-variance).",
+              "concept_tag": "linear"
+            },
+            {
+              "start_line": 138,
+              "end_line": 141,
+              "explanation": "The final layer uses only 2 conditioning values (shift and scale, no gate) — there's no residual connection here so gates aren't needed. The last adaLN step ensures the prediction is fully conditioned on t and y even after the final normalization.",
+              "concept_tag": "normalization"
+            }
+          ]
+        },
+        {
+          "label": "unpatchify: reconstruct spatial output from token sequence",
+          "source": "    def unpatchify(self, x):\n        \"\"\"\n        x: (N, T, patch_size**2 * C)\n        imgs: (N, H, W, C)\n        \"\"\"\n        c = self.out_channels\n        p = self.x_embedder.patch_size[0]\n        h = w = int(x.shape[1] ** 0.5)\n        assert h * w == x.shape[1]\n\n        x = x.reshape(shape=(x.shape[0], h, w, p, p, c))\n        x = torch.einsum('nhwpqc->nchpwq', x)\n        imgs = x.reshape(shape=(x.shape[0], c, h * p, h * p))\n        return imgs",
+          "source_start_line": 218,
+          "file_path": "models.py",
+          "annotations": [
+            {
+              "start_line": 228,
+              "end_line": 230,
+              "explanation": "The einsum 'nhwpqc->nchpwq' rearranges axes from (batch, grid_h, grid_w, patch_h, patch_w, channels) to (batch, channels, grid_h*patch_h, grid_w*patch_w). The final reshape merges the grid and patch dimensions to reconstruct the full spatial resolution.",
+              "concept_tag": "other:reshape"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "classifier-free-guidance",
+      "title": "Classifier-Free Guidance",
+      "narrative": "Classifier-Free Guidance (CFG) is the technique that makes class-conditional image generation actually useful. Without guidance, a conditional model often produces images that technically match the class distribution but lack visual sharpness and recognizability. CFG amplifies the class signal to trade diversity for quality.\n\nThe mechanism: during training, the model learns both conditional and unconditional generation by randomly replacing labels with a 'null' token. At inference, two forward passes are run — one with the real class label and one with the null token — and the outputs are linearly extrapolated:\n\n    ε_guided = ε_uncond + cfg_scale × (ε_cond − ε_uncond)\n\nA cfg_scale of 1.0 equals pure conditional sampling. Higher values (e.g. 4.0) push the output further in the direction that distinguishes the conditional from unconditional prediction, sharpening class-specific features at the cost of diversity.\n\nDiT implements CFG efficiently: rather than making two separate forward calls, it batches both halves together. The first half of the batch is the real input, and forward_with_cfg() constructs a combined batch [half, half] that processes both the conditional (first half of y) and unconditional (second half, which should be the null label) in a single pass.",
+      "code_blocks": [
+        {
+          "label": "forward_with_cfg: batched conditional + unconditional inference",
+          "source": "    def forward_with_cfg(self, x, t, y, cfg_scale):\n        \"\"\"\n        Forward pass of DiT, but also batches the unconditional forward pass for classifier-free guidance.\n        \"\"\"\n        # https://github.com/openai/glide-text2im/blob/main/notebooks/text2im.ipynb\n        half = x[: len(x) // 2]\n        combined = torch.cat([half, half], dim=0)\n        model_out = self.forward(combined, t, y)\n        # For exact reproducibility reasons, we apply classifier-free guidance on only\n        # three channels by default. The standard approach to cfg applies it to all channels.\n        # This can be done by uncommenting the following line and commenting-out the line following that.\n        # eps, rest = model_out[:, :self.in_channels], model_out[:, self.in_channels:]\n        eps, rest = model_out[:, :3], model_out[:, 3:]\n        cond_eps, uncond_eps = torch.split(eps, len(eps) // 2, dim=0)\n        half_eps = uncond_eps + cfg_scale * (cond_eps - uncond_eps)\n        eps = torch.cat([half_eps, half_eps], dim=0)\n        return torch.cat([eps, rest], dim=1)",
+          "source_start_line": 250,
+          "file_path": "models.py",
+          "annotations": [
+            {
+              "start_line": 255,
+              "end_line": 257,
+              "explanation": "Only the first half of x is the real input — the caller passes a batch where the first N/2 samples have real labels and the last N/2 have null labels. By concatenating [half, half], both are processed in one forward pass, halving the overhead vs two separate calls.",
+              "concept_tag": "other:inference"
+            },
+            {
+              "start_line": 262,
+              "end_line": 265,
+              "explanation": "CFG formula: ε_guided = ε_uncond + cfg_scale × (ε_cond − ε_uncond). Guidance is applied only to the first 3 channels (the noise prediction) — not to the variance channels (rest). This matches the default behavior from Improved DDPM.",
+              "concept_tag": "other:diffusion"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "putting-it-together",
+      "title": "Putting It All Together: The DiT Forward Pass",
+      "narrative": "The full DiT forward pass is remarkably clean — five lines of logic after setup:\n\n1. Patchify + position encode the latent input\n2. Embed the timestep and class label, sum them into a single conditioning vector c\n3. Run N DiTBlocks, each conditioned on c via adaLN-Zero\n4. FinalLayer: one more adaLN conditioning + project to patch pixels\n5. Unpatchify: reconstruct the spatial noise prediction\n\nWhat's notable is what's absent: no CLS token, no cross-attention, no separate context stream. The entire conditioning happens through the adaLN mechanism — a single vector c modulates every layer's normalization. The tokens never 'see' c directly in the attention keys/values; it only enters through the shift and scale applied before attention.\n\nThis design has a nice inductive bias: attention is purely spatial (each token attends to other patch tokens), while time and class conditioning is applied globally and uniformly across all tokens via the shared c vector. This separation of concerns makes the architecture interpretable and efficient.",
+      "code_blocks": [
+        {
+          "label": "DiT.forward(): the complete five-step forward pass",
+          "source": "    def forward(self, x, t, y):\n        \"\"\"\n        Forward pass of DiT.\n        x: (N, C, H, W) tensor of spatial inputs (images or latent representations of images)\n        t: (N,) tensor of diffusion timesteps\n        y: (N,) tensor of class labels\n        \"\"\"\n        x = self.x_embedder(x) + self.pos_embed  # (N, T, D), where T = H * W / patch_size ** 2\n        t = self.t_embedder(t)                   # (N, D)\n        y = self.y_embedder(y, self.training)    # (N, D)\n        c = t + y                                # (N, D)\n        for block in self.blocks:\n            x = block(x, c)                      # (N, T, D)\n        x = self.final_layer(x, c)                # (N, T, patch_size ** 2 * out_channels)\n        x = self.unpatchify(x)                   # (N, out_channels, H, W)\n        return x",
+          "source_start_line": 233,
+          "file_path": "models.py",
+          "annotations": [
+            {
+              "start_line": 240,
+              "end_line": 240,
+              "explanation": "PatchEmbed projects each patch to a token vector, then adds the fixed positional embedding. Shape goes from (N, 4, 32, 32) to (N, 256, 1152) for DiT-XL/2 — 256 tokens of dimension 1152.",
+              "concept_tag": "embedding"
+            },
+            {
+              "start_line": 241,
+              "end_line": 243,
+              "explanation": "Timestep and class embeddings are both hidden_size vectors. Their sum c is the single conditioning signal that every DiTBlock will use. Simple addition works because both embeddings live in the same learned space.",
+              "concept_tag": "embedding"
+            },
+            {
+              "start_line": 244,
+              "end_line": 245,
+              "explanation": "The transformer backbone: depth DiTBlocks (28 for XL) each process the full token sequence with self-attention and MLP, conditioned on c via adaLN-Zero. Unlike standard ViT, there's no class token — all 256 tokens are patch tokens.",
+              "concept_tag": "attention"
+            },
+            {
+              "start_line": 246,
+              "end_line": 247,
+              "explanation": "FinalLayer applies a last adaLN conditioning and projects each token to patch_size²×out_channels values. Unpatchify then reassembles the patches into the full spatial output — the predicted noise ε at this timestep.",
+              "concept_tag": "linear"
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "summary": "DiT (Diffusion Transformers) replaces the U-Net backbone used in most diffusion models with a Vision Transformer, demonstrating that transformer scaling laws apply directly to image generation. The key innovation is adaLN-Zero conditioning: each transformer block uses adaptive layer normalization where the scale, shift, and gate parameters are computed from a combined timestep+class embedding vector, with all conditioning outputs zero-initialized so every block starts as an identity. DiT operates in the latent space of a frozen VAE (like Stable Diffusion), patching 32×32×4 latents into 256 tokens and processing them with standard self-attention. Classifier-Free Guidance is built in via label dropout during training. DiT-XL/2 achieves state-of-the-art FID on class-conditional ImageNet-256, and ablations show a clear Gflops-vs-FID scaling law: larger DiT models consistently generate better images."
+}
