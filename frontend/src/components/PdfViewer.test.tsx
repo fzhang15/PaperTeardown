@@ -1,6 +1,6 @@
 import { render, screen } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
-import { describe, it, expect, vi } from 'vitest'
+import { describe, it, expect } from 'vitest'
 import { PdfViewer } from './PdfViewer'
 
 describe('PdfViewer', () => {
@@ -20,7 +20,7 @@ describe('PdfViewer', () => {
     render(<PdfViewer paperId="dinov2" />)
     await userEvent.click(screen.getByRole('button'))
     const iframe = screen.getByTitle('Paper PDF') as HTMLIFrameElement
-    expect(iframe.src).toContain('/data/papers/dinov2/paper.pdf')
+    expect(iframe.src).toContain('/papers/dinov2/paper.pdf')
   })
 
   it('collapses again on second click', async () => {

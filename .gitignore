@@ -33,3 +33,5 @@ tmp/
 # OS
 .DS_Store
 Thumbs.db
+data/papers/*/repo/  
+data/papers/*/repo/  

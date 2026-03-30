@@ -1,0 +1,12 @@
+{
+  "id": "dinov2",
+  "title": "DINOv2: Learning Robust Visual Features without Supervision",
+  "authors": ["Maxime Oquab", "Timothée Darcet", "Théo Moutakanni", "Huy V. Vo", "Marc Szafraniec", "Vasil Khalidov"],
+  "arxiv_url": "https://arxiv.org/abs/2304.07193",
+  "repo_url": "https://github.com/facebookresearch/dinov2",
+  "abstract": "The recent breakthroughs in natural language processing for model pretraining on large quantities of data have opened the way for similar foundation models in computer vision. These models could greatly simplify the use of images in any system by producing all-purpose visual features, i.e., features that work across image distributions and tasks without finetuning. This work shows that existing pretraining methods, especially self-supervised methods, can produce such features if trained on enough curated data from diverse sources.",
+  "introduction_excerpt": "In natural language processing (NLP), the last few years have seen tremendous progress in learning task-agnostic pretrained representations. Foundation models pretrained on large quantities of data can be adapted to many different downstream tasks, often greatly simplifying the use of text in systems.",
+  "module_count": 5,
+  "pytorch_file_count": 12,
+  "ingested_at": "2026-03-29T18:00:00Z"
+}

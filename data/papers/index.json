@@ -1,0 +1,12 @@
+[
+  {
+    "id": "dinov3",
+    "title": "DINOv3: Self-Supervised Visual Representation Learning with Multi-Scale Vision Transformers",
+    "authors": ["Mahmoud Assran", "Quentin Duval", "Ishan Misra", "Piotr Bojanowski", "Pascal Vincent", "Michael Rabbat"],
+    "arxiv_url": "https://arxiv.org/abs/2508.10104",
+    "repo_url": "https://github.com/facebookresearch/dinov3",
+    "abstract": "We present DINOv3, a self-supervised method for training visual features using multi-scale vision transformers. Building on the DINO self-distillation framework, DINOv3 introduces cross-scale attention mechanisms that enable the model to learn representations capturing both local detail and global context. Our approach achieves state-of-the-art results on image classification, segmentation, and detection benchmarks, producing universal visual features that transfer effectively across tasks without fine-tuning.",
+    "module_count": 4,
+    "ingested_at": "2026-03-29T20:00:00Z"
+  }
+]

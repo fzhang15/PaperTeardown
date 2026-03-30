@@ -1,9 +1,8 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
 import { fetchPaper } from '../api/papers'
-import { ModuleNav, type NavItem } from '../components/ModuleNav'
-import { ExplanationPanel } from '../components/ExplanationPanel'
-import { CodePanel } from '../components/CodePanel'
+import { ChapterNav } from '../components/ChapterNav'
+import { ChapterView } from '../components/ChapterView'
 import { PdfViewer } from '../components/PdfViewer'
 import type { AnalysisResult, PaperMeta } from '../types'
 
@@ -14,8 +13,8 @@ export function PaperView() {
   const [meta, setMeta] = useState<PaperMeta | null>(null)
   const [analysis, setAnalysis] = useState<AnalysisResult | null>(null)
   const [error, setError] = useState<string | null>(null)
-  const [selectedNav, setSelectedNav] = useState<NavItem | null>(null)
-  const [highlightRange, setHighlightRange] = useState<[number, number] | null>(null)
+  const [activeChapterId, setActiveChapterId] = useState<string | null>(null)
+  const chapterRefs = useRef<Record<string, HTMLDivElement | null>>({})
 
   useEffect(() => {
     if (!id) return
@@ -23,21 +22,18 @@ export function PaperView() {
       .then(({ meta, analysis }) => {
         setMeta(meta)
         setAnalysis(analysis)
-        if (analysis.analyzed_modules.length > 0) {
-          setSelectedNav({ kind: 'module', index: 0, label: analysis.analyzed_modules[0].module_name })
-        } else if (analysis.analyzed_loops.length > 0) {
-          setSelectedNav({ kind: 'loop', index: 0, label: `Loop L${analysis.analyzed_loops[0].start_line}` })
+        if (analysis.chapters.length > 0) {
+          setActiveChapterId(analysis.chapters[0].id)
         }
       })
       .catch((e: Error) => setError(e.message))
   }, [id])
 
-  const selectedItem =
-    analysis && selectedNav
-      ? selectedNav.kind === 'module'
-        ? analysis.analyzed_modules[selectedNav.index]
-        : analysis.analyzed_loops[selectedNav.index]
-      : null
+  function handleSelectChapter(chapterId: string) {
+    setActiveChapterId(chapterId)
+    const el = chapterRefs.current[chapterId]
+    el?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+  }
 
   if (error) {
     return (
@@ -81,57 +77,52 @@ export function PaperView() {
             </p>
           </div>
           <span style={{ fontSize: 12, color: '#6b7280', flexShrink: 0 }}>
-            {analysis.analyzed_modules.length} module{analysis.analyzed_modules.length !== 1 ? 's' : ''}
+            {analysis.chapters.length} chapter{analysis.chapters.length !== 1 ? 's' : ''}
           </span>
         </div>
       </header>
 
       {/* Main content */}
       <div style={{ flex: 1, display: 'flex', minHeight: 0 }}>
-        {/* Module nav sidebar */}
-        <ModuleNav
-          modules={analysis.analyzed_modules}
-          loops={analysis.analyzed_loops}
-          selected={selectedNav}
-          onSelect={(item) => { setSelectedNav(item); setHighlightRange(null) }}
+        {/* Chapter navigation */}
+        <ChapterNav
+          chapters={analysis.chapters}
+          activeId={activeChapterId}
+          onSelect={handleSelectChapter}
         />
 
-        {/* Right area: panels + PDF */}
-        <div style={{ flex: 1, display: 'flex', flexDirection: 'column', minWidth: 0 }}>
-          {/* Side-by-side panels */}
-          <div style={{ flex: 1, display: 'flex', minHeight: 0 }}>
-            {selectedItem ? (
-              <>
-                <div style={{ width: '40%', borderRight: '1px solid #e5e7eb', overflow: 'hidden' }}>
-                  <ExplanationPanel
-                    item={selectedItem}
-                    activeRange={highlightRange}
-                    onAnnotationHover={setHighlightRange}
-                    onAnnotationClick={setHighlightRange}
-                  />
-                </div>
-                <div style={{ flex: 1, overflow: 'hidden' }}>
-                  <CodePanel
-                    item={selectedItem}
-                    highlightRange={highlightRange}
-                    onLineClick={(line) => {
-                      const ann = selectedItem.annotations.find(
-                        (a) => line >= a.start_line && line <= a.end_line
-                      )
-                      if (ann) setHighlightRange([ann.start_line, ann.end_line])
-                    }}
-                  />
-                </div>
-              </>
-            ) : (
-              <div style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#9ca3af' }}>
-                Select a module from the sidebar
-              </div>
-            )}
+        {/* Scrollable content area */}
+        <div style={{ flex: 1, overflow: 'auto', minWidth: 0 }}>
+          {/* Summary */}
+          <div style={{ maxWidth: 820, margin: '0 auto', padding: '32px 24px 0' }}>
+            <div style={{
+              padding: '20px 24px', background: '#f0f9ff', borderRadius: 8,
+              border: '1px solid #bae6fd', marginBottom: 8,
+            }}>
+              <div style={{ fontSize: 12, fontWeight: 600, color: '#0369a1', marginBottom: 6 }}>TL;DR</div>
+              <p style={{ margin: 0, fontSize: 14, color: '#0c4a6e', lineHeight: 1.7 }}>
+                {analysis.summary}
+              </p>
+            </div>
           </div>
 
-          {/* PDF viewer (collapsible, at bottom) */}
-          {id && <PdfViewer paperId={id} />}
+          {/* Chapters */}
+          {analysis.chapters.map((chapter, i) => (
+            <div
+              key={chapter.id}
+              ref={(el) => { chapterRefs.current[chapter.id] = el }}
+              style={{ borderBottom: i < analysis.chapters.length - 1 ? '1px solid #e5e7eb' : 'none' }}
+            >
+              <ChapterView chapter={chapter} index={i} />
+            </div>
+          ))}
+
+          {/* PDF viewer */}
+          {id && (
+            <div style={{ maxWidth: 820, margin: '0 auto', padding: '0 24px 32px' }}>
+              <PdfViewer paperId={id} />
+            </div>
+          )}
         </div>
       </div>
     </div>

@@ -23,7 +23,7 @@ export function PdfViewer({ paperId }: Props) {
       </button>
       {open && (
         <iframe
-          src={`/data/papers/${paperId}/paper.pdf`}
+          src={`/papers/${paperId}/paper.pdf`}
           style={{ width: '100%', height: 500, border: 'none', display: 'block' }}
           title="Paper PDF"
           onError={() => {/* handled by browser natively */}}

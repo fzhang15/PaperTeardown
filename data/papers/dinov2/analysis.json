@@ -1,0 +1,106 @@
+{
+  "analyzed_modules": [
+    {
+      "module_name": "DinoVisionTransformer",
+      "file_path": "dinov2/models/vision_transformer.py",
+      "overview": "Main Vision Transformer backbone used in DINOv2. Takes image patches, embeds them via a patch embedding layer, adds positional embeddings, and processes through a sequence of transformer blocks. Supports register tokens and interpolation of positional embeddings for variable input sizes.",
+      "annotations": [
+        {
+          "start_line": 142,
+          "end_line": 145,
+          "explanation": "Initializes the patch embedding layer that converts raw image patches into embedding vectors. The embed_dim parameter controls the hidden dimension size throughout the transformer.",
+          "concept_tag": "embedding"
+        },
+        {
+          "start_line": 147,
+          "end_line": 150,
+          "explanation": "Creates learnable CLS token and positional embedding parameters. The CLS token is prepended to the patch sequence and used as the global image representation. Positional embeddings encode spatial location information.",
+          "concept_tag": "embedding"
+        },
+        {
+          "start_line": 155,
+          "end_line": 162,
+          "explanation": "Constructs a list of transformer blocks. Each block contains multi-head self-attention followed by an MLP, with layer normalization and residual connections.",
+          "concept_tag": "attention"
+        },
+        {
+          "start_line": 175,
+          "end_line": 185,
+          "explanation": "The forward pass: embeds patches, adds positional embeddings, prepends CLS token, then passes through all transformer blocks sequentially. The output CLS token contains the global image representation.",
+          "concept_tag": "other:forward_pass"
+        }
+      ],
+      "error": null
+    },
+    {
+      "module_name": "Attention",
+      "file_path": "dinov2/models/vision_transformer.py",
+      "overview": "Standard multi-head self-attention module. Projects input to queries, keys, and values, computes scaled dot-product attention, and projects the output back to the original dimension.",
+      "annotations": [
+        {
+          "start_line": 42,
+          "end_line": 48,
+          "explanation": "Initializes Q, K, V projection as a single fused linear layer (3x output dim) for efficiency. The attention scale factor is 1/sqrt(head_dim) which prevents softmax saturation.",
+          "concept_tag": "attention"
+        },
+        {
+          "start_line": 50,
+          "end_line": 62,
+          "explanation": "Forward pass computes Q, K, V projections, reshapes for multi-head attention, computes scaled dot-product attention with softmax, applies dropout, and projects output. Uses einsum-style reshape for clarity.",
+          "concept_tag": "attention"
+        }
+      ],
+      "error": null
+    },
+    {
+      "module_name": "Mlp",
+      "file_path": "dinov2/models/vision_transformer.py",
+      "overview": "Two-layer feed-forward network used within each transformer block. Expands the hidden dimension (typically by 4x), applies GELU activation, then projects back down. Includes dropout for regularization.",
+      "annotations": [
+        {
+          "start_line": 28,
+          "end_line": 35,
+          "explanation": "Standard MLP: Linear → GELU → Dropout → Linear → Dropout. The hidden dimension is typically 4x the input dimension, following the original Transformer design.",
+          "concept_tag": "linear"
+        }
+      ],
+      "error": null
+    },
+    {
+      "module_name": "MemEffAttention",
+      "file_path": "dinov2/models/vision_transformer.py",
+      "overview": "Memory-efficient attention variant using PyTorch's scaled_dot_product_attention (Flash Attention when available). Reduces memory usage from O(n²) to O(n) for long sequences, critical for high-resolution images.",
+      "annotations": [
+        {
+          "start_line": 70,
+          "end_line": 82,
+          "explanation": "Uses torch.nn.functional.scaled_dot_product_attention which automatically selects the most efficient attention kernel (Flash Attention, Memory-Efficient Attention, or standard). This avoids materializing the full N×N attention matrix.",
+          "concept_tag": "attention"
+        }
+      ],
+      "error": null
+    },
+    {
+      "module_name": "NestedTensorBlock",
+      "file_path": "dinov2/models/vision_transformer.py",
+      "overview": "Transformer block variant that supports PyTorch nested tensors for variable-length sequences. Enables efficient batching of images with different numbers of patches (e.g., multi-crop training) without padding waste.",
+      "annotations": [
+        {
+          "start_line": 95,
+          "end_line": 108,
+          "explanation": "Pre-norm transformer block: LayerNorm → Attention → Residual → LayerNorm → MLP → Residual. The nested tensor support allows processing variable-length sequences in a single batch.",
+          "concept_tag": "normalization"
+        },
+        {
+          "start_line": 110,
+          "end_line": 120,
+          "explanation": "Handles the nested tensor path: converts nested tensor to padded format for attention, then back to nested format. Includes stochastic depth (drop path) for regularization during training.",
+          "concept_tag": "dropout"
+        }
+      ],
+      "error": null
+    }
+  ],
+  "analyzed_loops": [],
+  "summary": "DINOv2 implements a Vision Transformer (ViT) backbone trained with self-supervised distillation. The codebase features a clean modular architecture: DinoVisionTransformer orchestrates patch embedding, positional encoding, and a sequence of transformer blocks. The attention mechanism comes in two variants — standard (Attention) and memory-efficient (MemEffAttention) using Flash Attention. NestedTensorBlock enables efficient multi-crop training by supporting variable-length sequences without padding."
+}
