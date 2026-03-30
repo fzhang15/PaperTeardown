@@ -3,7 +3,6 @@ import { useParams, useNavigate } from 'react-router-dom'
 import { fetchPaper } from '../api/papers'
 import { ChapterNav } from '../components/ChapterNav'
 import { ChapterView } from '../components/ChapterView'
-import { PdfViewer } from '../components/PdfViewer'
 import type { AnalysisResult, PaperMeta } from '../types'
 
 export function PaperView() {
@@ -117,12 +116,6 @@ export function PaperView() {
             </div>
           ))}
 
-          {/* PDF viewer */}
-          {id && (
-            <div style={{ maxWidth: 820, margin: '0 auto', padding: '0 24px 32px' }}>
-              <PdfViewer paperId={id} />
-            </div>
-          )}
         </div>
       </div>
     </div>

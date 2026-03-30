@@ -2,9 +2,10 @@ import { render, screen, fireEvent } from '@testing-library/react'
 import { describe, it, expect, beforeAll } from 'vitest'
 import { NarrativeCodeBlock } from './NarrativeCodeBlock'
 
-// jsdom doesn't implement scrollIntoView
+// jsdom doesn't implement scroll methods
 beforeAll(() => {
   Element.prototype.scrollIntoView = () => {}
+  Element.prototype.scrollTo = (() => {}) as any
 })
 import type { CodeBlock } from '../types'
 
