@@ -13,7 +13,7 @@ const MOCK_META: PaperMeta = {
   repo_url: 'https://github.com/facebookresearch/dinov3',
   abstract: 'We present DINOv3.',
   introduction_excerpt: 'Self-supervised learning...',
-  module_count: 4,
+  chapter_count: 4,
   pytorch_file_count: 8,
   ingested_at: '2026-03-29T20:00:00Z',
 }

@@ -36,7 +36,7 @@ export interface PaperIndexEntry {
   arxiv_url: string
   repo_url: string
   abstract: string
-  module_count: number
+  chapter_count: number
   ingested_at: string
 }
 

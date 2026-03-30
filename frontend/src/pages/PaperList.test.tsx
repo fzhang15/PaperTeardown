@@ -13,7 +13,7 @@ const MOCK_PAPERS: PaperIndexEntry[] = [
     arxiv_url: 'https://arxiv.org/abs/2304.07193',
     repo_url: 'https://github.com/facebookresearch/dinov2',
     abstract: 'We present DINOv2, a self-supervised learning method.',
-    module_count: 6,
+    chapter_count: 6,
     ingested_at: '2026-03-29T18:00:00Z',
   },
   {
@@ -23,7 +23,7 @@ const MOCK_PAPERS: PaperIndexEntry[] = [
     arxiv_url: 'https://arxiv.org/abs/1706.03762',
     repo_url: 'https://github.com/some/repo',
     abstract: 'The dominant sequence transduction models are based on recurrent or convolutional networks.',
-    module_count: 3,
+    chapter_count: 3,
     ingested_at: '2026-03-28T12:00:00Z',
   },
 ]
@@ -47,8 +47,8 @@ describe('PaperList', () => {
 
   it('shows module count badge', async () => {
     renderList()
-    await waitFor(() => screen.getByText('6 modules'))
-    expect(screen.getByText('3 modules')).toBeInTheDocument()
+    await waitFor(() => screen.getByText('6 chapters'))
+    expect(screen.getByText('3 chapters')).toBeInTheDocument()
   })
 
   it('truncates long author lists with et al.', async () => {

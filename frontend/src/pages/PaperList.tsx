@@ -35,7 +35,7 @@ function PaperCard({ paper, onClick }: { paper: PaperIndexEntry; onClick: () => 
           flexShrink: 0, fontSize: 11, fontWeight: 700, padding: '3px 8px', borderRadius: 99,
           background: '#eff6ff', color: '#3b82f6', border: '1px solid #bfdbfe',
         }}>
-          {paper.module_count} module{paper.module_count !== 1 ? 's' : ''}
+          {paper.chapter_count} chapter{paper.chapter_count !== 1 ? 's' : ''}
         </span>
       </div>
       <p style={{ margin: '0 0 8px', fontSize: 12, color: '#6b7280' }}>
@@ -100,7 +100,7 @@ export function PaperList() {
       <header style={{ background: '#fff', borderBottom: '1px solid #e5e7eb', padding: '16px 24px' }}>
         <h1 style={{ margin: 0, fontSize: 22, fontWeight: 700 }}>PaperTeardown</h1>
         <p style={{ margin: '4px 0 0', fontSize: 13, color: '#6b7280' }}>
-          Deconstructed PyTorch papers — browse modules, read code explanations
+          Deconstructed PyTorch papers — browse chapters, read code explanations
         </p>
       </header>
 
