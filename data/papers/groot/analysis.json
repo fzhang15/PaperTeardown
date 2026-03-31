@@ -1,0 +1,247 @@
+{
+  "chapters": [
+    {
+      "id": "the-generalist-robot-problem",
+      "title": "The Generalist Robot Problem",
+      "narrative": "Most robot learning systems are brittle specialists: a policy trained to open a fridge in one lab fails on a different fridge, in a different kitchen, on a different robot arm. The dream of robotics has always been a single model that generalises — across tasks, across environments, and crucially, across robot embodiments.\n\nGR00T N1 is NVIDIA's answer. It is an open foundation model for generalist humanoid robots, designed to be fine-tuned onto any new embodiment without retraining from scratch. The name stands for Generalist Robot 00 Technology, and its architecture is deliberately inspired by cognitive science's dual-process theory.\n\nSystem 2 is the slow, deliberate part: a large Vision-Language Model (VLM) called Eagle2 that processes camera frames and natural-language task instructions, reasoning about what the robot should do next. System 1 is the fast, reactive part: a compact Diffusion Transformer (DiT) that takes the VLM's rich contextual features and uses flow-matching to generate a chunk of 16 future joint-position targets in a handful of denoising steps.\n\nThe key architectural innovation is how GR00T handles heterogeneous embodiments — robots with different numbers of joints, cameras, and action spaces. Rather than hard-coding a single action dimensionality, GR00T learns separate weight matrices for each registered robot, indexed by an embodiment ID. A single checkpoint therefore covers the Fourier GR1 humanoid, Unitree G1, WidowX arm, and many others, all sharing the expensive VLM backbone while routing through embodiment-specific projections.\n\nThis chapter introduces the problem. The remaining chapters walk through every component in data-flow order.",
+      "code_blocks": []
+    },
+    {
+      "id": "eagle2-backbone",
+      "title": "Eagle2: The Vision-Language Backbone",
+      "narrative": "System 2 of GR00T is the Eagle2 VLM, a 2-billion-parameter vision-language model developed by NVIDIA. It combines a SigLIP vision encoder with a Phi-3 language model, connected by a cross-modal MLP projector (mlp1). Eagle2 was trained on internet-scale image-text data, so it already understands scenes, objects, and natural language instructions before seeing a single robot demonstration.\n\nGR00T wraps Eagle2 in the EagleBackbone class. Two design decisions are worth noting. First, GR00T only uses the first 16 transformer layers of the language model (select_layer=16 in the config), discarding the upper layers. The lower layers produce rich contextual embeddings; the upper layers are mostly needed for token prediction, which GR00T never does. Discarding them saves roughly half the compute and memory of the LLM.\n\nSecond, the backbone's forward pass returns not just the hidden states, but also an image_mask — a boolean tensor marking which sequence positions correspond to vision tokens (flattened image patches) versus text tokens (the task instruction). This mask is critical for the downstream AlternateVLDiT, which needs to route attention separately to image and text content.",
+      "code_blocks": [
+        {
+          "label": "EagleBackbone.forward — extracting vision-language features",
+          "source": "    def forward(self, vl_input: BatchFeature) -> BatchFeature:\n        self.set_frozen_modules_to_eval_mode()\n        # 0. Set frozen module to eval\n        keys_to_use = [\"input_ids\", \"attention_mask\", \"pixel_values\"]\n        vl_input = {k: vl_input[k] for k in keys_to_use}\n        outputs = self.model(**vl_input, output_hidden_states=True)\n        outputs = outputs[\"hidden_states\"][-1]\n        image_mask = vl_input[\"input_ids\"] == self.model.config.image_token_index\n        attention_mask = vl_input[\"attention_mask\"] == 1\n        return BatchFeature(\n            data={\n                \"backbone_features\": outputs,\n                \"backbone_attention_mask\": attention_mask,\n                \"image_mask\": image_mask,\n            }\n        )  # [B, T2, hidden_size]",
+          "source_start_line": 105,
+          "file_path": "gr00t/model/modules/eagle_backbone.py",
+          "annotations": [
+            {
+              "start_line": 110,
+              "end_line": 111,
+              "explanation": "Eagle2 is called with output_hidden_states=True, then we take hidden_states[-1] — the output of the 16th (last) transformer layer. This gives shape [B, S, 2048] where S is the combined sequence of image patch tokens + language tokens.",
+              "concept_tag": "embedding"
+            },
+            {
+              "start_line": 112,
+              "end_line": 113,
+              "explanation": "image_mask marks which token positions contain vision features (True) vs. text tokens (False). The backbone_attention_mask drops padding positions. Both masks are passed downstream so the DiT can selectively cross-attend to image or text tokens.",
+              "concept_tag": "attention"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "category-specific-linear",
+      "title": "CategorySpecificLinear: One Weight Matrix Per Robot",
+      "narrative": "Consider the mismatch in robot action spaces: a full humanoid like the Fourier GR1 has 23 DOF, a tabletop WidowX arm has 6, and a mobile manipulator might have 12. A single shared linear layer cannot map all of these cleanly to a common embedding space — the geometry is fundamentally different for each embodiment.\n\nGR00T solves this with CategorySpecificLinear, a linear layer that maintains separate weight matrices W and bias vectors b for every registered robot embodiment (up to 32 in the default config). During a forward pass, the embodiment ID is used to index into these stacked parameter tensors with a single batch-indexing operation, and then a batched matrix multiply (torch.bmm) applies the correct transformation for each sample in the batch.\n\nThis is elegant: there is no if/else branching, no dynamic dispatch, and no overhead beyond one extra index into a parameter tensor. The entire multi-embodiment routing is expressed as two lines of PyTorch.\n\nTwo MLP variants are built on top of this primitive: CategorySpecificMLP stacks two CategorySpecificLinear layers with a ReLU activation — used for encoding robot state and decoding predicted actions. MultiEmbodimentActionEncoder (covered in the next chapter) adds sinusoidal time conditioning.",
+      "code_blocks": [
+        {
+          "label": "CategorySpecificLinear — per-embodiment batch matmul",
+          "source": "class CategorySpecificLinear(nn.Module):\n    \"\"\"Linear layer with category-specific weights and biases for multi-embodiment support.\"\"\"\n\n    def __init__(self, num_categories, input_dim, hidden_dim):\n        super().__init__()\n        self.num_categories = num_categories\n        # For each category, we have separate weights and biases.\n        self.W = nn.Parameter(0.02 * torch.randn(num_categories, input_dim, hidden_dim))\n        self.b = nn.Parameter(torch.zeros(num_categories, hidden_dim))\n\n    def forward(self, x, cat_ids):\n        \"\"\"\n        Args:\n            x: [B, T, input_dim] input tensor\n            cat_ids: [B] category/embodiment IDs\n        Returns:\n            [B, T, hidden_dim] output tensor\n        \"\"\"\n        selected_W = self.W[cat_ids]\n        selected_b = self.b[cat_ids]\n        return torch.bmm(x, selected_W) + selected_b.unsqueeze(1)",
+          "source_start_line": 44,
+          "file_path": "gr00t/model/modules/embodiment_conditioned_mlp.py",
+          "annotations": [
+            {
+              "start_line": 51,
+              "end_line": 52,
+              "explanation": "W has shape [num_embodiments, input_dim, hidden_dim] — a separate weight matrix for each robot. Initialised with small random values (scale 0.02, the same initialisation GPT uses for its projections) to avoid large activations at the start of training.",
+              "concept_tag": "linear"
+            },
+            {
+              "start_line": 62,
+              "end_line": 64,
+              "explanation": "cat_ids indexes into the first dimension of W, selecting shape [B, input_dim, hidden_dim]. torch.bmm then performs B independent matrix multiplications — one per sample, each using that sample's embodiment-specific weights. The entire routing is two lines with no Python-level branching.",
+              "concept_tag": "linear"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "action-encoder",
+      "title": "MultiEmbodimentActionEncoder: Embedding Noisy Actions with Time",
+      "narrative": "During training, GR00T receives a noisy action trajectory — a tensor of shape [B, T_action, action_dim] that is a linear interpolation between Gaussian noise and the ground-truth action sequence. The model must predict the velocity that points from noise toward the true action. But to do that, it needs to know how noisy the current trajectory is — that is, what diffusion timestep t we are at.\n\nMultiEmbodimentActionEncoder fuses three signals into a single embedding: (1) the noisy action values, (2) the diffusion timestep, and (3) the embodiment ID. The action is first projected by an embodiment-specific linear layer W1. Separately, the timestep scalar t is converted to a sinusoidal positional encoding of the same hidden dimension w (matching the classic Transformer approach used by DDPM and many successors). These two w-dimensional vectors are concatenated to form a 2w vector, projected back to w by embodiment-specific W2 with Swish activation, and then projected again to w by W3.\n\nThe result is a [B, T_action, w] tensor that encodes both where the trajectory currently is in joint space and where it is in the denoising schedule — all conditioned on which robot body is being controlled.",
+      "code_blocks": [
+        {
+          "label": "MultiEmbodimentActionEncoder.forward — fusing action, time, and embodiment",
+          "source": "    def forward(self, actions, timesteps, cat_ids):\n        \"\"\"\n        Args:\n            actions: [B, T, action_dim] action tensor\n            timesteps: [B,] timesteps - a single scalar per batch item\n            cat_ids: [B,] category/embodiment IDs\n        Returns:\n            [B, T, hidden_size] encoded action features\n        \"\"\"\n        B, T, _ = actions.shape\n\n        # 1) Expand each batch's single scalar time 'tau' across all T steps\n        #    so that shape => (B, T)\n        #    e.g. if timesteps is (B,), replicate across T\n        if timesteps.dim() == 1 and timesteps.shape[0] == B:\n            # shape (B,) => (B,T)\n            timesteps = timesteps.unsqueeze(1).expand(-1, T)\n        else:\n            raise ValueError(\n                \"Expected `timesteps` to have shape (B,) so we can replicate across T.\"\n            )\n\n        # 2) Standard action MLP step for shape => (B, T, w)\n        a_emb = self.W1(actions, cat_ids)\n\n        # 3) Get the sinusoidal encoding (B, T, w)\n        tau_emb = self.pos_encoding(timesteps).to(dtype=a_emb.dtype)\n\n        # 4) Concat along last dim => (B, T, 2w), then W2 => (B, T, w), swish\n        x = torch.cat([a_emb, tau_emb], dim=-1)\n        x = swish(self.W2(x, cat_ids))\n\n        # 5) Finally W3 => (B, T, w)\n        x = self.W3(x, cat_ids)\n        return x",
+          "source_start_line": 176,
+          "file_path": "gr00t/model/modules/embodiment_conditioned_mlp.py",
+          "annotations": [
+            {
+              "start_line": 198,
+              "end_line": 199,
+              "explanation": "W1 is the embodiment-specific linear projection from action_dim to hidden_size w. Each robot gets its own linear transformation, so a 23-DOF humanoid and a 6-DOF arm are projected independently into the shared w-dimensional action embedding space.",
+              "concept_tag": "embedding"
+            },
+            {
+              "start_line": 204,
+              "end_line": 206,
+              "explanation": "The sinusoidal time embedding tau_emb (same dimension w) is concatenated with the action embedding, giving a 2w vector that encodes both joint state AND noise level. W2 projects back to w with Swish activation — this is the key fusion step.",
+              "concept_tag": "embedding"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "diffusion-transformer",
+      "title": "The Diffusion Transformer: Conditioning Action Tokens on VL Features",
+      "narrative": "The heart of GR00T's System 1 is a Diffusion Transformer (DiT) — a transformer-based denoiser that takes the concatenated [state_tokens, action_tokens] sequence and predicts the velocity that points toward the clean action.\n\nAdaptive Layer Norm (AdaLayerNorm) is how the diffusion timestep is injected into every transformer block. Instead of fixed layer normalisation parameters, AdaLayerNorm uses the timestep embedding to predict a per-channel scale and shift, modulating the hidden states before each attention operation. This is what makes the transformer 'diffusion-aware' — without it, the model would have no way of knowing whether it's operating at high or low noise.\n\nThe DiT has two attention modes alternated across its 32 layers. On even-indexed blocks, the transformer performs cross-attention from the action/state tokens to the VLM's backbone_features — this is how the robot's planned motion is conditioned on what the camera sees and what the instruction says. On odd-indexed blocks, it performs self-attention among the action/state tokens themselves, letting the model reason about temporal coherence across the 16-step action horizon.",
+      "code_blocks": [
+        {
+          "label": "AdaLayerNorm — timestep-conditioned scale and shift",
+          "source": "class AdaLayerNorm(nn.Module):\n    def __init__(\n        self,\n        embedding_dim: int,\n        norm_elementwise_affine: bool = False,\n        norm_eps: float = 1e-5,\n        chunk_dim: int = 0,\n    ):\n        super().__init__()\n        self.chunk_dim = chunk_dim\n        output_dim = embedding_dim * 2\n        self.silu = nn.SiLU()\n        self.linear = nn.Linear(embedding_dim, output_dim)\n        self.norm = nn.LayerNorm(output_dim // 2, norm_eps, norm_elementwise_affine)\n\n    def forward(\n        self,\n        x: torch.Tensor,\n        temb: Optional[torch.Tensor] = None,\n    ) -> torch.Tensor:\n        temb = self.linear(self.silu(temb))\n        scale, shift = temb.chunk(2, dim=1)\n        x = self.norm(x) * (1 + scale[:, None]) + shift[:, None]\n        return x",
+          "source_start_line": 59,
+          "file_path": "gr00t/model/modules/dit.py",
+          "annotations": [
+            {
+              "start_line": 79,
+              "end_line": 81,
+              "explanation": "The timestep embedding (temb) is projected to 2×dim, then split into scale and shift vectors. The hidden states are LayerNorm'd, then multiplied by (1+scale) and shifted. This is the standard DiT-style adaptive normalisation: the model learns to suppress or amplify features based on the current noise level.",
+              "concept_tag": "normalization"
+            }
+          ]
+        },
+        {
+          "label": "DiT.forward — interleaved cross-attention and self-attention",
+          "source": "    def forward(\n        self,\n        hidden_states: torch.Tensor,  # Shape: (B, T, D)\n        encoder_hidden_states: torch.Tensor,  # Shape: (B, S, D)\n        timestep: Optional[torch.LongTensor] = None,\n        encoder_attention_mask: Optional[torch.Tensor] = None,\n        return_all_hidden_states: bool = False,\n    ):\n        # Encode timesteps\n        temb = self.timestep_encoder(timestep)\n\n        # Process through transformer blocks - single pass through the blocks\n        hidden_states = hidden_states.contiguous()\n        encoder_hidden_states = encoder_hidden_states.contiguous()\n\n        all_hidden_states = [hidden_states]\n\n        # Process through transformer blocks\n        for idx, block in enumerate(self.transformer_blocks):\n            if idx % 2 == 1 and self.config.interleave_self_attention:\n                hidden_states = block(\n                    hidden_states,\n                    attention_mask=None,\n                    encoder_hidden_states=None,\n                    encoder_attention_mask=None,\n                    temb=temb,\n                )\n            else:\n                hidden_states = block(\n                    hidden_states,\n                    attention_mask=None,\n                    encoder_hidden_states=encoder_hidden_states,\n                    encoder_attention_mask=None,\n                    temb=temb,\n                )\n            all_hidden_states.append(hidden_states)\n\n        # Output processing\n        conditioning = temb\n        shift, scale = self.proj_out_1(F.silu(conditioning)).chunk(2, dim=1)\n        hidden_states = self.norm_out(hidden_states) * (1 + scale[:, None]) + shift[:, None]\n        if return_all_hidden_states:\n            return self.proj_out_2(hidden_states), all_hidden_states\n        else:\n            return self.proj_out_2(hidden_states)",
+          "source_start_line": 277,
+          "file_path": "gr00t/model/modules/dit.py",
+          "annotations": [
+            {
+              "start_line": 286,
+              "end_line": 286,
+              "explanation": "The diffusion timestep integer is converted to a rich embedding vector (temb) via sinusoidal projection followed by an MLP. This temb is passed to every transformer block and drives AdaLayerNorm conditioning throughout the network.",
+              "concept_tag": "embedding"
+            },
+            {
+              "start_line": 295,
+              "end_line": 311,
+              "explanation": "Odd-indexed blocks (idx%2==1) do self-attention among action/state tokens — reasoning about temporal consistency across the 16-step horizon. Even-indexed blocks do cross-attention from action/state tokens TO the VLM's encoder_hidden_states — grounding the motion plan in vision and language.",
+              "concept_tag": "attention"
+            },
+            {
+              "start_line": 315,
+              "end_line": 317,
+              "explanation": "Final adaptive norm: the timestep embedding produces a last scale/shift applied after the final LayerNorm, before the output projection. This ensures the output magnitude is also conditioned on noise level — important for flow matching where the target velocity magnitude changes with t.",
+              "concept_tag": "normalization"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "alternate-vl-dit",
+      "title": "AlternateVLDiT: Interleaving Image and Text Cross-Attention",
+      "narrative": "The default DiT always cross-attends to the full backbone sequence — both image patch tokens and language instruction tokens mixed together. AlternateVLDiT improves on this by alternating cross-attention between two disjoint subsets of the VLM sequence: image tokens on some blocks, text tokens on others.\n\nThe intuition: visual and language information carry very different signals. Image tokens tell the model about the current state of the workspace — where objects are, what gripper pose looks like. Language tokens tell it what the goal is. By attending to them separately in alternating blocks, the DiT can build separate representations for spatial 'what is' and semantic 'what to do', then integrate them through the interleaved self-attention blocks.\n\nConcretely, the image_mask boolean tensor (produced by EagleBackbone) is used to split the backbone sequence into two sub-masks. Every 2×attend_text_every_n_blocks cross-attention blocks attend to text; the others attend to image. In the default config with attend_text_every_n_blocks=2, that means every 4 cross-attention blocks attend to text, and the other cross-attention blocks attend to image — a 1:3 text-to-image ratio that reflects the visual nature of robotic manipulation.",
+      "code_blocks": [
+        {
+          "label": "AlternateVLDiT.forward — alternating image and text cross-attention",
+          "source": "    def forward(\n        self,\n        hidden_states: torch.Tensor,  # Shape: (B, T, D)\n        encoder_hidden_states: torch.Tensor,  # Shape: (B, S, D)\n        timestep: Optional[torch.LongTensor] = None,\n        encoder_attention_mask: Optional[torch.Tensor] = None,\n        return_all_hidden_states: bool = False,\n        image_mask: Optional[torch.Tensor] = None,\n        backbone_attention_mask: Optional[torch.Tensor] = None,\n    ):\n        assert image_mask is not None, \"Image mask is required\"\n\n        # Encode timesteps\n        temb = self.timestep_encoder(timestep)\n\n        # Process through transformer blocks - single pass through the blocks\n        hidden_states = hidden_states.contiguous()\n        encoder_hidden_states = encoder_hidden_states.contiguous()\n\n        # Create attention masks for image and non-image tokens\n        # image_mask shape: (B, S) where True indicates image tokens\n        # For attention, we need to invert: False means \"don't attend to this token\"\n\n        image_attention_mask = image_mask & backbone_attention_mask\n        non_image_attention_mask = (~image_mask) & backbone_attention_mask\n\n        all_hidden_states = [hidden_states]\n        assert self.config.interleave_self_attention, \"Interleave self attention must be enabled\"\n\n        # Process through transformer blocks\n        for idx, block in enumerate(self.transformer_blocks):\n            if idx % 2 == 1:\n                # Self-attention blocks\n                hidden_states = block(\n                    hidden_states,\n                    attention_mask=None,\n                    encoder_hidden_states=None,\n                    encoder_attention_mask=None,\n                    temb=temb,\n                )\n            else:\n                # Cross-attention blocks - alternate between non-image and image tokens\n                if idx % (2 * self.attend_text_every_n_blocks) == 0:\n                    # Attend to non-image tokens\n                    curr_encoder_attention_mask = non_image_attention_mask\n                else:\n                    # Attend to image tokens\n                    curr_encoder_attention_mask = image_attention_mask\n\n                hidden_states = block(\n                    hidden_states,\n                    attention_mask=None,\n                    encoder_hidden_states=encoder_hidden_states,\n                    encoder_attention_mask=curr_encoder_attention_mask,\n                    temb=temb,\n                )\n            all_hidden_states.append(hidden_states)\n\n        # Output processing\n        conditioning = temb\n        shift, scale = self.proj_out_1(F.silu(conditioning)).chunk(2, dim=1)\n        hidden_states = self.norm_out(hidden_states) * (1 + scale[:, None]) + shift[:, None]\n        if return_all_hidden_states:\n            return self.proj_out_2(hidden_states), all_hidden_states\n        else:\n            return self.proj_out_2(hidden_states)",
+          "source_start_line": 334,
+          "file_path": "gr00t/model/modules/dit.py",
+          "annotations": [
+            {
+              "start_line": 357,
+              "end_line": 358,
+              "explanation": "The backbone sequence is split into two boolean masks by ANDing image_mask with the padding mask. image_attention_mask keeps only vision patch tokens active; non_image_attention_mask keeps only language tokens. The full encoder_hidden_states tensor is passed to both but the mask zeroes out the irrelevant portion.",
+              "concept_tag": "attention"
+            },
+            {
+              "start_line": 375,
+              "end_line": 381,
+              "explanation": "The cross-attention schedule: even blocks (idx%2==0) alternate between text (when idx is divisible by 2*attend_text_every_n_blocks) and image tokens. With attend_text_every_n_blocks=2, every 4th cross-attention block attends to language; the others attend to vision — a high visual bandwidth appropriate for precise manipulation.",
+              "concept_tag": "attention"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "flow-matching-training",
+      "title": "Flow Matching: Training with Interpolated Trajectories",
+      "narrative": "GR00T is trained using flow matching, a generative modelling technique that is conceptually simpler than DDPM diffusion while achieving comparable or better sample quality. Flow matching defines a straight-line 'flow' between a noise distribution and the data distribution: a noisy sample at time t is simply a linear interpolation between a Gaussian noise vector and the clean target.\n\nThe model is trained to predict the 'velocity' — the vector pointing from the noise toward the clean action. At inference, following this predicted velocity for T small steps (Euler integration) turns the initial noise into a plausible action trajectory.\n\nTwo details distinguish GR00T's training schedule from a naive implementation. First, the noise timestep t is sampled from a Beta(1.5, 1.0) distribution rather than uniformly. This distribution is skewed toward t=1 (high signal, low noise), meaning the model trains more often on near-clean trajectories — empirically this produces smoother actions. Second, t is clipped to [0, noise_s=0.999], never reaching t=1.0 exactly, which avoids numerical instability when the noisy and target trajectories are identical.\n\nThe loss is masked MSE: the model only pays a gradient penalty for the action dimensions that are active for this embodiment (action_mask handles the variable-dimensionality case, zeroing out the padding dimensions of shorter-DOF robots).",
+      "code_blocks": [
+        {
+          "label": "Flow matching forward pass — interpolation, velocity target, and masked loss",
+          "source": "        # Embed noised action trajectory.\n        actions = action_input.action\n        noise = torch.randn(actions.shape, device=actions.device, dtype=actions.dtype)\n        t = self.sample_time(actions.shape[0], device=actions.device, dtype=actions.dtype)\n        t = t[:, None, None]  # shape (B,1,1) for broadcast\n\n        noisy_trajectory = (1 - t) * noise + t * actions\n        velocity = actions - noise\n\n        # Convert (continuous) t -> discrete if needed\n        t_discretized = (t[:, 0, 0] * self.num_timestep_buckets).long()\n        action_features = self.action_encoder(noisy_trajectory, t_discretized, embodiment_id)\n\n        # Maybe add position embedding.\n        if self.config.add_pos_embed:\n            pos_ids = torch.arange(action_features.shape[1], dtype=torch.long, device=device)\n            pos_embs = self.position_embedding(pos_ids).unsqueeze(0)\n            action_features = action_features + pos_embs\n\n        # Join vision, language, state and action embedding along sequence dimension.\n        sa_embs = torch.cat((state_features, action_features), dim=1)\n        vl_attn_mask = backbone_output.backbone_attention_mask\n\n        if self.config.use_alternate_vl_dit:\n            image_mask = backbone_output.image_mask\n            backbone_attention_mask = backbone_output.backbone_attention_mask\n            model_output, _ = self.model(\n                hidden_states=sa_embs,\n                encoder_hidden_states=vl_embeds,\n                encoder_attention_mask=vl_attn_mask,\n                timestep=t_discretized,\n                return_all_hidden_states=True,\n                image_mask=image_mask,\n                backbone_attention_mask=backbone_attention_mask,\n            )\n        else:\n            model_output, _ = self.model(\n                hidden_states=sa_embs,\n                encoder_hidden_states=vl_embeds,\n                encoder_attention_mask=vl_attn_mask,\n                timestep=t_discretized,\n                return_all_hidden_states=True,\n            )\n\n        pred = self.action_decoder(model_output, embodiment_id)\n        pred_actions = pred[:, -actions.shape[1] :]\n\n        # Slice out only the action portion of pred and target.\n        action_mask = action_input.action_mask\n        action_loss = F.mse_loss(pred_actions, velocity, reduction=\"none\") * action_mask\n        loss = action_loss.sum() / (action_mask.sum() + 1e-6)",
+          "source_start_line": 198,
+          "file_path": "gr00t/model/gr00t_n1d6/gr00t_n1d6.py",
+          "annotations": [
+            {
+              "start_line": 204,
+              "end_line": 205,
+              "explanation": "This is the heart of flow matching. noisy_trajectory = (1-t)*noise + t*actions is the linear interpolation: at t=0 it is pure Gaussian noise, at t=1 it is the clean action. velocity = actions - noise is the target direction the model must predict — the straight-line vector from noise to data.",
+              "concept_tag": "loss"
+            },
+            {
+              "start_line": 242,
+              "end_line": 248,
+              "explanation": "The action_decoder outputs a vector for both state tokens and action tokens (the full sa_embs sequence). pred[:, -actions.shape[1]:] slices off only the action portion. The masked MSE loss then only penalises active DOF channels — padding dimensions from shorter-DOF robots have action_mask=0 and contribute no gradient.",
+              "concept_tag": "loss"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "euler-inference",
+      "title": "Inference: Euler Integration from Noise to Action",
+      "narrative": "At inference time, GR00T generates actions by running the flow in reverse — starting from pure Gaussian noise and stepping toward a clean action trajectory using Euler integration. The number of inference steps is just 4 (num_inference_timesteps=4 in the config), making inference very fast despite having a 32-layer DiT.\n\nWhy can we get away with just 4 steps? Because flow matching, unlike DDPM diffusion, trains the model to predict a straight-line velocity — not a curved score function. Straight-line flows require far fewer integration steps to follow accurately. DDPM typically needs 50-1000 DDIM steps; GR00T needs 4.\n\nEach step: encode the current noisy action + the current timestep t, concatenate with embedded state, pass through the DiT (cross-attending to the cached VLM features), decode the predicted velocity, and nudge the actions by dt * velocity. After 4 steps, the actions tensor holds a 16-step action horizon of joint positions that the robot can execute at ~6Hz.",
+      "code_blocks": [
+        {
+          "label": "get_action_with_features — Euler integration over 4 denoising steps",
+          "source": "        # Set initial actions as the sampled noise.\n        batch_size = vl_embeds.shape[0]\n        device = vl_embeds.device\n        actions = torch.randn(\n            size=(batch_size, self.config.action_horizon, self.action_dim),\n            dtype=vl_embeds.dtype,\n            device=device,\n        )\n\n        dt = 1.0 / self.num_inference_timesteps\n\n        # Run denoising steps.\n        for t in range(self.num_inference_timesteps):\n            t_cont = t / float(self.num_inference_timesteps)  # e.g. goes 0, 1/N, 2/N, ...\n            t_discretized = int(t_cont * self.num_timestep_buckets)\n\n            # Embed noised action trajectory.\n            timesteps_tensor = torch.full(\n                size=(batch_size,), fill_value=t_discretized, device=device\n            )\n            action_features = self.action_encoder(actions, timesteps_tensor, embodiment_id)\n            # Add position embedding.\n            if self.config.add_pos_embed:\n                pos_ids = torch.arange(action_features.shape[1], dtype=torch.long, device=device)\n                pos_embs = self.position_embedding(pos_ids).unsqueeze(0)\n                action_features = action_features + pos_embs\n\n            # Join vision, language, state and action embedding along sequence dimension.\n            sa_embs = torch.cat((state_features, action_features), dim=1)\n\n            # Run model forward.\n            if self.config.use_alternate_vl_dit:\n                model_output = self.model(\n                    hidden_states=sa_embs,\n                    encoder_hidden_states=vl_embeds,\n                    timestep=timesteps_tensor,\n                    image_mask=backbone_output.image_mask,\n                    backbone_attention_mask=backbone_output.backbone_attention_mask,\n                )\n            else:\n                model_output = self.model(\n                    hidden_states=sa_embs,\n                    encoder_hidden_states=vl_embeds,\n                    timestep=timesteps_tensor,\n                )\n            pred = self.action_decoder(model_output, embodiment_id)\n\n            pred_velocity = pred[:, -self.action_horizon :]\n\n            # Update actions using euler integration.\n            actions = actions + dt * pred_velocity\n        return BatchFeature(\n            data={\n                \"action_pred\": actions,\n                \"backbone_features\": vl_embeds,\n                \"state_features\": state_features,\n            }\n        )",
+          "source_start_line": 307,
+          "file_path": "gr00t/model/gr00t_n1d6/gr00t_n1d6.py",
+          "annotations": [
+            {
+              "start_line": 310,
+              "end_line": 316,
+              "explanation": "Inference starts with a fresh Gaussian noise tensor of shape [B, action_horizon=16, action_dim=29]. dt = 1/4 = 0.25 is the Euler step size. The timestep t steps from 0 to 3/4 — we never reach t=1.0 (clean data) because the model was trained only up to noise_s=0.999.",
+              "concept_tag": "other:flow-matching"
+            },
+            {
+              "start_line": 354,
+              "end_line": 357,
+              "explanation": "Euler integration: actions += dt * predicted_velocity. The velocity is the model's estimate of the direction from noise toward clean actions. After 4 applications, the noisy tensor has been 'flowed' into a plausible 16-step action chunk. Because flows are trained to be straight lines, 4 steps is enough.",
+              "concept_tag": "other:flow-matching"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "putting-it-all-together",
+      "title": "Putting It All Together: The Full GR00T Forward Pass",
+      "narrative": "The Gr00tN1d6 class ties every component together into one HuggingFace-compatible model. Training and inference share the same two-stage structure: (1) run the Eagle2 backbone to extract vision-language features, (2) run the action head with those features as cross-attention context.\n\nAt training time, forward() calls the action head's training path — which samples a random noise timestep, corrupts the ground-truth action trajectory, and returns the flow-matching loss.\n\nAt inference time, get_action() calls the action head's sampling path — which runs 4 Euler steps from noise to a clean action chunk, cross-attending at each step to the same cached backbone_features.\n\nThe separation is clean: the EagleBackbone runs once per observation (expensive, ~2B parameters, frozen at inference). The DiT action head runs once per action chunk request (fast, ~300M parameters, 4 forward passes). On NVIDIA hardware this latency fits comfortably within the robot's 6Hz control loop.\n\nFrom first principles to full system: GR00T shows that the same foundation model recipe that works for vision-language tasks — pretrain a large VLM on internet data, fine-tune on task data — also works for embodied robotics, as long as you replace the text output head with a diffusion-based action head that handles continuous multi-dimensional outputs, variable robot morphologies, and real-time control constraints.",
+      "code_blocks": [
+        {
+          "label": "Gr00tN1d6.forward and get_action — training and inference entry points",
+          "source": "        # Prepare inputs for backbone and action head\n        backbone_inputs, action_inputs = self.prepare_input(inputs)\n        backbone_outputs = self.backbone(backbone_inputs)\n        action_outputs = self.action_head(backbone_outputs, action_inputs)\n\n        return action_outputs\n\n    def get_action(self, inputs: dict) -> BatchFeature:\n        \"\"\"\n        Generate actions using the complete model.\n        \"\"\"\n        # Prepare inputs for backbone and action head\n        backbone_inputs, action_inputs = self.prepare_input(inputs)\n\n        # Forward through backbone\n        backbone_outputs = self.backbone(backbone_inputs)\n        action_outputs = self.action_head.get_action(backbone_outputs, action_inputs)\n\n        return action_outputs",
+          "source_start_line": 508,
+          "file_path": "gr00t/model/gr00t_n1d6/gr00t_n1d6.py",
+          "annotations": [
+            {
+              "start_line": 509,
+              "end_line": 511,
+              "explanation": "Training forward: prepare_input splits the input dict into backbone inputs (pixel_values, input_ids, attention_mask) and action inputs (state, action, embodiment_id, action_mask). The backbone runs once; the action head computes the flow-matching loss.",
+              "concept_tag": "other:architecture"
+            },
+            {
+              "start_line": 520,
+              "end_line": 524,
+              "explanation": "Inference forward: identical structure, but action_head.get_action() runs the 4-step Euler sampler instead of the loss computation. The backbone output is reused across all 4 denoising steps — it is computed once and cached, keeping inference latency low.",
+              "concept_tag": "other:architecture"
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "summary": "GR00T N1 is NVIDIA's open foundation model for generalist humanoid robots. It couples a frozen Eagle2 vision-language model (System 2) with a flow-matching Diffusion Transformer action head (System 1). The VLM extracts rich image and language features from camera observations and task instructions; the 32-layer DiT cross-attends to those features while iteratively denoising a Gaussian noise tensor into a 16-step action chunk via 4 Euler integration steps. Multi-embodiment support is achieved through CategorySpecificLinear layers that maintain separate weight matrices for each registered robot, indexed by an embodiment ID at runtime. AlternateVLDiT further specialises cross-attention by alternating between image-token and text-token subsets of the VLM sequence, giving the action head separate high-bandwidth visual and semantic pathways. Training uses a Beta-distribution-skewed flow matching schedule with masked MSE loss over active joint dimensions."
+}

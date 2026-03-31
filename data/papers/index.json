@@ -40,6 +40,16 @@
     "ingested_at": "2026-03-31T00:00:00Z"
   },
   {
+    "id": "groot",
+    "title": "GR00T N1: An Open Foundation Model for Generalist Humanoid Robots",
+    "authors": ["NVIDIA Isaac Team"],
+    "arxiv_url": "https://arxiv.org/abs/2503.14734",
+    "repo_url": "https://github.com/NVIDIA/Isaac-GR00T",
+    "abstract": "We present GR00T N1, an open foundation model for generalist humanoid robots. GR00T N1 uses a dual-system architecture: a large Vision-Language Model (Eagle2, System 2) processes camera frames and natural-language task instructions, while a compact Diffusion Transformer action head (System 1) generates robot actions via flow matching. Multi-embodiment support is achieved through category-specific linear layers that maintain separate weight matrices for each robot morphology, indexed at runtime by an embodiment ID.",
+    "chapter_count": 9,
+    "ingested_at": "2026-03-31T00:00:00Z"
+  },
+  {
     "id": "pi0",
     "title": "pi0: A Vision-Language-Action Flow Model for General Robot Control",
     "authors": ["Kevin Black", "Noah Brown", "Danny Driess", "Chelsea Finn", "Karol Hausman", "Sergey Levine", "et al."],

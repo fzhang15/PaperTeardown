@@ -1,0 +1,12 @@
+{
+  "id": "groot",
+  "title": "GR00T N1: An Open Foundation Model for Generalist Humanoid Robots",
+  "authors": ["NVIDIA Isaac Team"],
+  "arxiv_url": "https://arxiv.org/abs/2503.14734",
+  "repo_url": "https://github.com/NVIDIA/Isaac-GR00T",
+  "abstract": "We present GR00T N1, an open foundation model for generalist humanoid robots. GR00T N1 uses a dual-system architecture: a large Vision-Language Model (Eagle2, System 2) processes camera frames and natural-language task instructions, while a compact Diffusion Transformer action head (System 1) generates robot actions via flow matching. Multi-embodiment support is achieved through category-specific linear layers that maintain separate weight matrices for each robot morphology, indexed at runtime by an embodiment ID. AlternateVLDiT further improves cross-attention efficiency by alternating between image and text token subsets of the VLM sequence. The model achieves state-of-the-art performance across multiple humanoid robot platforms and generalises to new embodiments via fine-tuning.",
+  "introduction_excerpt": "We introduce GR00T N1 (Generalist Robot 00 Technology), an open foundation model designed to serve as a general-purpose brain for humanoid robots. Inspired by dual-process cognitive theory, GR00T N1 combines a slow, deliberative vision-language system with a fast, reactive flow-matching action system. The architecture supports cross-embodiment training, enabling a single model checkpoint to control diverse robot platforms including the Fourier GR1, Unitree G1, WidowX, and others.",
+  "chapter_count": 9,
+  "pytorch_file_count": 12,
+  "ingested_at": "2026-03-31T00:00:00Z"
+}
