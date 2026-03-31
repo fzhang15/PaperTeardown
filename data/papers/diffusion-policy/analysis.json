@@ -1,0 +1,255 @@
+{
+  "chapters": [
+    {
+      "id": "the-imitation-learning-problem",
+      "title": "The Imitation Learning Problem",
+      "narrative": "Behavioral cloning is the simplest approach to robot learning: collect demonstrations, treat them as supervised data, train a policy to map observations to actions. It works — until it doesn't. The root problem is distribution shift: the policy makes small errors, which push the robot into states not covered by training demonstrations, which cause larger errors, which push it further off-distribution, until the task fails entirely.\n\nA subtler but equally important problem is multi-modality. Human demonstrations of the same task — say, pushing a block to a target — often approach from different angles, use different grip points, or follow different paths. A standard regression policy tries to average these modes together, producing a single 'mean' action that may be physically impossible (e.g., move left and right simultaneously). The result is a frozen, hesitant policy that straddles all valid strategies while committing to none.\n\nDiffusion Policy (Chi et al., 2023) attacks both problems with a single architecture. Rather than directly regressing from observations to actions, it models the action distribution as a diffusion process: a Denoising Diffusion Probabilistic Model (DDPM) that can represent arbitrary multi-modal distributions. The policy learns to denoise a Gaussian noise tensor into a plausible action trajectory, conditioned on the current observation.\n\nTwo design choices make this practical for robotics. First, the policy operates on action chunks — it predicts a horizon of T_p future actions at once (e.g., 16 steps), not a single action. This dramatically improves temporal consistency and reduces the compounding error problem. Second, observation is injected as conditioning into the denoising network rather than concatenated token-by-token, allowing the model to freely attend to the full context while denoising.\n\nThe result: a policy that can represent multi-modal distributions, plan coherent trajectories, and generalise to novel situations — all from demonstrations alone.",
+      "code_blocks": []
+    },
+    {
+      "id": "sinusoidal-timestep-embedding",
+      "title": "Encoding the Diffusion Timestep: SinusoidalPosEmb",
+      "narrative": "The denoising network needs to know how noisy its input is — that is, which step t of the diffusion process it's operating at. A scalar integer (t ∈ {0, …, T-1}) is a poor input directly: it has no useful geometric structure and its scale is arbitrary.\n\nDiffusion Policy borrows the sinusoidal positional encoding from the original Transformer paper, repurposed for diffusion timesteps. The key idea is to map the scalar t to a vector in a high-dimensional space using log-space sinusoidal frequencies. Adjacent timesteps map to nearby vectors (continuity), but the representation also has enough variation to distinguish every timestep (injectivity).\n\nThe resulting embedding has dimension `dim` (256 in the default config), and is passed through a small two-layer MLP (Linear → Mish → Linear) before being concatenated with the observation embedding to form the `global_feature` that conditions every ConditionalResidualBlock in the UNet.",
+      "code_blocks": [
+        {
+          "label": "SinusoidalPosEmb.forward — mapping timestep integer to embedding vector",
+          "source": "    def forward(self, x):\n        device = x.device\n        half_dim = self.dim // 2\n        emb = math.log(10000) / (half_dim - 1)\n        emb = torch.exp(torch.arange(half_dim, device=device) * -emb)\n        emb = x[:, None] * emb[None, :]\n        emb = torch.cat((emb.sin(), emb.cos()), dim=-1)\n        return emb",
+          "source_start_line": 10,
+          "file_path": "diffusion_policy/model/diffusion/positional_embedding.py",
+          "annotations": [
+            {
+              "start_line": 13,
+              "end_line": 16,
+              "explanation": "Log-space frequencies: `emb` starts as geometric sequence [10000^0, 10000^(-1/half_dim), ...]. Multiplying by x (the timestep) then taking sin/cos creates a half_dim-dimensional basis. Concatenating sin and cos gives a dim-dimensional vector where nearby timesteps produce similar vectors but every t is uniquely encoded.",
+              "concept_tag": "embedding"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "conv1d-building-block",
+      "title": "1D Convolutions for Temporal Action Sequences",
+      "narrative": "Robot action sequences are 1D temporal signals: an action chunk has shape [batch, time, action_dim]. Standard image diffusion models use 2D UNets operating on [B, C, H, W] feature maps. Diffusion Policy adapts this to 1D by replacing all 2D operations with 1D counterparts.\n\nThe primitive building block is Conv1dBlock: a single 1D convolution followed by GroupNorm and the Mish activation function. The padding is kernel_size // 2, which keeps the temporal dimension unchanged — so each block operates as a fixed-width temporal filter that mixes information across nearby timesteps.\n\nWhy GroupNorm instead of BatchNorm? GroupNorm computes statistics within each sample, not across the batch. This is critical for small-batch or online robot deployments where batch statistics would be unreliable. Why Mish (x * tanh(softplus(x))) instead of ReLU? Mish is smooth everywhere and allows small negative values to flow through, which helps gradient flow in deep networks.",
+      "code_blocks": [
+        {
+          "label": "Conv1dBlock — the atomic unit of the 1D UNet",
+          "source": "class Conv1dBlock(nn.Module):\n    '''\n        Conv1d --> GroupNorm --> Mish\n    '''\n\n    def __init__(self, inp_channels, out_channels, kernel_size, n_groups=8):\n        super().__init__()\n\n        self.block = nn.Sequential(\n            nn.Conv1d(inp_channels, out_channels, kernel_size, padding=kernel_size // 2),\n            # Rearrange('batch channels horizon -> batch channels 1 horizon'),\n            nn.GroupNorm(n_groups, out_channels),\n            # Rearrange('batch channels 1 horizon -> batch channels horizon'),\n            nn.Mish(),\n        )\n\n    def forward(self, x):\n        return self.block(x)",
+          "source_start_line": 23,
+          "file_path": "diffusion_policy/model/diffusion/conv1d_components.py",
+          "annotations": [
+            {
+              "start_line": 31,
+              "end_line": 37,
+              "explanation": "Three operations in sequence: Conv1d mixes channels and temporal neighbors (kernel_size=3 means each output position sees the adjacent action steps). GroupNorm normalises per-sample, stable at any batch size. Mish activation is smooth and non-monotone, helping gradient flow in deep stacks of these blocks.",
+              "concept_tag": "convolution"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "film-conditioning",
+      "title": "FiLM Conditioning: Injecting Observations into Every Block",
+      "narrative": "The central challenge in conditional diffusion is getting the conditioning signal (observations + timestep) deep into the denoiser. A naive approach appends the condition to the input and hopes it propagates. Diffusion Policy uses a much more principled technique: FiLM (Feature-wise Linear Modulation), which injects the conditioning at every residual block through adaptive per-channel scale and bias.\n\nThe condition vector (`global_feature` — a concatenation of the sinusoidal timestep embedding and the flattened observation) is passed through a small MLP that predicts either a per-channel bias (additive conditioning) or both scale and bias (multiplicative + additive). These are broadcast along the time dimension and applied after the first convolution, before the second. This is identical in spirit to AdaLayerNorm used in DiT and GR00T — the difference is that FiLM operates on 1D feature maps rather than token sequences.\n\nThe residual connection ensures gradients flow cleanly through the full depth of the network regardless of the conditioning, which is critical during the early stages of training when the condition signal may produce large modulations.",
+      "code_blocks": [
+        {
+          "label": "ConditionalResidualBlock1D — FiLM conditioning setup",
+          "source": "        # FiLM modulation https://arxiv.org/abs/1709.07871\n        # predicts per-channel scale and bias\n        cond_channels = out_channels\n        if cond_predict_scale:\n            cond_channels = out_channels * 2\n        self.cond_predict_scale = cond_predict_scale\n        self.out_channels = out_channels\n        self.cond_encoder = nn.Sequential(\n            nn.Mish(),\n            nn.Linear(cond_dim, cond_channels),\n            Rearrange('batch t -> batch t 1'),\n        )",
+          "source_start_line": 29,
+          "file_path": "diffusion_policy/model/diffusion/conditional_unet1d.py",
+          "annotations": [
+            {
+              "start_line": 31,
+              "end_line": 40,
+              "explanation": "When cond_predict_scale=True, the MLP outputs 2 * out_channels — the first half is per-channel scale, the second half is bias. When False, it outputs only bias (simpler additive conditioning). The Rearrange adds a trailing dimension so the [B, C] output broadcasts over the time axis [B, C, T] of the feature map.",
+              "concept_tag": "normalization"
+            }
+          ]
+        },
+        {
+          "label": "ConditionalResidualBlock1D.forward — applying FiLM and residual",
+          "source": "    def forward(self, x, cond):\n        '''\n            x : [ batch_size x in_channels x horizon ]\n            cond : [ batch_size x cond_dim]\n\n            returns:\n            out : [ batch_size x out_channels x horizon ]\n        '''\n        out = self.blocks[0](x)\n        embed = self.cond_encoder(cond)\n        if self.cond_predict_scale:\n            embed = embed.reshape(\n                embed.shape[0], 2, self.out_channels, 1)\n            scale = embed[:,0,...]\n            bias = embed[:,1,...]\n            out = scale * out + bias\n        else:\n            out = out + embed\n        out = self.blocks[1](out)\n        out = out + self.residual_conv(x)\n        return out",
+          "source_start_line": 46,
+          "file_path": "diffusion_policy/model/diffusion/conditional_unet1d.py",
+          "annotations": [
+            {
+              "start_line": 54,
+              "end_line": 63,
+              "explanation": "The conditioning is applied between the two Conv1dBlocks. The embed has shape [B, C, 1] which broadcasts over the time axis T. In scale+bias mode this is `scale * out + bias` — a learned affine transform per channel. In additive mode it simplifies to `out + embed`. Either way, the timestep and observation context modulate every channel of every temporal position.",
+              "concept_tag": "normalization"
+            },
+            {
+              "start_line": 64,
+              "end_line": 66,
+              "explanation": "A second Conv1dBlock after the conditioning, then the residual connection. If in_channels ≠ out_channels, a 1×1 conv projects the skip to the right dimension. This is the standard pre-activation ResNet style, ensuring clean gradient flow through all blocks regardless of conditioning magnitude.",
+              "concept_tag": "residual"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "conditional-unet1d",
+      "title": "ConditionalUnet1D: The 1D UNet Denoiser",
+      "narrative": "The full denoiser is a 1D UNet: a symmetric encoder-decoder architecture with skip connections between corresponding encoder and decoder levels. The architecture contracts the action sequence to a compact bottleneck representation (via strided convolutions), processes it with two mid-blocks, then expands back to the original temporal length (via transposed convolutions), skipping encoder features into the decoder at each scale.\n\nThe conditioning signal — `global_feature`, a concatenation of the sinusoidal timestep embedding and the flattened observation — flows into every ConditionalResidualBlock at every level through FiLM modulation. There is no separate cross-attention mechanism; the conditioning is always injected as a global vector.\n\nThe default architecture uses three scales with channel sizes [256, 512, 1024]. The encoder halves the time dimension at each scale (Downsample1d uses stride-2 Conv1d); the decoder doubles it (Upsample1d uses ConvTranspose1d). Skip connections are concatenated on the channel dimension before the upsampling residual blocks.",
+      "code_blocks": [
+        {
+          "label": "ConditionalUnet1D.forward — down path, bottleneck, and up path with skips",
+          "source": "        sample = einops.rearrange(sample, 'b h t -> b t h')\n\n        # 1. time\n        timesteps = timestep\n        if not torch.is_tensor(timesteps):\n            # TODO: this requires sync between CPU and GPU. So try to pass timesteps as tensors if you can\n            timesteps = torch.tensor([timesteps], dtype=torch.long, device=sample.device)\n        elif torch.is_tensor(timesteps) and len(timesteps.shape) == 0:\n            timesteps = timesteps[None].to(sample.device)\n        # broadcast to batch dimension in a way that's compatible with ONNX/Core ML\n        timesteps = timesteps.expand(sample.shape[0])\n\n        global_feature = self.diffusion_step_encoder(timesteps)\n\n        if global_cond is not None:\n            global_feature = torch.cat([\n                global_feature, global_cond\n            ], axis=-1)\n        \n        # encode local features\n        h_local = list()\n        if local_cond is not None:\n            local_cond = einops.rearrange(local_cond, 'b h t -> b t h')\n            resnet, resnet2 = self.local_cond_encoder\n            x = resnet(local_cond, global_feature)\n            h_local.append(x)\n            x = resnet2(local_cond, global_feature)\n            h_local.append(x)\n        \n        x = sample\n        h = []\n        for idx, (resnet, resnet2, downsample) in enumerate(self.down_modules):\n            x = resnet(x, global_feature)\n            if idx == 0 and len(h_local) > 0:\n                x = x + h_local[0]\n            x = resnet2(x, global_feature)\n            h.append(x)\n            x = downsample(x)\n\n        for mid_module in self.mid_modules:\n            x = mid_module(x, global_feature)\n\n        for idx, (resnet, resnet2, upsample) in enumerate(self.up_modules):\n            x = torch.cat((x, h.pop()), dim=1)\n            x = resnet(x, global_feature)\n            # The correct condition should be:\n            # if idx == (len(self.up_modules)-1) and len(h_local) > 0:\n            # However this change will break compatibility with published checkpoints.\n            # Therefore it is left as a comment.\n            if idx == len(self.up_modules) and len(h_local) > 0:\n                x = x + h_local[1]\n            x = resnet2(x, global_feature)\n            x = upsample(x)\n\n        x = self.final_conv(x)\n\n        x = einops.rearrange(x, 'b t h -> b h t')\n        return x",
+          "source_start_line": 184,
+          "file_path": "diffusion_policy/model/diffusion/conditional_unet1d.py",
+          "annotations": [
+            {
+              "start_line": 196,
+              "end_line": 201,
+              "explanation": "global_feature is the concatenation of the sinusoidal timestep embedding (256-dim) and the flattened observation (n_obs_steps * obs_dim). This single vector carries all conditioning information and is passed to every ResNet block at every scale — there is no cross-attention, just FiLM modulation throughout.",
+              "concept_tag": "embedding"
+            },
+            {
+              "start_line": 213,
+              "end_line": 221,
+              "explanation": "Down path: two FiLM-conditioned residual blocks per scale, output saved to skip-connection list h, then halved by Downsample1d (stride-2 Conv1d). At scale 0, optional local_cond is added. The list h accumulates skip features in order [scale0, scale1, scale2].",
+              "concept_tag": "convolution"
+            },
+            {
+              "start_line": 226,
+              "end_line": 236,
+              "explanation": "Up path: h.pop() reverses the skip list (LIFO), concatenating the encoder's feature map on the channel axis before the first ResNet block. This gives the decoder access to fine-grained temporal features from the encoder — the standard UNet trick that prevents loss of spatial (here: temporal) detail during compression.",
+              "concept_tag": "residual"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "ddpm-training",
+      "title": "DDPM Training: Adding Noise and Predicting It Back",
+      "narrative": "Training Diffusion Policy follows the standard DDPM recipe. For each batch of clean action trajectories, the training loop: (1) samples a random diffusion timestep t uniformly from {0, …, T-1}, (2) samples Gaussian noise and uses the noise scheduler's `add_noise` to corrupt the clean trajectory to the noise level of timestep t, (3) runs the denoiser to predict either the added noise (epsilon-prediction) or the clean trajectory (sample-prediction), and (4) computes MSE loss between the prediction and the target.\n\nThe noise scheduler (`DDPMScheduler` from HuggingFace diffusers) handles the forward diffusion math: `noisy = sqrt(alpha_bar_t) * clean + sqrt(1 - alpha_bar_t) * noise`. The model never sees this formula — it only sees the corrupted trajectory and the timestep, and must predict what was subtracted.\n\nA key subtlety is the `condition_mask`. In inpainting mode, observation tokens are embedded directly in the trajectory tensor alongside action tokens. The `condition_mask` marks these observation positions as 'known', so the model is not penalised for them in the loss (`loss_mask = ~condition_mask`). This is how observations are injected as hard constraints — not just soft conditioning signals.",
+      "code_blocks": [
+        {
+          "label": "compute_loss — DDPM forward process and noise-prediction loss",
+          "source": "        # Sample noise that we'll add to the images\n        noise = torch.randn(trajectory.shape, device=trajectory.device)\n        bsz = trajectory.shape[0]\n        # Sample a random timestep for each image\n        timesteps = torch.randint(\n            0, self.noise_scheduler.config.num_train_timesteps, \n            (bsz,), device=trajectory.device\n        ).long()\n        # Add noise to the clean images according to the noise magnitude at each timestep\n        # (this is the forward diffusion process)\n        noisy_trajectory = self.noise_scheduler.add_noise(\n            trajectory, noise, timesteps)\n        \n        # compute loss mask\n        loss_mask = ~condition_mask\n\n        # apply conditioning\n        noisy_trajectory[condition_mask] = trajectory[condition_mask]\n        \n        # Predict the noise residual\n        pred = self.model(noisy_trajectory, timesteps, \n            local_cond=local_cond, global_cond=global_cond)\n\n        pred_type = self.noise_scheduler.config.prediction_type \n        if pred_type == 'epsilon':\n            target = noise\n        elif pred_type == 'sample':\n            target = trajectory\n        else:\n            raise ValueError(f\"Unsupported prediction type {pred_type}\")\n\n        loss = F.mse_loss(pred, target, reduction='none')\n        loss = loss * loss_mask.type(loss.dtype)\n        loss = reduce(loss, 'b ... -> b (...)', 'mean')\n        loss = loss.mean()\n        return loss",
+          "source_start_line": 217,
+          "file_path": "diffusion_policy/policy/diffusion_unet_lowdim_policy.py",
+          "annotations": [
+            {
+              "start_line": 221,
+              "end_line": 228,
+              "explanation": "Timestep t is sampled uniformly — every noise level is trained with equal frequency. `add_noise` implements the DDPM forward process: noisy = sqrt(alpha_bar_t) * clean + sqrt(1 - alpha_bar_t) * noise. In inpainting mode, observation positions are then overwritten with clean data (line 234) — they serve as anchors the denoiser cannot modify.",
+              "concept_tag": "other:diffusion"
+            },
+            {
+              "start_line": 240,
+              "end_line": 250,
+              "explanation": "Epsilon-prediction ('epsilon') trains the model to predict the noise that was added. Sample-prediction ('sample') trains it to predict the clean trajectory directly. Both are valid; epsilon-prediction is more common. The loss_mask zeros out observation token positions so they don't contribute to gradients — only action token predictions are supervised.",
+              "concept_tag": "loss"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "conditional-sampling",
+      "title": "Inference: The Conditional Sampling Loop",
+      "narrative": "At inference time, Diffusion Policy runs the reverse diffusion process: starting from pure Gaussian noise, it iteratively applies the learned denoiser to step toward a clean action trajectory. The scheduler manages the exact step sizes and noise schedules — the model just predicts the denoising direction at each step.\n\nThe `condition_mask` mechanism is elegant here too. On every denoising step, before calling the model, the known observation tokens are written directly back into the trajectory tensor at their correct positions. This acts as inpainting: the denoiser sees real observations at their positions and noisy actions at the action positions, and must denoise only the action part. The observations serve as hard boundary conditions that the trajectory must interpolate between.\n\nWith DDIM acceleration (DDIMScheduler), the full 100-step DDPM chain can be run in as few as 10 steps with minimal quality loss — making real-time robot control at 10Hz feasible even on moderate hardware.",
+      "code_blocks": [
+        {
+          "label": "conditional_sample — iterative denoising from Gaussian noise to clean actions",
+          "source": "    def conditional_sample(self, \n            condition_data, condition_mask,\n            local_cond=None, global_cond=None,\n            generator=None,\n            # keyword arguments to scheduler.step\n            **kwargs\n            ):\n        model = self.model\n        scheduler = self.noise_scheduler\n\n        trajectory = torch.randn(\n            size=condition_data.shape, \n            dtype=condition_data.dtype,\n            device=condition_data.device,\n            generator=generator)\n    \n        # set step values\n        scheduler.set_timesteps(self.num_inference_steps)\n\n        for t in scheduler.timesteps:\n            # 1. apply conditioning\n            trajectory[condition_mask] = condition_data[condition_mask]\n\n            # 2. predict model output\n            model_output = model(trajectory, t, \n                local_cond=local_cond, global_cond=global_cond)\n\n            # 3. compute previous image: x_t -> x_t-1\n            trajectory = scheduler.step(\n                model_output, t, trajectory, \n                generator=generator,\n                **kwargs\n                ).prev_sample\n        \n        # finally make sure conditioning is enforced\n        trajectory[condition_mask] = condition_data[condition_mask]        \n\n        return trajectory",
+          "source_start_line": 59,
+          "file_path": "diffusion_policy/policy/diffusion_unet_lowdim_policy.py",
+          "annotations": [
+            {
+              "start_line": 69,
+              "end_line": 76,
+              "explanation": "Inference starts from pure Gaussian noise with the same shape as the full trajectory (obs + action tokens concatenated). scheduler.set_timesteps configures the denoising schedule — DDPMScheduler uses all T=100 steps, DDIMScheduler can use as few as 10.",
+              "concept_tag": "other:diffusion"
+            },
+            {
+              "start_line": 78,
+              "end_line": 91,
+              "explanation": "Each denoising step: (1) overwrite observation positions with the real obs values — this is the inpainting conditioning, applied at every step so the trajectory never drifts away from the given observations. (2) predict noise. (3) scheduler.step computes the 'previous' (less noisy) sample via the DDPM posterior. After all steps, trajectory holds a clean action chunk.",
+              "concept_tag": "other:diffusion"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "transformer-denoiser",
+      "title": "TransformerForDiffusion: An Encoder-Decoder Alternative",
+      "narrative": "While the 1D UNet is the primary denoiser, Diffusion Policy also provides a transformer-based alternative: `TransformerForDiffusion`. The design separates conditioning and denoising into an encoder-decoder architecture: the encoder processes the conditioning context (timestep + observations), and the decoder cross-attends to that context while denoising the noisy action tokens.\n\nThis is the same encoder-decoder structure used in the original Transformer paper, but applied to diffusion rather than sequence-to-sequence translation. The timestep embedding is prepended as a single extra token to the condition sequence (the 'time token'), while observation embeddings form the rest of the condition. The decoder receives the noisy action tokens with learned position embeddings, and uses cross-attention to query the encoded condition at every layer.\n\nThe optional causal attention mask in the decoder enforces temporal causality: action token at position t can only attend to action tokens at positions ≤ t. This is appropriate for autoregressive-style action generation, though the default configuration uses full (non-causal) attention.\n\nCompared to the UNet, the transformer handles variable-length observation and action sequences more naturally, and cross-attention is arguably more principled than FiLM for complex conditioning. The UNet, however, is faster and works better at lower parameter counts.",
+      "code_blocks": [
+        {
+          "label": "TransformerForDiffusion.forward — encoder-decoder denoising",
+          "source": "        time_emb = self.time_emb(timesteps).unsqueeze(1)\n        # (B,1,n_emb)\n\n        # process input\n        input_emb = self.input_emb(sample)\n\n        if self.encoder_only:\n            # BERT\n            token_embeddings = torch.cat([time_emb, input_emb], dim=1)\n            t = token_embeddings.shape[1]\n            position_embeddings = self.pos_emb[\n                :, :t, :\n            ]  # each position maps to a (learnable) vector\n            x = self.drop(token_embeddings + position_embeddings)\n            # (B,T+1,n_emb)\n            x = self.encoder(src=x, mask=self.mask)\n            # (B,T+1,n_emb)\n            x = x[:,1:,:]\n            # (B,T,n_emb)\n        else:\n            # encoder\n            cond_embeddings = time_emb\n            if self.obs_as_cond:\n                cond_obs_emb = self.cond_obs_emb(cond)\n                # (B,To,n_emb)\n                cond_embeddings = torch.cat([cond_embeddings, cond_obs_emb], dim=1)\n            tc = cond_embeddings.shape[1]\n            position_embeddings = self.cond_pos_emb[\n                :, :tc, :\n            ]  # each position maps to a (learnable) vector\n            x = self.drop(cond_embeddings + position_embeddings)\n            x = self.encoder(x)\n            memory = x\n            # (B,T_cond,n_emb)\n            \n            # decoder\n            token_embeddings = input_emb\n            t = token_embeddings.shape[1]\n            position_embeddings = self.pos_emb[\n                :, :t, :\n            ]  # each position maps to a (learnable) vector\n            x = self.drop(token_embeddings + position_embeddings)\n            # (B,T,n_emb)\n            x = self.decoder(\n                tgt=x,\n                memory=memory,\n                tgt_mask=self.mask,\n                memory_mask=self.memory_mask\n            )\n            # (B,T,n_emb)\n        \n        # head\n        x = self.ln_f(x)\n        x = self.head(x)\n        # (B,T,n_out)\n        return x",
+          "source_start_line": 289,
+          "file_path": "diffusion_policy/model/diffusion/transformer_for_diffusion.py",
+          "annotations": [
+            {
+              "start_line": 289,
+              "end_line": 293,
+              "explanation": "The timestep embedding is unsqueezed to shape [B, 1, n_emb] — a single 'time token' prepended to the condition sequence. This is the same idea as CLS tokens in BERT: a dedicated position that carries global information about the diffusion step and gets processed alongside the observation tokens.",
+              "concept_tag": "embedding"
+            },
+            {
+              "start_line": 309,
+              "end_line": 321,
+              "explanation": "Encoder path: [time_token | obs_tokens] are combined with learnable positional embeddings and processed by a standard TransformerEncoder. The output memory has shape [B, T_cond, n_emb] where T_cond = 1 (time) + n_obs_steps (observations). This memory is what the decoder will cross-attend to.",
+              "concept_tag": "attention"
+            },
+            {
+              "start_line": 332,
+              "end_line": 337,
+              "explanation": "Decoder: the noisy action tokens cross-attend to the encoded condition (memory). tgt_mask is the optional causal mask (upper-triangular -inf) that prevents each action token from attending to future action tokens. memory_mask is a cross-attention mask ensuring each action token only attends to 'causally valid' condition tokens — set to None in non-causal mode.",
+              "concept_tag": "attention"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "putting-it-all-together",
+      "title": "Putting It All Together: predict_action and Action Chunking",
+      "narrative": "The full inference pipeline in `predict_action` ties everything together: normalise observations, configure the conditioning, run conditional sampling, slice out the executable action chunk.\n\nA key design choice is how observations are delivered to the denoiser. The code supports three modes: (1) `obs_as_global_cond` — flatten the last n_obs_steps of observations into a global conditioning vector passed to every FiLM block. This is the most common mode. (2) `obs_as_local_cond` — treat observations as a sequence of local features at each timestep, injected via the local conditioning pathway. (3) Neither (inpainting) — concatenate obs and action on the feature dimension into one joint trajectory, let the model denoise the full [obs, action] tensor.\n\nThe action chunking then takes the full predicted horizon (T=16) and slices out only n_action_steps (e.g., 8) starting from the observation offset To. This 'receding horizon' execution: predict a long chunk, execute a few steps, observe again, predict again. Executing fewer steps than the horizon gives the policy a chance to re-plan frequently, while predicting a long horizon provides temporal coherence across the executed steps.",
+      "code_blocks": [
+        {
+          "label": "predict_action — observation conditioning setup (three modes)",
+          "source": "        nobs = self.normalizer['obs'].normalize(obs_dict['obs'])\n        B, _, Do = nobs.shape\n        To = self.n_obs_steps\n        assert Do == self.obs_dim\n        T = self.horizon\n        Da = self.action_dim\n\n        # build input\n        device = self.device\n        dtype = self.dtype\n\n        # handle different ways of passing observation\n        local_cond = None\n        global_cond = None\n        if self.obs_as_local_cond:\n            # condition through local feature\n            # all zero except first To timesteps\n            local_cond = torch.zeros(size=(B,T,Do), device=device, dtype=dtype)\n            local_cond[:,:To] = nobs[:,:To]\n            shape = (B, T, Da)\n            cond_data = torch.zeros(size=shape, device=device, dtype=dtype)\n            cond_mask = torch.zeros_like(cond_data, dtype=torch.bool)\n        elif self.obs_as_global_cond:\n            # condition throught global feature\n            global_cond = nobs[:,:To].reshape(nobs.shape[0], -1)\n            shape = (B, T, Da)\n            if self.pred_action_steps_only:\n                shape = (B, self.n_action_steps, Da)\n            cond_data = torch.zeros(size=shape, device=device, dtype=dtype)\n            cond_mask = torch.zeros_like(cond_data, dtype=torch.bool)\n        else:\n            # condition through impainting\n            shape = (B, T, Da+Do)\n            cond_data = torch.zeros(size=shape, device=device, dtype=dtype)\n            cond_mask = torch.zeros_like(cond_data, dtype=torch.bool)\n            cond_data[:,:To,Da:] = nobs[:,:To]\n            cond_mask[:,:To,Da:] = True",
+          "source_start_line": 107,
+          "file_path": "diffusion_policy/policy/diffusion_unet_lowdim_policy.py",
+          "annotations": [
+            {
+              "start_line": 130,
+              "end_line": 131,
+              "explanation": "Global conditioning (most common): flatten the last To observation timesteps into a single vector of shape [B, To*obs_dim]. This vector becomes the `global_cond` passed to the UNet, concatenated with the timestep embedding to form the full FiLM conditioning signal.",
+              "concept_tag": "embedding"
+            },
+            {
+              "start_line": 142,
+              "end_line": 143,
+              "explanation": "Inpainting mode: observations are embedded directly in the trajectory tensor at positions [:, :To, Da:]. cond_mask marks these positions as 'known', so they are overwritten at every denoising step and excluded from the loss. The model must complete the action positions [:, :, :Da] while respecting the observation anchors.",
+              "concept_tag": "other:diffusion"
+            }
+          ]
+        },
+        {
+          "label": "predict_action — action chunk slicing (receding horizon execution)",
+          "source": "        # unnormalize prediction\n        naction_pred = nsample[...,:Da]\n        action_pred = self.normalizer['action'].unnormalize(naction_pred)\n\n        # get action\n        if self.pred_action_steps_only:\n            action = action_pred\n        else:\n            start = To\n            if self.oa_step_convention:\n                start = To - 1\n            end = start + self.n_action_steps\n            action = action_pred[:,start:end]\n        \n        result = {\n            'action': action,\n            'action_pred': action_pred\n        }\n        if not (self.obs_as_local_cond or self.obs_as_global_cond):\n            nobs_pred = nsample[...,Da:]\n            obs_pred = self.normalizer['obs'].unnormalize(nobs_pred)\n            action_obs_pred = obs_pred[:,start:end]\n            result['action_obs_pred'] = action_obs_pred\n            result['obs_pred'] = obs_pred\n        return result",
+          "source_start_line": 154,
+          "file_path": "diffusion_policy/policy/diffusion_unet_lowdim_policy.py",
+          "annotations": [
+            {
+              "start_line": 161,
+              "end_line": 165,
+              "explanation": "Action chunking: the full denoised horizon has T steps. We only execute n_action_steps of them, starting from offset To (skipping the first To observation steps when in inpainting mode). For example with T=16, To=2, n_action_steps=8: we execute steps 2-9, then observe again and re-plan. This receding horizon gives frequent replanning with temporally coherent actions.",
+              "concept_tag": "other:action-chunking"
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "summary": "Diffusion Policy applies DDPM-style denoising diffusion to robot imitation learning. Instead of directly regressing actions, it models the action distribution as a diffusion process: a UNet or transformer-based denoiser iteratively refines a Gaussian noise tensor into a clean action trajectory conditioned on camera observations. The 1D UNet uses FiLM modulation (adaptive per-channel scale and bias) to inject the combined timestep + observation conditioning at every residual block. Training uses the standard DDPM objective — corrupt the action with noise, predict the noise back. Inference runs 10-100 denoising steps, with observations injected as inpainting constraints at each step. The critical robotics insight is action chunking: the policy predicts a horizon of 16 future actions but only executes 8, re-planning at every step for temporal coherence without sacrificing reactivity."
+}

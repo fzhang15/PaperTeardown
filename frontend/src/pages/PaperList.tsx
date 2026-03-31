@@ -18,14 +18,15 @@ const LINEAGE_GROUPS = [
     id: 'robot-learning',
     name: 'Robot Foundation Models',
     description:
-      'A direct conceptual lineage: RT-1 tokenises robot actions as discrete tokens → RT-2 grounds them in a VLM backbone → pi0 replaces token prediction with continuous flow matching → GR00T scales to multi-embodiment generalist control.',
-    paperIds: ['rt1', 'rt2', 'pi0', 'groot'],
+      'A direct conceptual lineage: Diffusion Policy frames action generation as DDPM denoising → RT-1 tokenises robot actions as discrete tokens → RT-2 grounds them in a VLM backbone → pi0 replaces token prediction with continuous flow matching → GR00T scales to multi-embodiment generalist control.',
+    paperIds: ['diffusion-policy', 'rt1', 'rt2', 'pi0', 'groot'],
     showArrows: true,
   },
 ]
 
 // Cross-group dependencies shown as a badge on individual cards
 const BUILDS_ON: Record<string, string> = {
+  'diffusion-policy': 'DDPM (DiT)',
   pi0: 'DiT action head',
   groot: 'DiT action head',
 }

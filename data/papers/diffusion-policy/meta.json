@@ -1,0 +1,11 @@
+{
+  "id": "diffusion-policy",
+  "title": "Diffusion Policy: Visuomotor Policy Learning via Action Diffusion",
+  "authors": ["Cheng Chi", "Siyuan Feng", "Yilun Du", "Zhenjia Xu", "Eric Cousineau", "Benjamin Burchfiel", "Shuran Song"],
+  "arxiv_url": "https://arxiv.org/abs/2303.04137",
+  "repo_url": "https://github.com/real-stanford/diffusion_policy",
+  "abstract": "This paper introduces Diffusion Policy, a robot learning method that represents a robot's visuomotor policy as a conditional denoising diffusion process. By formulating action prediction as DDPM-style denoising over an action trajectory, Diffusion Policy naturally handles multimodal action distributions, benefits from the training stability of diffusion models, and supports high-dimensional action spaces. A 1D temporal U-Net conditioned on robot observations via FiLM modulation serves as the denoising network. The method introduces action chunking — predicting T future actions and executing the first n — which reduces compounding errors while maintaining reactivity.",
+  "chapter_count": 9,
+  "pytorch_file_count": 18,
+  "ingested_at": "2026-03-31T00:00:00Z"
+}
