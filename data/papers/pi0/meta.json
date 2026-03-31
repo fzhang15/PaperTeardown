@@ -31,7 +31,7 @@
   "repo_url": "https://github.com/Physical-Intelligence/openpi",
   "abstract": "We present pi0, a novel flow matching-based vision-language-action (VLA) model designed for general robot control. pi0 combines a pre-trained vision-language model (PaliGemma) with a purpose-built action expert transformer that runs in parallel, sharing attention layers to give the action expert direct access to visual and language representations at every depth. Continuous robot action trajectories are generated via flow matching, enabling smooth, high-dimensional action prediction. We demonstrate that pi0 can be pre-trained on diverse cross-embodiment robot data and fine-tuned to new tasks and hardware with relatively few demonstrations, achieving strong performance on dexterous manipulation tasks including laundry folding, table bussing, and box assembly.",
   "introduction_excerpt": "Foundation models for language and vision have demonstrated remarkable capabilities, learning rich representations from vast amounts of data that generalize across tasks. We ask: can we build a similar foundation model for robot control? The key challenge is that robot actions are continuous, high-dimensional, and temporally correlated — unlike discrete language tokens. We propose pi0, which combines a pre-trained vision-language model with a flow matching action head, enabling both pre-training on diverse robot data and fine-tuning to specific tasks.",
-  "chapter_count": 8,
+  "chapter_count": 10,
   "pytorch_file_count": 4,
   "ingested_at": "2026-03-30T00:00:00Z"
 }
