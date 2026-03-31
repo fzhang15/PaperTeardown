@@ -103,7 +103,8 @@ This is the manual, high-quality step. Read the paper and codebase, then write `
 **Concept tags (fixed taxonomy):**
 `attention`, `embedding`, `normalization`, `activation`, `loss`, `linear`, `dropout`, `pooling`, `residual`, `convolution`, `other:<sublabel>`
 
-### Step 4: Create meta.json and update index.json
+### Step 4: Create meta.json, update index.json, and place in lineage gallery
+
 ```json
 // data/papers/<id>/meta.json
 {
@@ -121,6 +122,19 @@ This is the manual, high-quality step. Read the paper and codebase, then write `
 ```
 
 Update `data/papers/index.json` to include the new paper entry.
+
+**Also update the lineage gallery** in `frontend/src/pages/PaperList.tsx`:
+
+The gallery page organises papers into dependency-ordered groups. `LINEAGE_GROUPS` controls which group a paper appears in and its reading order within that group. `BUILDS_ON` adds a cross-group dependency badge (e.g. `↳ DiT action head`) to a card.
+
+Current groups:
+- `foundations` — `['dinov3', 'dit']` — peer works, no arrows
+- `robot-learning` — `['rt1', 'rt2', 'pi0', 'groot']` — direct lineage, arrows shown
+
+For each new paper:
+1. Decide which group it belongs to and insert its ID at the correct position in `paperIds`
+2. If it borrows architecture from a paper in another group, add it to `BUILDS_ON` with a short label
+3. If it doesn't fit any existing group, add a new group object (`id`, `name`, `description`, `paperIds`, `showArrows`)
 
 ### Step 5: Start frontend and verify
 ```bash

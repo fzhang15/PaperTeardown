@@ -33,6 +33,10 @@ Then execute the following phases:
 ### Phase 4: Metadata
 9. Write `data/papers/<paper-id>/meta.json`
 10. Update `data/papers/index.json` (add entry, don't duplicate)
+11. Place the paper in the lineage gallery — edit `LINEAGE_GROUPS` in `frontend/src/pages/PaperList.tsx`:
+    - Decide which existing group it belongs to (`foundations`, `robot-learning`, etc.) and insert it at the correct position in dependency order
+    - If it has a cross-group dependency (e.g. borrows architecture from a paper in another group), add an entry to `BUILDS_ON` with a short label
+    - If it doesn't fit any existing group, add a new group object to `LINEAGE_GROUPS` with `id`, `name`, `description`, `paperIds`, and `showArrows`
 
 ### Phase 5: Verify and Ship
 11. TypeScript check: `frontend/node_modules/.bin/tsc.cmd --noEmit --project frontend/tsconfig.json`
