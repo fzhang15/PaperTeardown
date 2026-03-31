@@ -20,6 +20,16 @@
     "ingested_at": "2026-03-29T20:00:00Z"
   },
   {
+    "id": "rt1",
+    "title": "RT-1: Robotics Transformer for Real-World Control at Scale",
+    "authors": ["Anthony Brohan", "Noah Brown", "Chelsea Finn", "Karol Hausman", "Sergey Levine", "et al."],
+    "arxiv_url": "https://arxiv.org/abs/2212.06817",
+    "repo_url": "https://github.com/google-research/robotics_transformer",
+    "abstract": "We present RT-1, a Robotics Transformer model that tokenizes robot observations and natural language instructions to produce discretized action tokens. Trained on 130,000+ real-robot episodes spanning 700+ tasks, RT-1 achieves 97% success on trained tasks and demonstrates strong generalization to novel objects, environments, and instructions. Key components: FiLM-conditioned EfficientNet for language-steered visual encoding, TokenLearner for spatial compression (81→8 tokens), and a causal decoder-only transformer that predicts discretized robot actions.",
+    "chapter_count": 9,
+    "ingested_at": "2026-03-31T00:00:00Z"
+  },
+  {
     "id": "pi0",
     "title": "pi0: A Vision-Language-Action Flow Model for General Robot Control",
     "authors": ["Kevin Black", "Noah Brown", "Danny Driess", "Chelsea Finn", "Karol Hausman", "Sergey Levine", "et al."],

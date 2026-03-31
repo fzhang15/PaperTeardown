@@ -1,0 +1,297 @@
+{
+  "chapters": [
+    {
+      "id": "generalization-problem",
+      "title": "The Generalization Problem in Robotics",
+      "narrative": "For decades, robotics research operated under a quiet assumption: each task requires its own system. Pick an apple? One controller. Open a drawer? Another. Stack blocks? Yet another. These systems were meticulously engineered, carefully calibrated, and entirely specific. Scaling them to hundreds of tasks meant hundreds of engineering efforts — a fundamentally unbounded problem.\n\nRT-1 (Robotics Transformer 1) is Google's answer to a different question: can a single neural network, trained on enough data across enough tasks, learn to generalize across an open-ended set of real-world manipulation tasks? Not in simulation — on real robots, with real objects, in real kitchens and offices.\n\nThe answer, it turns out, is yes — but only at scale. RT-1 was trained on over 130,000 real robot demonstration episodes collected over 17 months using a fleet of 13 robots, spanning 700+ distinct tasks. The key insight is that diversity is the teacher: a model exposed to 'pick up the apple', 'pick up the banana', 'pick up the orange cup', and 'pick up the blue cup' can generalize to 'pick up the green cup' in a way that a specialized gripper-apple controller never could.\n\nArchitecturally, RT-1 treats robot control as a sequence prediction problem. Given a natural language instruction (e.g., 'place the rice chips on the plate') and a short history of RGB camera frames, the model predicts a sequence of discrete action tokens that the robot should execute. This framing — borrowed from language modeling — lets RT-1 use the same transformer machinery that powers GPT and BERT, applied now to robotics.\n\nThe pipeline has four stages: (1) encode each image frame using a FiLM-conditioned EfficientNet that lets the language instruction steer the visual features; (2) compress 81 spatial tokens down to 8 using TokenLearner; (3) interleave image tokens with action tokens across the time history; (4) run a causal transformer to predict the next action. Each of these stages has a careful design rationale — and real performance consequences.",
+      "code_blocks": []
+    },
+    {
+      "id": "film-conditioning",
+      "title": "FiLM: Letting Language Steer Vision",
+      "narrative": "A naive approach to combining language and vision is late fusion: encode the image, encode the language, concatenate, predict. This works, but it wastes an opportunity. The language instruction fundamentally changes what matters in an image — 'pick up the apple' means attending to red objects, while 'open the drawer' means attending to handles and edges. Why not let language reshape the visual features as they're being computed?\n\nFiLM (Feature-wise Linear Modulation, Perez et al. 2017) is the mechanism RT-1 uses to do exactly this. It's elegantly simple: given a language embedding vector, compute a per-channel scale γ and shift β, then rescale the CNN feature map channel-by-channel:\n\n  output = (1 + γ) × features + β\n\nThe 1 + γ formulation is intentional — at initialization, γ=0 means the FiLM layers start as identity transforms, so early training is stable. As training progresses, the model learns to use γ and β to selectively amplify or suppress feature channels based on the instruction.\n\nIn RT-1, FiLM conditioning is applied at multiple internal blocks of EfficientNet ('early film') and again on the final feature map. The conditioning signal comes from Universal Sentence Encoder embeddings of the natural language instruction. This gives the visual backbone a language-grounded prior before any spatial pooling happens.",
+      "code_blocks": [
+        {
+          "label": "FilmConditioning.call — scale and shift feature maps with language",
+          "source": "  def call(self, conv_filters: tf.Tensor, conditioning: tf.Tensor):\n    tf.debugging.assert_rank(conditioning, 2)\n    projected_cond_add = self._projection_add(conditioning)\n    projected_cond_mult = self._projection_mult(conditioning)\n\n    if len(conv_filters.shape) == 4:\n      # [B, D] -> [B, 1, 1, D]\n      projected_cond_add = projected_cond_add[:, tf.newaxis, tf.newaxis]\n      projected_cond_mult = projected_cond_mult[:, tf.newaxis, tf.newaxis]\n    else:\n      tf.debugging.assert_rank(conv_filters, 2)\n\n    # Original FiLM paper argues that 1 + gamma centers the initialization at\n    # identity transform.\n    result = (1 + projected_cond_mult) * conv_filters + projected_cond_add\n    return result",
+          "source_start_line": 59,
+          "file_path": "film_efficientnet/film_conditioning_layer.py",
+          "annotations": [
+            {
+              "start_line": 61,
+              "end_line": 62,
+              "explanation": "Two separate Dense layers project the language embedding into per-channel scale (mult) and shift (add) parameters. Each output has shape [B, num_channels].",
+              "concept_tag": "linear"
+            },
+            {
+              "start_line": 65,
+              "end_line": 67,
+              "explanation": "Broadcasting trick: expand the [B, D] language embedding to [B, 1, 1, D] so it can multiply a [B, H, W, D] spatial feature map channel-wise without explicit tiling.",
+              "concept_tag": "other:broadcasting"
+            },
+            {
+              "start_line": 73,
+              "end_line": 74,
+              "explanation": "The FiLM transform: (1 + γ) × features + β. The '1 +' ensures that at initialization (when weights are zero), this is an identity transform — critical for stable fine-tuning of pretrained weights.",
+              "concept_tag": "normalization"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "efficientnet-backbone",
+      "title": "FiLM-EfficientNet: The Language-Conditioned Visual Backbone",
+      "narrative": "RT-1 uses EfficientNetB3 as its visual backbone — a standard choice in 2022 for strong image representations at reasonable compute cost. EfficientNetB3 was pretrained on ImageNet and produces a rich 9×9 spatial feature map from a 300×300 input image.\n\nThe key modification is 'early film': FiLM layers are injected throughout the internal blocks of EfficientNet, not just at the end. This allows the language instruction to modulate features at every spatial resolution, shaping the representation before global structure is lost to downsampling. The paper found this to be essential for strong performance — the late-fusion baseline is significantly weaker.\n\nAfter the backbone extracts features, a 1×1 convolution reduces the channel dimension to 512, followed by one more FiLM layer applied to the output. When `pooling=False` (as used in RT-1's tokenizer), the output is the full 9×9×512 = 81 spatial tokens — one 512-dim vector per spatial grid cell.\n\nThe images are center-cropped and padded to 300×300 before encoding. During training, random crops provide data augmentation; during inference, the center crop is used.",
+      "code_blocks": [
+        {
+          "label": "EfficientNetEncoder.call — FiLM encode image and optionally pool",
+          "source": "  def call(self,\n           image: tf.Tensor,\n           context: Optional[tf.Tensor] = None,\n           training: bool = True) -> tf.Tensor:\n    if self.freeze:\n      features = tf.stop_gradient(self._encode(image, context, training))\n    else:\n      features = self._encode(image, context, training)\n    if context is not None:\n      features = self.conv1x1(features)\n      features = self.film_layer(features, context)\n\n    if not self._pooling:\n      return features\n\n    # Global average pool.\n    return tf.reduce_mean(features, [1, 2])",
+          "source_start_line": 106,
+          "file_path": "film_efficientnet/pretrained_efficientnet_encoder.py",
+          "annotations": [
+            {
+              "start_line": 115,
+              "end_line": 116,
+              "explanation": "After EfficientNet extracts features, a 1×1 conv projects to 512 channels, then a final FiLM layer applies one more language-conditioned rescaling. This double application of FiLM (inside the network + outside) further tunes the representation.",
+              "concept_tag": "convolution"
+            },
+            {
+              "start_line": 118,
+              "end_line": 122,
+              "explanation": "When pooling=False (used during tokenization), returns the full 9×9 spatial feature map [B, 9, 9, 512]. When pooling=True (used for classification tasks), collapses the spatial dimensions by averaging — 81 tokens become 1 global vector.",
+              "concept_tag": "pooling"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "image-tokenizer",
+      "title": "RT1ImageTokenizer: From Pixels to a Token Sequence",
+      "narrative": "The image tokenizer's job is to turn a batch of video frames — shape (batch, time, height, width, 3) — into a flat token sequence that the transformer can attend over. The challenge is that EfficientNet expects a single-frame input (batch, H, W, 3), not a video sequence.\n\nThe solution is a batch-time fold trick: temporarily reshape (B, T, H, W, 3) → (B*T, H, W, 3), run EfficientNet on the flattened batch, then restore the time dimension. This lets a single forward pass encode all frames in parallel without any architectural changes to the backbone.\n\nThe language context (Universal Sentence Encoder embedding, shape [B, T, 512]) is similarly folded along the time axis before being passed to EfficientNet as the FiLM conditioning signal. Each frame gets conditioned on the same instruction.\n\nAfter encoding, each frame produces 81 spatial tokens of size 512. If TokenLearner is enabled, these 81 tokens are compressed to 8 per frame (see next chapter). The final output has shape (B, T, num_tokens, 512) — ready to be fed into the transformer.",
+      "code_blocks": [
+        {
+          "label": "RT1ImageTokenizer.__call__ — fold time into batch, encode, unfold",
+          "source": "  def __call__(self,\n               image: tf.Tensor,\n               context: Optional[tf.Tensor] = None,\n               training: bool = False) -> tf.Tensor:\n    \"\"\"Gets image tokens.\n\n    Args:\n      image: Images of shape (b, t, h, w, 3) to tokenize.\n      context: An optional context vector (e.g., a natural language embedding).\n        Expected to have shape (b, t, embedding_dim).\n      training: Whether or not we are in training mode.\n\n    Returns:\n      tokens: has shape (batch, t, num_tokens_per_timestep, embedding_dim)\n    \"\"\"\n    image_shape = tf.shape(image)\n    b = image_shape[0]\n    t = image_shape[1]\n    h = image_shape[2]\n    w = image_shape[3]\n    c = image_shape[4]\n\n    # Fold the time axis into the batch axis.\n    image = tf.reshape(image, [b * t, h, w, c])\n    if context is not None:\n      context_rank = tf.rank(context)\n      assertion = tf.Assert(context_rank == 3, data=[context_rank])\n      with tf.control_dependencies([assertion]):\n        context = tf.reshape(context, [b * t, tf.shape(context)[-1]])\n    tokens = self.get_image_embeddings(image, context, training)\n    if self._use_token_learner:\n      tokens = self._token_learner(tokens, training)\n    # Unflatten the time axis, which was previously flattened into the batch.\n    tokens = tf.reshape(tokens, [b, t, tf.shape(tokens)[1], -1])\n    return tokens",
+          "source_start_line": 60,
+          "file_path": "tokenizers/image_tokenizer.py",
+          "annotations": [
+            {
+              "start_line": 83,
+              "end_line": 83,
+              "explanation": "Fold: (B, T, H, W, C) → (B*T, H, W, C). This lets us process all timesteps through EfficientNet in a single parallel batch call, without any changes to the backbone's expected input shape.",
+              "concept_tag": "embedding"
+            },
+            {
+              "start_line": 89,
+              "end_line": 91,
+              "explanation": "get_image_embeddings returns 81 spatial tokens per frame. If TokenLearner is enabled, this is immediately compressed to 8 tokens — a 10× reduction that makes the downstream transformer much faster.",
+              "concept_tag": "embedding"
+            },
+            {
+              "start_line": 93,
+              "end_line": 93,
+              "explanation": "Unfold: restore the time axis, going from (B*T, num_tokens, D) → (B, T, num_tokens, D). The transformer will later see all T×num_tokens tokens in a single flat sequence.",
+              "concept_tag": "embedding"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "token-learner",
+      "title": "TokenLearner: Learned Spatial Compression",
+      "narrative": "Without TokenLearner, each image frame produces 81 spatial tokens (the 9×9 EfficientNet output grid). With 6 frames of temporal context, that's 486 image tokens — plus 66 action tokens (11 actions × 6 steps) — totaling 552 tokens per sequence. Self-attention scales quadratically with sequence length, so this is expensive.\n\nTokenLearner (Ryoo et al. 2021) compresses 81 spatial tokens to just 8 learned tokens per frame. The key idea is that not all 81 grid cells are equally informative — the model should learn to select and aggregate the most task-relevant spatial locations.\n\nThe mechanism is a soft spatial attention: a small MLP maps the 81 token representations to 8 attention weight vectors (one per output token), each of length 81. After softmax, these weights define a weighted sum over the input tokens, producing 8 output representations that are learned combinations of all 81 inputs.\n\nWith TokenLearner: 8 tokens × 6 frames = 48 image tokens + 66 action tokens = 114 total — roughly 5× fewer than without, yielding about a 2× speedup in practice. The paper found TokenLearner also slightly improves accuracy, because it forces the model to learn compact, task-relevant scene representations.",
+      "code_blocks": [
+        {
+          "label": "TokenLearnerModule — learned soft attention over spatial tokens",
+          "source": "class TokenLearnerModule(tf.keras.layers.Layer):\n  \"\"\"TokenLearner module V1.1 (https://arxiv.org/abs/2106.11297).\"\"\"\n\n  def __init__(self,\n               num_tokens: int,\n               bottleneck_dim: int = 64,\n               dropout_rate: float = 0.):\n    super().__init__()\n\n    self.mlp = MlpBlock(\n        mlp_dim=bottleneck_dim, out_dim=num_tokens, dropout_rate=dropout_rate)\n    self.layernorm = tf.keras.layers.LayerNormalization(epsilon=1e-6)\n\n  def call(self, inputs: tf.Tensor, training: bool = False) -> tf.Tensor:\n    if len(inputs.shape) == 4:\n      bs, h, w, c = inputs.shape\n      inputs = tf.reshape(inputs, [bs, h * w, c])\n\n    selected = self.layernorm(inputs)\n\n    selected = self.mlp(\n        selected, is_training=training)  # Shape: [bs, h*w, n_token].\n\n    selected = tf.transpose(selected, [0, 2, 1])  # Shape: [bs, n_token, h*w].\n    selected = tf.nn.softmax(selected, axis=-1)\n\n    feat = tf.einsum(\"...si,...id->...sd\", selected, inputs)\n\n    return feat  # Shape: [bs, n_token, c]",
+          "source_start_line": 100,
+          "file_path": "tokenizers/token_learner.py",
+          "annotations": [
+            {
+              "start_line": 109,
+              "end_line": 111,
+              "explanation": "The MlpBlock (hidden_dim=64, out_dim=num_tokens=8) is the attention generator. LayerNorm stabilizes the input before the MLP. The bottleneck dimension 64 keeps this compression module lightweight.",
+              "concept_tag": "normalization"
+            },
+            {
+              "start_line": 120,
+              "end_line": 124,
+              "explanation": "MLP maps [bs, 81, D] → [bs, 81, 8] (8 attention score vectors, one per output token). Transpose to [bs, 8, 81], then softmax over the 81 spatial positions to get proper attention weights summing to 1.",
+              "concept_tag": "attention"
+            },
+            {
+              "start_line": 126,
+              "end_line": 126,
+              "explanation": "Einstein summation: '...si,...id->...sd' means for each of the 8 output tokens (s), compute a weighted sum over all 81 input positions (i) using the softmax weights, producing 8 output tokens of dimension d=512.",
+              "concept_tag": "attention"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "action-tokenizer",
+      "title": "Action Tokenization: Discretizing the Continuous World",
+      "narrative": "A robot arm's action space is inherently continuous: dx, dy, dz (translation), droll, dpitch, dyaw (rotation), gripper openness, and a discrete terminate flag. How do you apply a language-model-style transformer to predict continuous numbers?\n\nRT-1's answer: discretize everything into a vocabulary of 256 buckets. Each action dimension gets its own token drawn from a 256-token vocabulary. For an 11-dimensional action (7 continuous arm DOFs + 1 gripper + 1 terminate + 2 base DOFs), that's 11 tokens per timestep.\n\nThe discretization is simple but effective: clip to [min, max], normalize to [0, 1], then multiply by 255 and cast to int. This uniform bucketing loses some precision at the extremes, but the paper found it works well in practice — the robot doesn't need submillimeter accuracy; it needs robustness and generalization.\n\nDiscrete tokens have a key advantage: the transformer can output a categorical distribution over 256 buckets for each action dimension, making it straightforward to apply cross-entropy loss, sample diverse actions, and interpret model confidence. Continuous regression with MSE loss is harder to train and doesn't naturally support uncertainty estimation.",
+      "code_blocks": [
+        {
+          "label": "RT1ActionTokenizer.tokenize — continuous → discrete action tokens",
+          "source": "  def tokenize(self, action: tensorspec_utils.TensorSpecStruct) -> tf.Tensor:\n    \"\"\"Tokenizes an action.\"\"\"\n    action_tokens = []\n    for k in self._action_order:\n      a = action[k]  # a is [batch, actions_size]\n      spec = self._action_spec[k]\n      if spec.dtype == tf.int32:\n        # Int32 actions are already assumed to be tokens, assume it is smaller\n        # than the vocab size, so all we need to do is pad zeros.\n        tf.debugging.assert_equal(1, tf.reduce_sum(a, axis=-1))\n        # extract the token [batch, 1]\n        token = tf.argmax(a, axis=-1, output_type=tf.int32)\n        tf.debugging.assert_less(token, self._vocab_size)\n        # Add a seq dimension [batch, 1]\n        token = tf.expand_dims(token, axis=-1)\n      else:\n        a = tf.clip_by_value(a, spec.minimum, spec.maximum)\n        # Normalize the action [batch, actions_size]\n        token = (a - spec.minimum) / (spec.maximum - spec.minimum)\n        # Bucket and discretize the action to vocab_size, [batch, actions_size]\n        token = tf.cast(token * (self._vocab_size - 1), tf.int32)\n      action_tokens.append(token)\n    # Append all actions, [batch, all_actions_size]\n    action_tokens = tf.concat(action_tokens, axis=-1)\n    return action_tokens",
+          "source_start_line": 103,
+          "file_path": "tokenizers/action_tokenizer.py",
+          "annotations": [
+            {
+              "start_line": 109,
+              "end_line": 117,
+              "explanation": "Discrete (int32) actions like 'terminate' are one-hot vectors; argmax extracts the active class index directly. These are already in token space — no binning needed.",
+              "concept_tag": "embedding"
+            },
+            {
+              "start_line": 119,
+              "end_line": 123,
+              "explanation": "Continuous actions: clip to [min, max] → normalize to [0,1] → scale to [0, 255] → cast to int. The result is a discrete token in vocab_size=256. For example, a translation of 0.5 in a range [-1, 1] maps to token 191.",
+              "concept_tag": "other:discretization"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "transformer-backbone",
+      "title": "The Causal Transformer: A Decoder for Robot Actions",
+      "narrative": "RT-1's transformer is a decoder-only (GPT-style) architecture: it can only attend to past and current tokens, never future ones. This is the right inductive bias for action prediction — the robot can't see into the future.\n\nEach transformer layer is a standard pre-LayerNorm block: LayerNorm → Multi-Head Self-Attention → residual, then LayerNorm → Feed-Forward → residual. Pre-norm (normalizing before the attention/FFN, not after) has been found to train more stably than post-norm for deep transformers.\n\nPosition embeddings use a clever approach: rather than learned absolute embeddings or RoPE, RT-1 uses one-hot position vectors projected through a learned Dense layer. This creates a learned positional encoding that's flexible and simple.\n\nThe output of the transformer is projected to `vocab_size=256` logits via a final Dense layer. Each position in the sequence outputs a distribution over 256 possible tokens — and for action positions, this distribution directly gives the predicted action token.",
+      "code_blocks": [
+        {
+          "label": "_TransformerLayer.call — pre-LN self-attention block",
+          "source": "  def call(self, x: tf.Tensor, attention_mask: tf.Tensor,\n           training: bool) -> Tuple[tf.Tensor, Union[tf.Tensor, None]]:\n    \"\"\"Calls the layer.\n\n    Args:\n      x: Input Tensor of shape `(B, T, dim)`.\n      attention_mask: a boolean mask of shape `(B, T, T)`, that prevents\n        attention to certain positions. The boolean mask specifies which query\n        elements can attend to which key elements, 1 indicates attention and 0\n        indicates no attention. Broadcasting can happen for the missing batch\n        dimensions and the head dimension.\n      training: Python boolean indicating whether the layer should behave in\n        training mode (adding dropout) or in inference mode (no dropout).\n\n    Returns:\n      y: Output Tensor of shape `(B, T, dim)`. Also return the attention scores\n      of shape `(B, T, dim)` or None.\n    \"\"\"\n    x1 = self.layernorm1(x)\n    mha_results = self.mha1(\n        query=x1,\n        key=x1,\n        value=x1,\n        attention_mask=attention_mask,\n        return_attention_scores=self._return_attention_scores,\n        training=training)\n    if self._return_attention_scores:\n      x1, score = mha_results\n    else:\n      x1, score = mha_results, None\n\n    x = x + x1\n\n    y = self.layernorm2(x)\n    ff_y = self.ff(y)\n    ff_y = self.dropout_ff(ff_y, training=training)\n    x = x + ff_y\n    return x, score",
+          "source_start_line": 52,
+          "file_path": "transformer.py",
+          "annotations": [
+            {
+              "start_line": 70,
+              "end_line": 77,
+              "explanation": "Pre-LayerNorm: normalize x before computing attention (not after). Self-attention uses x1 as query, key, and value — the mask prevents attending to future positions and to same-step action tokens during training.",
+              "concept_tag": "attention"
+            },
+            {
+              "start_line": 83,
+              "end_line": 83,
+              "explanation": "First residual connection: add the attention output back to the pre-attention input. This allows gradients to flow directly through the skip connection, enabling training of deep transformers.",
+              "concept_tag": "residual"
+            },
+            {
+              "start_line": 85,
+              "end_line": 88,
+              "explanation": "Feed-forward network: second LayerNorm → Dense → Dropout → second residual. The FF layer projects to feed_forward_size=512 — note this is narrower than the attention layer_size=4096, a design typical of large language models.",
+              "concept_tag": "linear"
+            }
+          ]
+        },
+        {
+          "label": "Transformer.call — position embeddings and transformer stack",
+          "source": "    seq_len = tf.shape(x)[1]\n    batch_size = tf.shape(x)[0]\n\n    positions = tf.one_hot(\n        tf.tile(tf.expand_dims(tf.range(0, seq_len, 1), 0), [batch_size, 1]),\n        seq_len)\n\n    x = self._token_emb(x)\n    x += self._position_emb(positions)\n    scores = []\n\n    for layer in self._layers:\n      x, score = layer(x, attention_mask=attention_mask, training=training)\n      if score is not None:\n        scores.append(score)\n    x = self._output_tokens(x)\n    return x, scores",
+          "source_start_line": 153,
+          "file_path": "transformer.py",
+          "annotations": [
+            {
+              "start_line": 156,
+              "end_line": 161,
+              "explanation": "Position encoding: generate a one-hot vector for each position (position i → one-hot vector of length seq_len), then project through a learned Dense layer. This is a learned linear position embedding. Token embeddings project input dim → feed_forward_size, then position embeddings are added.",
+              "concept_tag": "embedding"
+            },
+            {
+              "start_line": 164,
+              "end_line": 167,
+              "explanation": "Stack of num_layers=1 transformer blocks by default (but up to 8 in larger configs). Each layer outputs the same dimension, allowing arbitrary depth.",
+              "concept_tag": "attention"
+            },
+            {
+              "start_line": 168,
+              "end_line": 168,
+              "explanation": "Final projection: Dense(vocab_size=256) maps each token's representation to a distribution over the 256-token action vocabulary. At action positions, argmax gives the predicted action bucket.",
+              "concept_tag": "linear"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "sequence-assembly-masking",
+      "title": "Sequence Assembly and the Action Mask",
+      "narrative": "RT-1's sequence structure is the key to multi-step temporal modeling. Each timestep contributes two groups of tokens: first the image tokens (8 after TokenLearner), then the action tokens (11 for the robot's action dimensions). A 6-step history produces:\n\n  [img₁×8, act₁×11, img₂×8, act₂×11, ..., img₆×8, act₆×11] = 114 tokens\n\nThe causal mask ensures that each token can only attend to tokens at earlier or equal positions (lower-triangular matrix). But there's a subtlety: during training, the ground-truth action tokens from previous timesteps are available. The model should use these as context for predicting later timesteps' actions — but it must NOT use the action tokens from the current timestep as input when predicting that same timestep's action (that would be cheating).\n\nThis requires a modified attention mask: action tokens at step t are masked out from each other at step t (no action-to-action attention within the same timestep). The code implements this by subtracting a special `action_mask` matrix from the causal mask.\n\nThe assembly function itself has a notable quirk: action tokens are explicitly zeroed out (`tf.zeros_like`) before being concatenated with image tokens. This appears to be a workaround for a training bug (see the `b/260260205` comment) — the model predicts actions only from image tokens' output positions.",
+      "code_blocks": [
+        {
+          "label": "_generate_masks — build causal and action attention masks",
+          "source": "  def _generate_masks(self):\n    \"\"\"Generate mask for action prediction loss and attention visualization.\"\"\"\n    # each time step = [image, action]\n    self._single_time_step_num_tokens = (\n        self._tokens_per_action + self._tokens_per_context_image)\n\n    # full sequence = [prefix context + N x timestep + postfix context]\n    self._all_num_tokens = (\n        self._time_sequence_length * self._single_time_step_num_tokens)\n\n    # create mask for action predition loss\n    self._action_tokens_mask = []\n    for n in range(0, self._all_num_tokens, self._single_time_step_num_tokens):\n      for x in range(0, self._tokens_per_action, 1):\n        self._action_tokens_mask.append(x + n + self._tokens_per_context_image)\n    self._action_tokens_mask = tf.constant(\n        self._action_tokens_mask, dtype=tf.int32)\n\n    # The look ahead mask ensures causality.\n    self._default_attention_mask = tf.linalg.band_part(\n        tf.ones((self._all_num_tokens, self._all_num_tokens)), -1, 0)\n\n    action_mask = np.ndarray(\n        shape=(self._all_num_tokens, self._all_num_tokens), dtype=int)\n    for i in range(self._all_num_tokens):\n      for j in range(self._all_num_tokens):\n        action_i = self._get_action_index_for_token(i)\n        action_j = self._get_action_index_for_token(j)\n        mask = 0\n        if action_i != -1 and action_j != -1:\n          # Ignore actions of previous steps.\n          if action_j < action_i:\n            mask = 1\n          # If we're not auto-regression, ignore action dimensions of current\n          # step.\n          if (action_j == action_i and j <= i):\n            mask = 1\n        action_mask[i, j] = mask\n    self._default_attention_mask -= action_mask",
+          "source_start_line": 174,
+          "file_path": "transformer_network.py",
+          "annotations": [
+            {
+              "start_line": 193,
+              "end_line": 194,
+              "explanation": "Lower-triangular causal mask: tf.linalg.band_part(ones, -1, 0) keeps the lower triangle (including diagonal) and zeros out the upper triangle. Token i can attend to token j only if j ≤ i.",
+              "concept_tag": "attention"
+            },
+            {
+              "start_line": 200,
+              "end_line": 212,
+              "explanation": "Action mask: for any two action tokens from the same timestep (action_i == action_j), mask out the attention (set mask=1, then subtract from the causal mask). This prevents action token j from being used as input when predicting action token j — no label leakage between action dimensions at the same timestep.",
+              "concept_tag": "attention"
+            }
+          ]
+        },
+        {
+          "label": "_assemble_input_token_sequence — interleave image and action tokens",
+          "source": "  def _assemble_input_token_sequence(self, context_image_tokens, action_tokens,\n                                     batch_size):\n    # embed action tokens\n    action_tokens = tf.one_hot(action_tokens, self._vocab_size)\n    action_tokens = self._action_token_emb(action_tokens)\n    action_tokens = tf.zeros_like(action_tokens)  # b/260260205\n\n    # Because of b/254902773, we need to add 1 extra dimension.\n    action_tokens = tf.expand_dims(action_tokens, axis=-2)\n\n    # assemble token sequence\n    input_token_sequence = tf.concat([context_image_tokens, action_tokens],\n                                     axis=2)\n\n    input_token_sequence = tf.reshape(\n        input_token_sequence, [batch_size, -1, self._token_embedding_size])\n    return input_token_sequence",
+          "source_start_line": 630,
+          "file_path": "transformer_network.py",
+          "annotations": [
+            {
+              "start_line": 633,
+              "end_line": 635,
+              "explanation": "Action tokens are one-hot encoded and projected to embedding space — then immediately zeroed out (tf.zeros_like). This bug workaround means action tokens in the input are all zeros; the model cannot attend to previous action values and must rely entirely on image tokens.",
+              "concept_tag": "embedding"
+            },
+            {
+              "start_line": 640,
+              "end_line": 645,
+              "explanation": "Concatenate image and (zeroed) action tokens within each timestep along axis=2, then reshape to flatten all timesteps into one sequence: [B, T, tokens_per_step, D] → [B, T*tokens_per_step, D]. The transformer sees one flat sequence of 114 tokens.",
+              "concept_tag": "other:sequence-assembly"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "training-and-inference",
+      "title": "Putting It All Together: Training and Inference",
+      "narrative": "RT-1 runs in two distinct modes depending on whether it's training or running live on the robot.\n\nDuring **training**, all 6 timesteps of observations and ground-truth actions are available. The model runs one forward pass through the full transformer, producing logits at every position. Only the logits at action-token positions are used for the loss — image-token positions are ignored. The loss is sparse categorical cross-entropy over 256 buckets, applied to all T×11 action token positions simultaneously.\n\nDuring **inference** (running on the robot), only the current observation is available at each step, and actions must be predicted one token at a time. The model runs in a loop: for each of the 11 action dimensions, it runs a full forward pass and slices out the logit at the current action's position. This autoregressive decoding means 11 forward passes per timestep — expensive, but unavoidable for a model that conditions each action token on the previously predicted ones.\n\nThe network state (`context_image_tokens`, `action_tokens`, `seq_idx`) is maintained across inference steps, forming a rolling window of the last 6 observations. When the window fills up, the oldest frame is shifted out to make room for the newest.\n\nThis duality — parallel training, sequential inference — is a deliberate design choice that keeps training efficient while preserving the autoregressive structure needed for high-quality action generation.",
+      "code_blocks": [
+        {
+          "label": "TransformerNetwork.call — training branch: gather action logits and compute loss",
+          "source": "    else:\n      # training call --> simply run one transformer forward pass\n      output_tokens = self._transformer_call(\n          context_image_tokens,\n          action_tokens,\n          attention_mask=attention_mask,\n          batch_size=b,\n          training=training)\n\n      # Gather all predicted actions for the action loss.\n      action_logits = tf.gather(\n          output_tokens, self._action_tokens_mask - 1, axis=1)\n      action_logits_for_training = tf.reshape(\n          action_logits, [b, t, self._tokens_per_action, -1])\n\n      # Only take the last action as the action.\n      # action_logits_for_output is [b, self._tokens_per_action, emb]\n      action_logits_for_output = action_logits_for_training[:, -1]\n\n      # predicted_tokens_for_output is [b, self._tokens_per_action]\n      predicted_tokens_for_output = tf.argmax(\n          action_logits_for_output, axis=-1, output_type=tf.int32)\n\n      num_items = (\n          tf.cast(b * t, tf.float32) * self._single_time_step_num_tokens)\n      action_loss = tf.reduce_mean(\n          self._loss_object(action_tokens, action_logits_for_training) /\n          num_items,\n          axis=-1)\n\n      self._loss = action_loss",
+          "source_start_line": 360,
+          "file_path": "transformer_network.py",
+          "annotations": [
+            {
+              "start_line": 370,
+              "end_line": 373,
+              "explanation": "tf.gather extracts logits only at action-token positions (pre-built in _generate_masks). The -1 offset accounts for the transformer predicting the NEXT token, so the logit for action position k is at output position k-1. Result: [B, T*11, vocab_size] reshaped to [B, T, 11, vocab_size].",
+              "concept_tag": "attention"
+            },
+            {
+              "start_line": 383,
+              "end_line": 388,
+              "explanation": "Sparse categorical cross-entropy: given ground-truth action tokens (integer class indices) and predicted logits, compute the loss. Normalized by the total number of tokens in the sequence (not just action tokens), which downweights the loss relative to sequence length.",
+              "concept_tag": "loss"
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "summary": "RT-1 demonstrates that transformer-based sequence modeling, applied at scale to real robot data, can produce a single generalist manipulation policy across 700+ tasks. The architecture encodes each image frame with a FiLM-conditioned EfficientNetB3 — allowing the natural language instruction to modulate visual features channel-wise at every convolutional block — then compresses 81 spatial tokens to 8 via TokenLearner's learned soft attention. Continuous robot actions (translation, rotation, gripper) are discretized into 256 buckets each, producing 11 action tokens per timestep. A causal decoder-only transformer attends over the interleaved [image, action] token sequence across 6 historical frames, predicting the next action token at each position with sparse categorical cross-entropy. The result: trained on 130,000+ real-robot episodes, RT-1 achieves 97% success on trained tasks and generalizes to novel objects, environments, and instruction phrasings — showing that scale and diversity of data matter more than architectural novelty."
+}
