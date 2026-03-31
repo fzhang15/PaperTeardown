@@ -123,18 +123,21 @@ This is the manual, high-quality step. Read the paper and codebase, then write `
 
 Update `data/papers/index.json` to include the new paper entry.
 
-**Also update the lineage gallery** in `frontend/src/pages/PaperList.tsx`:
+**Also update the 2D lineage grid** in `frontend/src/pages/PaperList.tsx`:
 
-The gallery page organises papers into dependency-ordered groups. `LINEAGE_GROUPS` controls which group a paper appears in and its reading order within that group. `BUILDS_ON` adds a cross-group dependency badge (e.g. `↳ DiT action head`) to a card.
+The gallery uses a fixed column/row grid with an SVG wiring layer. Three static objects control the layout:
 
-Current groups:
-- `foundations` — `['dinov3', 'dit']` — peer works, no arrows
-- `robot-learning` — `['rt1', 'rt2', 'pi0', 'groot']` — direct lineage, arrows shown
+- `PAPER_POSITIONS` — maps each paper ID to `{col, row}`. Current layout:
+  - Row 0 (foundations): `dinov3` col 0, `dit` col 1
+  - Row 1 (robot-learning): `diffusion-policy` col 0, `rt1` col 1, `rt2` col 2, `pi0` col 3, `groot` col 4
+- `EDGES` — directed dependency arrows. Solid (`{}`) for direct lineage; dashed (`{dashed: true}`) when borrowing architecture cross-row.
+- `ROWS` — one entry per row with `id`, `label`, `color`, `borderColor`, `colRange`.
 
 For each new paper:
-1. Decide which group it belongs to and insert its ID at the correct position in `paperIds`
-2. If it borrows architecture from a paper in another group, add it to `BUILDS_ON` with a short label
-3. If it doesn't fit any existing group, add a new group object (`id`, `name`, `description`, `paperIds`, `showArrows`)
+1. Add `'<paper-id>': { col: N, row: R }` to `PAPER_POSITIONS` (next free column in the right row, or a new row)
+2. Add edges to `EDGES` pointing from its predecessors
+3. If adding a new row, add an entry to `ROWS` and update `MAX_ROW` / `SVG_H`
+4. Papers omitted from `PAPER_POSITIONS` automatically appear in the "Other Papers" catch-all below the grid
 
 ### Step 5: Start frontend and verify
 ```bash
