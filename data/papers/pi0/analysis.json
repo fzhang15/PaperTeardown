@@ -1,0 +1,319 @@
+{
+  "chapters": [
+    {
+      "id": "the-generalist-robot-problem",
+      "title": "The Generalist Robot Problem",
+      "narrative": "Most robot policies are specialists. You train one network to pick up a cup, another to fold laundry, another to load a dishwasher — and none of them transfers to the others. This is because robot manipulation is extraordinarily diverse: different grippers, different cameras, different action spaces, different physics. The state of the art before pi0 was mostly behavior cloning on a single robot, a single task, a single dataset.\n\npi0 asks a different question: what if we trained a single foundation model on a massive variety of robot demonstrations, the way language models are trained on the web? A model that has seen robots fold laundry, bag groceries, and assemble boxes is better positioned to learn any individual task with just a small amount of fine-tuning data.\n\nThe specific technical challenges this creates are substantial. Robot actions are continuous, high-dimensional, and temporally correlated — a 50-step action chunk for a dual-arm robot might have 32 degrees of freedom per step. You cannot just predict action tokens the way a language model predicts word tokens; the action space is too continuous and too structured. The model also needs to condition on rich visual observations (multiple camera views) and language instructions simultaneously.\n\npi0's solution combines three ideas. First, repurpose a pre-trained vision-language model (PaliGemma, which already understands images and language) as the backbone. Second, add a purpose-built \"action expert\" transformer that runs in parallel with PaliGemma, sharing attention layers so it can read from visual and language context. Third, use flow matching — a modern generative modeling technique — to produce continuous, smooth action trajectories rather than discrete tokens.\n\nThe result is a model that can be pre-trained on diverse robot data and then fine-tuned to new tasks and hardware with relatively few demonstrations.",
+      "code_blocks": []
+    },
+    {
+      "id": "model-architecture-overview",
+      "title": "Two Transformers, One Attention Layer",
+      "narrative": "pi0 is built from two Gemma transformer models that run in parallel and share attention at every layer. The first is PaliGemma — a 2-billion-parameter vision-language model that processes images (through a SigLIP encoder) and language instructions. The second is a 300-million-parameter \"action expert\" Gemma that processes the robot's joint state and the noisy action sequence being denoised.\n\nThe critical architectural insight is that these two models do NOT run independently. At each of the 18 transformer layers, both models compute their own query, key, and value projections — but then those K and V tensors are concatenated before the attention operation. This means the action expert can attend to image and language tokens, and the language model can attend to action tokens (though the attention mask controls which directions are allowed).\n\nThe model is initialized by loading PaliGemma's pre-trained weights into the first expert and randomly initializing the action expert. During fine-tuning, the action expert learns entirely from scratch while PaliGemma can be frozen or fine-tuned with LoRA.\n\nThe `Pi0.__init__` method reveals the full component list: a single `_gemma.Module` instantiated with two configs (one for PaliGemma, one for the action expert), a SigLIP image encoder, and a handful of linear projection layers to bridge between the action space and the transformer embedding dimension.",
+      "code_blocks": [
+        {
+          "label": "Pi0 model initialization — two Gemma configs, one shared module",
+          "source": "class Pi0(_model.BaseModel):\n    def __init__(self, config: pi0_config.Pi0Config, rngs: nnx.Rngs):\n        super().__init__(config.action_dim, config.action_horizon, config.max_token_len)\n        self.pi05 = config.pi05\n        paligemma_config = _gemma.get_config(config.paligemma_variant)\n        action_expert_config = _gemma.get_config(config.action_expert_variant)\n        # TODO: rewrite gemma in NNX. For now, use bridge.\n        llm = nnx_bridge.ToNNX(\n            _gemma.Module(\n                configs=[paligemma_config, action_expert_config],\n                embed_dtype=config.dtype,\n                adarms=config.pi05,\n            )\n        )\n        llm.lazy_init(rngs=rngs, method=\"init\", use_adarms=[False, True] if config.pi05 else [False, False])\n        img = nnx_bridge.ToNNX(\n            _siglip.Module(\n                num_classes=paligemma_config.width,\n                variant=\"So400m/14\",\n                pool_type=\"none\",\n                scan=True,\n                dtype_mm=config.dtype,\n            )\n        )\n        img.lazy_init(next(iter(config.fake_obs().images.values())), train=False, rngs=rngs)\n        self.PaliGemma = nnx.Dict(llm=llm, img=img)\n        self.action_in_proj = nnx.Linear(config.action_dim, action_expert_config.width, rngs=rngs)\n        if config.pi05:\n            self.time_mlp_in = nnx.Linear(action_expert_config.width, action_expert_config.width, rngs=rngs)\n            self.time_mlp_out = nnx.Linear(action_expert_config.width, action_expert_config.width, rngs=rngs)\n        else:\n            self.state_proj = nnx.Linear(config.action_dim, action_expert_config.width, rngs=rngs)\n            self.action_time_mlp_in = nnx.Linear(2 * action_expert_config.width, action_expert_config.width, rngs=rngs)\n            self.action_time_mlp_out = nnx.Linear(action_expert_config.width, action_expert_config.width, rngs=rngs)\n        self.action_out_proj = nnx.Linear(action_expert_config.width, config.action_dim, rngs=rngs)\n\n        # This attribute gets automatically set by model.train() and model.eval().\n        self.deterministic = True",
+          "source_start_line": 66,
+          "file_path": "src/openpi/models/pi0.py",
+          "annotations": [
+            {
+              "start_line": 73,
+              "end_line": 80,
+              "explanation": "A single `_gemma.Module` is created with a list of two configs — one for PaliGemma (2B params) and one for the action expert (300M params). This is the dual-expert design: both experts share the same transformer stack with interleaved attention.",
+              "concept_tag": "attention"
+            },
+            {
+              "start_line": 81,
+              "end_line": 91,
+              "explanation": "SigLIP So400m/14 is a 400M-parameter Vision Transformer that encodes 224x224 images into patch embeddings. The `pool_type=\"none\"` means all patch tokens are kept (not pooled to a single CLS vector), giving the language model spatial detail to reason about.",
+              "concept_tag": "embedding"
+            },
+            {
+              "start_line": 92,
+              "end_line": 100,
+              "explanation": "The action expert operates in its own embedding dimension (1024 for gemma_300m). These projections translate between the robot action space (32 dims for joint positions) and the transformer embedding dimension. The action_out_proj decodes the final hidden states back to action deltas.",
+              "concept_tag": "linear"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "embedding-the-prefix",
+      "title": "The Prefix: Images and Language",
+      "narrative": "At every forward pass, the model builds a sequence of tokens called the \"prefix\" — the part of the context that stays fixed and captures what the robot sees and what it's being asked to do.\n\nThe prefix is constructed by passing each camera image through the SigLIP encoder to get a grid of patch tokens (256 patches per 224×224 image at 14px patch size). If the robot has three cameras (base + two wrists), that's 768 image tokens. Then the language instruction is tokenized and embedded through the PaliGemma embedding layer, adding up to 48 more tokens.\n\nAll these tokens are marked with `ar_mask = False`, which means they share bidirectional attention with each other. Image tokens can attend to language and vice versa — the model can decide which parts of the image are most relevant to the instruction and vice versa.\n\nThe output is three arrays: the token embeddings, a boolean mask marking which positions are valid (not padding), and the `ar_mask` that encodes the attention pattern. These will be combined with the suffix tokens before the transformer forward pass.",
+      "code_blocks": [
+        {
+          "label": "embed_prefix — encoding images and language into the token sequence",
+          "source": "    def embed_prefix(\n        self, obs: _model.Observation\n    ) -> tuple[at.Float[at.Array, \"b s emb\"], at.Bool[at.Array, \"b s\"], at.Bool[at.Array, \" s\"]]:\n        input_mask = []\n        ar_mask = []\n        tokens = []\n        # embed images\n        for name in obs.images:\n            image_tokens, _ = self.PaliGemma.img(obs.images[name], train=False)\n\n            tokens.append(image_tokens)\n            input_mask.append(\n                einops.repeat(\n                    obs.image_masks[name],\n                    \"b -> b s\",\n                    s=image_tokens.shape[1],\n                )\n            )\n            # image tokens attend to each other\n            ar_mask += [False] * image_tokens.shape[1]\n\n        # add language (aka tokenized inputs)\n        if obs.tokenized_prompt is not None:\n            tokenized_inputs = self.PaliGemma.llm(obs.tokenized_prompt, method=\"embed\")\n            tokens.append(tokenized_inputs)\n            input_mask.append(obs.tokenized_prompt_mask)\n            # full attention between image and language inputs\n            ar_mask += [False] * tokenized_inputs.shape[1]\n        tokens = jnp.concatenate(tokens, axis=1)\n        input_mask = jnp.concatenate(input_mask, axis=1)\n        ar_mask = jnp.array(ar_mask)\n        return tokens, input_mask, ar_mask",
+          "source_start_line": 106,
+          "file_path": "src/openpi/models/pi0.py",
+          "annotations": [
+            {
+              "start_line": 114,
+              "end_line": 114,
+              "explanation": "SigLIP encodes each 224×224 image into (256, width) patch tokens. The second return value is discarded — SigLIP is used in `pool_type=\"none\"` mode so the second output (CLS token) is unused.",
+              "concept_tag": "embedding"
+            },
+            {
+              "start_line": 116,
+              "end_line": 125,
+              "explanation": "The image_mask is per-image (True if camera is active), but the token sequence needs a per-token mask. `einops.repeat` broadcasts the single bool across all 256 patch tokens for that image. Setting ar_mask=False for every image token means they all share bidirectional (non-causal) attention.",
+              "concept_tag": "attention"
+            },
+            {
+              "start_line": 127,
+              "end_line": 133,
+              "explanation": "Language tokens are embedded through the shared PaliGemma embedding table and appended after the image tokens. ar_mask=False here means language tokens also get full bidirectional attention with all image tokens — the model can freely cross-attend between vision and language.",
+              "concept_tag": "embedding"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "embedding-the-suffix",
+      "title": "The Suffix: State, Actions, and Time",
+      "narrative": "The \"suffix\" is the action-side of the token sequence: the robot's current joint positions, the noisy action trajectory being denoised, and the current diffusion timestep.\n\nThe timestep needs to be embedded into a vector that the model can reason about. Rather than a simple learned embedding, pi0 uses a sinusoidal positional encoding adapted for scalar values in [0, 1]. The encoding covers periods from 4ms to 4 seconds, giving the model sensitivity across the full range of flow matching timesteps.\n\nFor pi0 (not pi0.5), the robot state is projected into a single token, and the timestep embedding is concatenated with each of the 50 noisy action tokens before passing through a small MLP. This \"fused\" representation lets each action token know both its positional content and the current noise level.\n\nThe attention mask for suffix tokens is set differently from prefix tokens: `ar_mask = True` for the first action token (and the state token). This creates an asymmetry — prefix tokens cannot attend to suffix tokens, but suffix tokens CAN attend to prefix tokens. This way, the action expert reads from image/language context but the VLM part is not distracted by partially denoised actions.",
+      "code_blocks": [
+        {
+          "label": "posemb_sincos — sinusoidal embedding for diffusion timestep",
+          "source": "def posemb_sincos(\n    pos: at.Real[at.Array, \" b\"], embedding_dim: int, min_period: float, max_period: float\n) -> at.Float[at.Array, \"b {embedding_dim}\"]:\n    \"\"\"Computes sine-cosine positional embedding vectors for scalar positions.\"\"\"\n    if embedding_dim % 2 != 0:\n        raise ValueError(f\"embedding_dim ({embedding_dim}) must be divisible by 2\")\n\n    fraction = jnp.linspace(0.0, 1.0, embedding_dim // 2)\n    period = min_period * (max_period / min_period) ** fraction\n    sinusoid_input = jnp.einsum(\n        \"i,j->ij\",\n        pos,\n        1.0 / period * 2 * jnp.pi,\n        precision=jax.lax.Precision.HIGHEST,\n    )\n    return jnp.concatenate([jnp.sin(sinusoid_input), jnp.cos(sinusoid_input)], axis=-1)",
+          "source_start_line": 48,
+          "file_path": "src/openpi/models/pi0.py",
+          "annotations": [
+            {
+              "start_line": 55,
+              "end_line": 56,
+              "explanation": "Periods are log-spaced between min_period (4e-3) and max_period (4.0). This gives the model fine-grained sensitivity to small timestep differences near 0 and coarser sensitivity near 1 — matching the non-uniform distribution of training times.",
+              "concept_tag": "embedding"
+            },
+            {
+              "start_line": 57,
+              "end_line": 63,
+              "explanation": "The outer product (pos × frequencies) gives a (batch, dim/2) matrix of sinusoid inputs. Concatenating sin and cos doubles the dimension and ensures the encoding is injective — no two timestep values map to the same vector.",
+              "concept_tag": "embedding"
+            }
+          ]
+        },
+        {
+          "label": "embed_suffix — projecting state, noisy actions, and timestep into tokens",
+          "source": "    def embed_suffix(\n        self, obs: _model.Observation, noisy_actions: _model.Actions, timestep: at.Float[at.Array, \" b\"]\n    ) -> tuple[\n        at.Float[at.Array, \"b s emb\"],\n        at.Bool[at.Array, \"b s\"],\n        at.Bool[at.Array, \" s\"],\n        at.Float[at.Array, \"b emb\"] | None,\n    ]:\n        input_mask = []\n        ar_mask = []\n        tokens = []\n        if not self.pi05:\n            # add a single state token\n            state_token = self.state_proj(obs.state)[:, None, :]\n            tokens.append(state_token)\n            input_mask.append(jnp.ones((obs.state.shape[0], 1), dtype=jnp.bool_))\n            # image/language inputs do not attend to state or actions\n            ar_mask += [True]\n\n        action_tokens = self.action_in_proj(noisy_actions)\n        # embed timestep using sine-cosine positional encoding with sensitivity in the range [0, 1]\n        time_emb = posemb_sincos(timestep, self.action_in_proj.out_features, min_period=4e-3, max_period=4.0)\n        if self.pi05:\n            # time MLP (for adaRMS)\n            time_emb = self.time_mlp_in(time_emb)\n            time_emb = nnx.swish(time_emb)\n            time_emb = self.time_mlp_out(time_emb)\n            time_emb = nnx.swish(time_emb)\n            action_expert_tokens = action_tokens\n            adarms_cond = time_emb\n        else:\n            # mix timestep + action information using an MLP (no adaRMS)\n            time_tokens = einops.repeat(time_emb, \"b emb -> b s emb\", s=self.action_horizon)\n            action_time_tokens = jnp.concatenate([action_tokens, time_tokens], axis=-1)\n            action_time_tokens = self.action_time_mlp_in(action_time_tokens)\n            action_time_tokens = nnx.swish(action_time_tokens)\n            action_time_tokens = self.action_time_mlp_out(action_time_tokens)\n            action_expert_tokens = action_time_tokens\n            adarms_cond = None\n        tokens.append(action_expert_tokens)\n        input_mask.append(jnp.ones(action_expert_tokens.shape[:2], dtype=jnp.bool_))\n        # image/language/state inputs do not attend to action tokens\n        ar_mask += [True] + ([False] * (self.action_horizon - 1))\n        tokens = jnp.concatenate(tokens, axis=1)\n        input_mask = jnp.concatenate(input_mask, axis=1)\n        ar_mask = jnp.array(ar_mask)\n        return tokens, input_mask, ar_mask, adarms_cond",
+          "source_start_line": 140,
+          "file_path": "src/openpi/models/pi0.py",
+          "annotations": [
+            {
+              "start_line": 151,
+              "end_line": 157,
+              "explanation": "In pi0 mode (not pi0.5), the robot joint state is projected to a single token prepended before the action tokens. ar_mask=True marks the boundary — the VLM prefix tokens cannot attend to this state token, preventing action-space information from leaking into the language model's computation.",
+              "concept_tag": "linear"
+            },
+            {
+              "start_line": 159,
+              "end_line": 161,
+              "explanation": "The noisy action sequence has shape (batch, 50, 32) — 50 timesteps of 32 joint values. action_in_proj maps 32→1024 dims. The timestep is then embedded with sinusoidal encoding (1024 dims) to match the action embedding dimension for concatenation.",
+              "concept_tag": "embedding"
+            },
+            {
+              "start_line": 171,
+              "end_line": 178,
+              "explanation": "The timestep embedding is broadcast to all 50 action positions and concatenated with action embeddings (making 2048-dim vectors), then compressed back to 1024 through a 2-layer MLP with Swish activation. This way every action token carries both its positional content and awareness of the current noise level.",
+              "concept_tag": "other:mlp-fusion"
+            },
+            {
+              "start_line": 182,
+              "end_line": 182,
+              "explanation": "The first action token gets ar_mask=True (causal boundary), but subsequent action tokens get ar_mask=False (they share attention among themselves). This means action tokens can attend to each other within the chunk — important for generating temporally coherent motion.",
+              "concept_tag": "attention"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "prefix-lm-attention-masking",
+      "title": "Prefix-LM Attention: What Can Attend to What",
+      "narrative": "pi0 uses a carefully designed attention mask that controls which tokens can attend to which. The design is called \"prefix-LM\" attention, where a prefix block has full bidirectional attention and a suffix block has causal (left-to-right) attention relative to the prefix.\n\nBut pi0 generalizes this further. The `mask_ar` array encodes the attention pattern at a fine-grained level:\n- `mask_ar[i] = False` means token i shares attention with the previous token (i.e., it belongs to the same bidirectional group)\n- `mask_ar[i] = True` means token i starts a new causal block (previous tokens cannot attend to it)\n\nUsing a cumulative sum trick, this compactly encodes complex multi-block attention patterns into a single integer comparison: token i can attend to token j if and only if `cumsum(mask_ar)[j] ≤ cumsum(mask_ar)[i]`.\n\nFor pi0's token sequence:\n- Image tokens: all False → full bidirectional attention within and across all cameras\n- Language tokens: all False → attends freely to all image tokens\n- State token: True → starts a new causal block; prefix cannot attend back\n- First action token: True → another new block after state\n- Remaining action tokens: False → attend to each other and to everything before them",
+      "code_blocks": [
+        {
+          "label": "make_attn_mask — cumulative-sum trick for flexible attention patterns",
+          "source": "def make_attn_mask(input_mask, mask_ar):\n    \"\"\"Adapted from big_vision.\n\n    Tokens can attend to valid inputs tokens which have a cumulative mask_ar\n    smaller or equal to theirs. This way `mask_ar` bool[?B, N] can be used to\n    setup several types of attention, for example:\n\n      [[1 1 1 1 1 1]]: pure causal attention.\n\n      [[0 0 0 1 1 1]]: prefix-lm attention. The first 3 tokens can attend between\n          themselves and the last 3 tokens have a causal attention. The first\n          entry could also be a 1 without changing behaviour.\n\n      [[1 0 1 0 1 0 0 1 0 0]]: causal attention between 4 blocks. Tokens of a\n          block can attend all previous blocks and all tokens on the same block.\n\n    Args:\n      input_mask: bool[B, N] true if its part of the input, false if padding.\n      mask_ar: bool[?B, N] mask that's true where previous tokens cannot depend on\n        it and false where it shares the same attention mask as the previous token.\n    \"\"\"\n    mask_ar = jnp.broadcast_to(mask_ar, input_mask.shape)\n    cumsum = jnp.cumsum(mask_ar, axis=1)\n    attn_mask = cumsum[:, None, :] <= cumsum[:, :, None]\n    valid_mask = input_mask[:, None, :] * input_mask[:, :, None]\n    return jnp.logical_and(attn_mask, valid_mask)",
+          "source_start_line": 19,
+          "file_path": "src/openpi/models/pi0.py",
+          "annotations": [
+            {
+              "start_line": 26,
+              "end_line": 34,
+              "explanation": "Three examples show the flexibility of this encoding. `[0 0 0 1 1 1]` creates prefix-LM: tokens 0-2 attend bidirectionally, tokens 3-5 attend causally. `[1 0 1 0 1 0 0 1 0 0]` creates 4 separate causal blocks where each block can fully attend to all previous blocks.",
+              "concept_tag": "attention"
+            },
+            {
+              "start_line": 40,
+              "end_line": 41,
+              "explanation": "The cumulative sum converts the sparse boundary markers into a monotonically increasing group index. Token i belongs to 'group' cumsum[i]. The full 2D attention mask is then: token i can attend to token j iff cumsum[j] ≤ cumsum[i] (j is from an earlier or same group).",
+              "concept_tag": "attention"
+            },
+            {
+              "start_line": 42,
+              "end_line": 44,
+              "explanation": "The padding mask (input_mask) is AND-ed in as a second constraint: even if the cumsum condition allows attention, padding tokens are excluded. This handles variable-length prompts and missing camera views.",
+              "concept_tag": "attention"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "dual-expert-transformer",
+      "title": "The Dual-Expert Transformer Block",
+      "narrative": "The architectural heart of pi0 is how two transformer models — PaliGemma and the action expert — process tokens together at each layer. They do NOT run sequentially. At each of the 18 layers, both models compute their Q, K, V projections independently, then those projections are concatenated before the attention operation, so a single joint attention is computed across both token streams.\n\nThis is implemented in `compute_layer_complete` in the PyTorch version. For each layer index:\n1. Apply each model's input LayerNorm to its own hidden states (possibly with adaptive modulation for pi0.5)\n2. Compute Q, K, V for each model's tokens separately using their own projection weights\n3. Concatenate all Q, K, V tensors along the sequence dimension\n4. Run a single attention computation across the full concatenated sequence\n5. Slice the output back to each model's token range and apply the output projection from each model's own weights\n6. Apply FFN and second residual independently per model\n\nThe key insight: the two models have different width dimensions (2048 for PaliGemma, 1024 for the action expert), but they must share the same head dimension and number of attention heads. This ensures the concatenated K and V tensors are compatible. After attention, each model's output projection maps from the shared head space back to its own width.\n\nThis design lets the action expert be much smaller than PaliGemma while still having full access to the VLM's internal representations — every layer, not just at the input.",
+      "code_blocks": [
+        {
+          "label": "compute_layer_complete — shared attention across PaliGemma and action expert",
+          "source": "            def compute_layer_complete(layer_idx, inputs_embeds, attention_mask, position_ids, adarms_cond):\n                models = [self.paligemma.language_model, self.gemma_expert.model]\n\n                query_states = []\n                key_states = []\n                value_states = []\n                gates = []\n                for i, hidden_states in enumerate(inputs_embeds):\n                    layer = models[i].layers[layer_idx]\n                    hidden_states, gate = layer.input_layernorm(hidden_states, cond=adarms_cond[i])  # noqa: PLW2901\n                    gates.append(gate)\n\n                    input_shape = hidden_states.shape[:-1]\n                    hidden_shape = (*input_shape, -1, layer.self_attn.head_dim)\n                    query_state = layer.self_attn.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)\n                    key_state = layer.self_attn.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)\n                    value_state = layer.self_attn.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)\n\n                    query_states.append(query_state)\n                    key_states.append(key_state)\n                    value_states.append(value_state)\n\n                # Concatenate and process attention\n                query_states = torch.cat(query_states, dim=2)\n                key_states = torch.cat(key_states, dim=2)\n                value_states = torch.cat(value_states, dim=2)\n\n                dummy_tensor = torch.zeros(\n                    query_states.shape[0],\n                    query_states.shape[2],\n                    query_states.shape[-1],\n                    device=query_states.device,\n                    dtype=query_states.dtype,\n                )\n                cos, sin = self.paligemma.model.language_model.rotary_emb(dummy_tensor, position_ids)\n                query_states, key_states = modeling_gemma.apply_rotary_pos_emb(\n                    query_states, key_states, cos, sin, unsqueeze_dim=1\n                )\n\n                batch_size = query_states.shape[0]\n                scaling = self.paligemma.language_model.layers[layer_idx].self_attn.scaling\n\n                # Attention computation\n                att_output, _ = modeling_gemma.eager_attention_forward(\n                    self.paligemma.language_model.layers[layer_idx].self_attn,\n                    query_states,\n                    key_states,\n                    value_states,\n                    attention_mask,\n                    scaling,\n                )\n                # Get head_dim from the current layer, not from the model\n                head_dim = self.paligemma.language_model.layers[layer_idx].self_attn.head_dim\n                att_output = att_output.reshape(batch_size, -1, 1 * 8 * head_dim)\n\n                # Process layer outputs\n                outputs_embeds = []\n                start_pos = 0\n                for i, hidden_states in enumerate(inputs_embeds):\n                    layer = models[i].layers[layer_idx]\n                    end_pos = start_pos + hidden_states.shape[1]\n\n                    if att_output.dtype != layer.self_attn.o_proj.weight.dtype:\n                        att_output = att_output.to(layer.self_attn.o_proj.weight.dtype)\n                    out_emb = layer.self_attn.o_proj(att_output[:, start_pos:end_pos])\n\n                    # first residual\n                    out_emb = modeling_gemma._gated_residual(hidden_states, out_emb, gates[i])\n                    after_first_residual = out_emb.clone()\n                    out_emb, gate = layer.post_attention_layernorm(out_emb, cond=adarms_cond[i])\n                    # Convert to bfloat16 if the next layer (mlp) uses bfloat16\n                    if layer.mlp.up_proj.weight.dtype == torch.bfloat16:\n                        out_emb = out_emb.to(dtype=torch.bfloat16)\n\n                    out_emb = layer.mlp(out_emb)\n                    # second residual\n                    out_emb = modeling_gemma._gated_residual(after_first_residual, out_emb, gate)\n                    outputs_embeds.append(out_emb)\n                    start_pos = end_pos\n\n                return outputs_embeds",
+          "source_start_line": 158,
+          "file_path": "src/openpi/models_pytorch/gemma_pytorch.py",
+          "annotations": [
+            {
+              "start_line": 165,
+              "end_line": 178,
+              "explanation": "Each model computes its own Q, K, V using its own projection weights. This is the model-specific part: PaliGemma uses 2048-dim hidden states while the action expert uses 1024-dim, but both produce the same head_dim (256) × num_heads (8) shape because they're configured to match.",
+              "concept_tag": "attention"
+            },
+            {
+              "start_line": 181,
+              "end_line": 183,
+              "explanation": "The critical cross-expert step: K and V tensors from both models are concatenated along the sequence dimension. After this, a single attention operation sees keys and values from both token streams simultaneously. The action expert can now directly attend into PaliGemma's internal representation.",
+              "concept_tag": "attention"
+            },
+            {
+              "start_line": 192,
+              "end_line": 208,
+              "explanation": "RoPE is applied to queries and keys across the full concatenated sequence using shared position IDs — ensuring relative position encoding is consistent between the two token streams. Then a single attention computation produces outputs for all tokens at once.",
+              "concept_tag": "attention"
+            },
+            {
+              "start_line": 214,
+              "end_line": 236,
+              "explanation": "After the joint attention, outputs are sliced back to each model's token range [start_pos:end_pos]. Each model applies its own output projection, FFN, and residual connections independently. The models remain separate in their feed-forward computation — only attention is shared.",
+              "concept_tag": "other:mixture-of-experts"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "flow-matching-training",
+      "title": "Flow Matching: Training the Action Generator",
+      "narrative": "pi0 uses flow matching rather than DDPM-style diffusion to generate actions. The idea is elegant: instead of learning to reverse a fixed noise process, you learn a velocity field that interpolates directly between Gaussian noise and the target action.\n\nDuring training, a random interpolation time `t` is sampled from a Beta(1.5, 1) distribution shifted to [0.001, 1]. This distribution concentrates samples near t=1 (more noisy), which turns out to give better training signal. The interpolated action is:\n\n```\nx_t = t * noise + (1 - t) * actions\n```\n\nAt t=1 this is pure Gaussian noise; at t=0 it's the clean action. The model is trained to predict the velocity that would move x_t toward the clean action, which is simply:\n\n```\nu_t = noise - actions\n```\n\nThe loss is the mean squared error between the predicted velocity v_t and the true velocity u_t. At inference, the model runs an Euler ODE solver from t=1 to t=0, applying the predicted velocity at each step.\n\nOne implementation note: the code comment at the top of `sample_actions` apologizes that the inference convention (t=1 is noise, t=0 is clean) is the opposite of the paper — the paper uses t=0 for noise and t=1 for clean. The math is equivalent either way.",
+      "code_blocks": [
+        {
+          "label": "compute_loss — flow matching interpolation and velocity prediction loss",
+          "source": "    def compute_loss(\n        self, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions, *, train: bool = False\n    ) -> at.Float[at.Array, \"*b ah\"]:\n        preprocess_rng, noise_rng, time_rng = jax.random.split(rng, 3)\n        observation = _model.preprocess_observation(preprocess_rng, observation, train=train)\n\n        batch_shape = actions.shape[:-2]\n        noise = jax.random.normal(noise_rng, actions.shape)\n        time = jax.random.beta(time_rng, 1.5, 1, batch_shape) * 0.999 + 0.001\n        time_expanded = time[..., None, None]\n        x_t = time_expanded * noise + (1 - time_expanded) * actions\n        u_t = noise - actions\n\n        # one big forward pass of prefix + suffix at once\n        prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)\n        suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(observation, x_t, time)\n        input_mask = jnp.concatenate([prefix_mask, suffix_mask], axis=1)\n        ar_mask = jnp.concatenate([prefix_ar_mask, suffix_ar_mask], axis=0)\n        attn_mask = make_attn_mask(input_mask, ar_mask)\n        positions = jnp.cumsum(input_mask, axis=1) - 1\n        (prefix_out, suffix_out), _ = self.PaliGemma.llm(\n            [prefix_tokens, suffix_tokens], mask=attn_mask, positions=positions, adarms_cond=[None, adarms_cond]\n        )\n        v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])\n\n        return jnp.mean(jnp.square(v_t - u_t), axis=-1)",
+          "source_start_line": 189,
+          "file_path": "src/openpi/models/pi0.py",
+          "annotations": [
+            {
+              "start_line": 196,
+              "end_line": 200,
+              "explanation": "Beta(1.5, 1) sampling shifted to [0.001, 0.999] concentrates training time near t=1 (noisy end). The interpolated x_t is a straight-line mix between noise and clean action. The target velocity u_t = noise - actions points from x_t toward the clean action (when you think of it as the direction that, when integrated, removes the noise).",
+              "concept_tag": "loss"
+            },
+            {
+              "start_line": 203,
+              "end_line": 211,
+              "explanation": "At training time, both prefix and suffix tokens are processed together in one forward pass — the full sequence [image tokens | language tokens | state token | action tokens]. The dual Gemma module returns outputs for both token streams; the action expert's output is in suffix_out.",
+              "concept_tag": "other:training"
+            },
+            {
+              "start_line": 212,
+              "end_line": 214,
+              "explanation": "Only the last action_horizon tokens from suffix_out are used — these correspond to the 50 denoising action positions. The output projection maps from 1024-dim transformer output back to 32-dim action space. MSE is computed per action step, returning shape (batch, 50).",
+              "concept_tag": "loss"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "adaptive-rmsnorm",
+      "title": "Adaptive RMSNorm: Conditioning on Diffusion Time (pi0.5)",
+      "narrative": "The original pi0 model conditions on the diffusion timestep by concatenating the timestep embedding directly with the action tokens via an MLP. This is simple but has a limitation: the timestep information must propagate through the full transformer depth via residual connections to influence normalization and gating behavior.\n\npi0.5 takes a different approach called Adaptive RMSNorm (adaRMS), borrowed from DiT (Diffusion Transformers). Instead of injecting timestep information at the input layer, the timestep conditions the RMSNorm scale and shift at every layer. A small MLP transforms the timestep embedding into scale, shift, and gate parameters that directly modulate the normalized activations before and after attention.\n\nThe `cond` parameter to `RMSNorm.__call__` is the timestep embedding. When `cond=None`, regular RMSNorm runs with a learned scale. When `cond` is provided, a Dense layer projects `cond` to 3x the hidden dimension, then splits into scale/shift/gate. The gate multiplies the residual connection, giving the model fine-grained control over how much each layer's output contributes to the residual.\n\nIn pi0.5, the state input is also moved from a continuous token into the discrete language token sequence (tokenized as numbers), making the model more similar to a pure language model interface for robot commands.",
+      "code_blocks": [
+        {
+          "label": "RMSNorm with optional timestep conditioning (adaRMS)",
+          "source": "class RMSNorm(nn.Module):\n    @nn.compact\n    def __call__(self, x, cond):\n        dtype = x.dtype  # original dtype, could be half-precision\n        var = jnp.mean(jnp.square(x.astype(jnp.float32)), axis=-1, keepdims=True)  # compute variance in float32\n        normed_inputs = jnp.asarray(x * jnp.reciprocal(jnp.sqrt(var + 1e-06)))  # compute normalization in float32\n        if cond is None:\n            # regular RMSNorm\n            scale = self.param(\"scale\", nn.initializers.zeros_init(), (x.shape[-1]))\n            normed_inputs = normed_inputs * (\n                1 + scale\n            )  # scale by learned parameter in float32 (matches Flax implementation)\n            return normed_inputs.astype(dtype), None  # return in original dtype\n\n        # adaptive RMSNorm\n        modulation = nn.Dense(x.shape[-1] * 3, kernel_init=nn.initializers.zeros, dtype=dtype)(cond)\n        scale, shift, gate = jnp.split(modulation[:, None, :], 3, axis=-1)\n        normed_inputs = normed_inputs * (1 + scale) + shift  # scale and shift in float32\n        return normed_inputs.astype(dtype), gate",
+          "source_start_line": 113,
+          "file_path": "src/openpi/models/gemma.py",
+          "annotations": [
+            {
+              "start_line": 117,
+              "end_line": 118,
+              "explanation": "Variance is computed in float32 even when x is bfloat16 — this prevents underflow in the reciprocal square root. The result is kept as float32 through normalization, then cast back to the original dtype before returning. This pattern of upcasting for norm operations is common in mixed-precision training.",
+              "concept_tag": "normalization"
+            },
+            {
+              "start_line": 119,
+              "end_line": 125,
+              "explanation": "Standard RMSNorm: scale is initialized to zero, so `1 + scale` starts at 1 (identity). The network learns to deviate from identity only where needed. Returns None as the gate so the residual connection in Block uses an unconditional addition.",
+              "concept_tag": "normalization"
+            },
+            {
+              "start_line": 127,
+              "end_line": 131,
+              "explanation": "Adaptive path: a Dense layer projects the timestep embedding (from the flow matching time) to 3×hidden_dim. After splitting, scale and shift modulate the normalized activations (like FiLM conditioning), while gate is returned to multiply the residual — this is the 'gated residual' that makes adaRMS differ from simple FiLM.",
+              "concept_tag": "normalization"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "inference-kv-cache",
+      "title": "Inference: Euler Steps with KV Cache",
+      "narrative": "At inference time, pi0 generates actions by running an Euler ODE solver: start from pure Gaussian noise and iteratively apply the predicted velocity over 10 steps, stepping from t=1 down to t=0.\n\nThe naive implementation would run the full transformer (prefix + suffix) on every step — 10 forward passes through 18 layers of a 2.3B parameter model. This is expensive. pi0 amortizes the prefix cost with a KV cache.\n\nThe first pass runs ONLY the prefix tokens (images + language) through the transformer and stores the resulting key-value pairs at every layer. This is the \"context filling\" step and happens once per inference call.\n\nSubsequent denoising steps only need to run the suffix tokens (state + noisy actions), with the attention mask configured so suffix tokens can attend to the cached prefix KV pairs. This is substantially cheaper because the suffix is only 51 tokens (1 state + 50 actions) versus the full sequence of ~800 tokens.\n\nIn JAX, the denoising loop is implemented as `jax.lax.while_loop` for efficient XLA compilation. The `step` function carries `(x_t, time)` and updates both in each iteration. The loop terminates when `time < 0.5 * dt` (robustly handling floating-point drift).",
+      "code_blocks": [
+        {
+          "label": "sample_actions — KV cache prefill then iterative Euler denoising",
+          "source": "    def sample_actions(\n        self,\n        rng: at.KeyArrayLike,\n        observation: _model.Observation,\n        *,\n        num_steps: int | at.Int[at.Array, \"\"] = 10,\n        noise: at.Float[at.Array, \"b ah ad\"] | None = None,\n    ) -> _model.Actions:\n        observation = _model.preprocess_observation(None, observation, train=False)\n        # note that we use the convention more common in diffusion literature, where t=1 is noise and t=0 is the target\n        # distribution. yes, this is the opposite of the pi0 paper, and I'm sorry.\n        dt = -1.0 / num_steps\n        batch_size = observation.state.shape[0]\n        if noise is None:\n            noise = jax.random.normal(rng, (batch_size, self.action_horizon, self.action_dim))\n\n        # first fill KV cache with a forward pass of the prefix\n        prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)\n        prefix_attn_mask = make_attn_mask(prefix_mask, prefix_ar_mask)\n        positions = jnp.cumsum(prefix_mask, axis=1) - 1\n        _, kv_cache = self.PaliGemma.llm([prefix_tokens, None], mask=prefix_attn_mask, positions=positions)\n\n        def step(carry):\n            x_t, time = carry\n            suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(\n                observation, x_t, jnp.broadcast_to(time, batch_size)\n            )\n            # `suffix_attn_mask` is shape (b, suffix_len, suffix_len) indicating how the suffix tokens can attend to each\n            # other\n            suffix_attn_mask = make_attn_mask(suffix_mask, suffix_ar_mask)\n            # `prefix_attn_mask` is shape (b, suffix_len, prefix_len) indicating how the suffix tokens can attend to the\n            # prefix tokens\n            prefix_attn_mask = einops.repeat(prefix_mask, \"b p -> b s p\", s=suffix_tokens.shape[1])\n            # `combined_mask` is shape (b, suffix_len, prefix_len + suffix_len) indicating how the suffix tokens (which\n            # generate the queries) can attend to the full prefix + suffix sequence (which generates the keys and values)\n            full_attn_mask = jnp.concatenate([prefix_attn_mask, suffix_attn_mask], axis=-1)\n            assert full_attn_mask.shape == (\n                batch_size,\n                suffix_tokens.shape[1],\n                prefix_tokens.shape[1] + suffix_tokens.shape[1],\n            )\n            # `positions` is shape (b, suffix_len) indicating the positions of the suffix tokens\n            positions = jnp.sum(prefix_mask, axis=-1)[:, None] + jnp.cumsum(suffix_mask, axis=-1) - 1\n\n            (prefix_out, suffix_out), _ = self.PaliGemma.llm(\n                [None, suffix_tokens],\n                mask=full_attn_mask,\n                positions=positions,\n                kv_cache=kv_cache,\n                adarms_cond=[None, adarms_cond],\n            )\n            assert prefix_out is None\n            v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])\n\n            return x_t + dt * v_t, time + dt\n\n        def cond(carry):\n            x_t, time = carry\n            # robust to floating-point error\n            return time >= -dt / 2\n\n        x_0, _ = jax.lax.while_loop(cond, step, (noise, 1.0))\n        return x_0",
+          "source_start_line": 217,
+          "file_path": "src/openpi/models/pi0.py",
+          "annotations": [
+            {
+              "start_line": 228,
+              "end_line": 228,
+              "explanation": "dt = -1/10 = -0.1 per step. With 10 steps starting from t=1.0, the loop runs at t=1.0, 0.9, 0.8, ..., 0.1, ending at x_0 (the clean action prediction). Negative dt because time decreases from noise (t=1) to clean (t=0).",
+              "concept_tag": "other:flow-matching"
+            },
+            {
+              "start_line": 233,
+              "end_line": 237,
+              "explanation": "Prefix-only forward pass: passing [prefix_tokens, None] runs only PaliGemma on the image/language tokens and stores all 18 layers of K and V pairs in kv_cache. This is the expensive one-time cost; subsequent denoising steps reuse this cache.",
+              "concept_tag": "attention"
+            },
+            {
+              "start_line": 249,
+              "end_line": 267,
+              "explanation": "The full attention mask for the denoising step is (suffix_len, prefix_len + suffix_len): each suffix token queries against both the cached prefix K/V and its own suffix K/V. The attention mask enforces that suffix queries can read from the full prefix but only from action tokens at or before them.",
+              "concept_tag": "attention"
+            },
+            {
+              "start_line": 273,
+              "end_line": 278,
+              "explanation": "jax.lax.while_loop compiles the denoising loop into a single XLA while_loop op. This avoids Python loop overhead and allows XLA to optimize across iterations. The termination condition checks time >= -dt/2 rather than time > 0 to robustly handle floating-point rounding after 10 additions of -0.1.",
+              "concept_tag": "other:jax"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "putting-it-all-together",
+      "title": "Putting It All Together",
+      "narrative": "pi0 assembles into a coherent system once you see how each component feeds the next.\n\n**Training** takes a batch of robot demonstrations: (images, language instruction, joint state, clean action sequence). A random noise interpolation time `t ~ Beta(1.5, 1)` is sampled, and the clean action is mixed with Gaussian noise to produce `x_t`. The full token sequence is assembled:\n\n```\n[SigLIP(img1) | SigLIP(img2) | SigLIP(img3) | embed(language) | proj(state) | MLP(action_in_proj(x_t), timestep_emb)]\n```\n\nThis sequence passes through 18 transformer layers where PaliGemma tokens and action expert tokens share attention. The action expert's output for the last 50 positions is decoded back to 32-dimensional action space and the velocity prediction is compared to the true velocity with MSE loss.\n\n**Inference** runs the prefix (images + language) once to fill the KV cache, then runs an Euler ODE loop 10 times over just the suffix (state + action tokens), each time predicting the velocity and stepping `x_t += dt * v_t`. The result is a 50-step, 32-DOF action trajectory ready to execute on the robot.\n\n**pi0.5** improves on this by using Adaptive RMSNorm to inject the timestep signal at every transformer layer (instead of only at the input), and by encoding the robot state as tokenized text rather than a continuous token — making the interface more like a pure VLM.\n\nThe training pipeline supports cross-embodiment learning: the same model architecture handles ALOHA (bimanual 14-DOF), DROID (single-arm 7-DOF), and LIBERO setups by varying only the `action_dim` config and the data transforms. Pre-training on diverse robot data followed by fine-tuning on task-specific data is the intended usage pattern.",
+      "code_blocks": []
+    }
+  ],
+  "summary": "pi0 is a Vision-Language-Action (VLA) foundation model for robot manipulation. It combines a pre-trained PaliGemma VLM (2B params, SigLIP vision + Gemma language) with a smaller action expert transformer (300M params) that runs in parallel with PaliGemma, sharing attention at every layer so the action expert can read directly from the VLM's internal representations. Continuous robot actions (50-step, 32-DOF trajectories) are generated via flow matching: the model predicts a velocity field that denoises Gaussian noise into clean actions via an Euler ODE solver. A KV-cache optimization allows the expensive image+language prefix to be computed once per inference call, with subsequent denoising steps operating only on the lightweight action token suffix."
+}
