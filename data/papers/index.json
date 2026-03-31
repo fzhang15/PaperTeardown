@@ -30,6 +30,16 @@
     "ingested_at": "2026-03-31T00:00:00Z"
   },
   {
+    "id": "rt2",
+    "title": "RT-2: Vision-Language-Action Models Transfer Web Knowledge to Robotic Control",
+    "authors": ["Anthony Brohan", "Noah Brown", "Chelsea Finn", "Karol Hausman", "Sergey Levine", "et al."],
+    "arxiv_url": "https://arxiv.org/abs/2307.15818",
+    "repo_url": "https://github.com/kyegomez/RT-2",
+    "abstract": "We study how vision-language models trained on internet-scale data can be incorporated directly into end-to-end robot control to boost generalization and enable emergent semantic reasoning. RT-2 co-fine-tunes state-of-the-art vision-language models on both robotic trajectory data and internet-scale vision-language tasks, representing actions as language tokens. This enables emergent capabilities such as chain-of-thought reasoning and symbol understanding in robotic manipulation.",
+    "chapter_count": 8,
+    "ingested_at": "2026-03-31T00:00:00Z"
+  },
+  {
     "id": "pi0",
     "title": "pi0: A Vision-Language-Action Flow Model for General Robot Control",
     "authors": ["Kevin Black", "Noah Brown", "Danny Driess", "Chelsea Finn", "Karol Hausman", "Sergey Levine", "et al."],

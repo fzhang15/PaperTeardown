@@ -1,0 +1,191 @@
+{
+  "chapters": [
+    {
+      "id": "the-vla-problem",
+      "title": "The Web-to-Robot Transfer Problem",
+      "narrative": "Robots that can only do what they were explicitly trained to do are brittle. If you train a robot to pick up apples but never showed it a banana, it fails — not because it lacks the physical capability, but because it lacks the *conceptual* knowledge that bananas are also graspable fruit.\n\nThe insight behind RT-2 is that this conceptual knowledge already exists, encoded in the billions of image-text pairs that large vision-language models (VLMs) are trained on. Web-scale pretraining teaches models to understand categories, attributes, spatial relationships, and even commonsense reasoning. The question RT-2 asks is: can we make a robot inherit that knowledge directly?\n\nPrevious robots (including RT-1) used language only as a conditioning signal — a string fed through a fixed encoder that produces a task embedding. The model was otherwise a specialist that knew nothing about the broader world. RT-2 goes further: it takes a full VLM (Google's PaLI-X at 55B parameters, or PaLM-E at 562B) and fine-tunes it end-to-end so that its outputs *are* robot actions.\n\nThe mechanism that makes this possible is surprisingly clean: robot actions are discretized into bins and represented as tokens in the model's existing vocabulary. No new output head. No special architecture. The model that previously said \"the ripe banana is yellow\" can now, after fine-tuning, output the token sequences that move a robot arm to pick it up.",
+      "code_blocks": []
+    },
+    {
+      "id": "action-tokenization",
+      "title": "Action Tokens: Repurposing the Vocabulary",
+      "narrative": "The core trick in RT-2 is action tokenization: converting continuous robot actions into discrete integer tokens that live in the same vocabulary as natural language.\n\nRobot actions in the RT-1 dataset are 7-dimensional vectors: (x, y, z) for arm translation, (roll, pitch, yaw) for rotation, and a gripper open/close value. Each dimension is continuous-valued. To represent these as tokens, RT-2 discretizes each dimension into 256 uniform bins. That creates 256 possible tokens per action dimension × 7 dimensions — an action sequence of exactly 7 tokens per timestep.\n\nThese 256 token IDs are drawn from the *least-used* tokens in the original language model vocabulary (e.g., numeric strings like \"1\", \"2\", ..., \"256\" that rarely appear in natural text). This is deliberate: re-using low-frequency tokens minimizes interference with the model's language understanding while giving actions a home in the shared token space.\n\nIn the implementation below, `num_tokens=20000` is the vocabulary size — all tokens, both language tokens and the action bins, are drawn from this shared space. `max_seq_len=1024` is the maximum token sequence the decoder can process, which must be long enough to hold both the language instruction and the output action tokens.",
+      "code_blocks": [
+        {
+          "label": "RT2 constructor: shared vocabulary for language and actions",
+          "source": "    def __init__(\n        self,\n        image_size: int = 256,\n        patch_size: int = 32,\n        encoder_dim: int = 512,\n        encoder_depth: int = 6,\n        encoder_heads: int = 8,\n        num_tokens: int = 20000,\n        max_seq_len: int = 1024,\n        decoder_dim: int = 512,\n        decoder_depth: int = 6,\n        decoder_heads: int = 8,\n        attn_kv_heads: int = 2,\n        use_abs_pos_emb: bool = False,\n        cross_attend: bool = True,\n        attn_flash: bool = True,\n        qk_norm: bool = True,\n    ):",
+          "source_start_line": 39,
+          "file_path": "rt2/model.py",
+          "annotations": [
+            {
+              "start_line": 46,
+              "end_line": 47,
+              "explanation": "num_tokens is the shared vocabulary size. Language tokens and discretized action tokens both live here — no separate action head. max_seq_len caps the instruction + action token sequence.",
+              "concept_tag": "embedding"
+            },
+            {
+              "start_line": 53,
+              "end_line": 53,
+              "explanation": "cross_attend=True is the architectural key that lets the decoder attend to image embeddings from the encoder. This is how visual context flows into the language-action stream.",
+              "concept_tag": "attention"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "vit-encoder",
+      "title": "Seeing Through Patches: The ViT Image Encoder",
+      "narrative": "Before the language decoder can reason about visual inputs, the raw image must be compressed into a sequence of meaningful embeddings. RT-2 uses a Vision Transformer (ViT) for this — the same patch-based architecture that powers the visual understanding in PaLI-X and PaLM-E.\n\nThe ViT divides the input image into a grid of non-overlapping patches (e.g., 32×32 pixels each from a 256×256 image → 64 patches), projects each patch linearly into an embedding vector, and runs them through a stack of self-attention layers. The result is a sequence of patch embeddings where each embedding has \"seen\" the entire image through global attention.\n\nCritically, when we call `encoder(img, return_embeddings=True)` in the forward pass, we get back the full sequence of patch embeddings — not a pooled class token. This means the decoder gets spatially rich visual context: 64 vectors, each encoding what was happening in one patch of the image, all in relation to each other. The language decoder can attend selectively to the parts of the image most relevant to the current action.",
+      "code_blocks": [
+        {
+          "label": "ViTransformerWrapper: patch-based image encoding",
+          "source": "        self.encoder = ViTransformerWrapper(\n            image_size=image_size,\n            patch_size=patch_size,\n            attn_layers=Encoder(\n                dim=encoder_dim, depth=encoder_depth, heads=encoder_heads\n            ),\n        )",
+          "source_start_line": 59,
+          "file_path": "rt2/model.py",
+          "annotations": [
+            {
+              "start_line": 59,
+              "end_line": 65,
+              "explanation": "ViTransformerWrapper wraps a standard ViT: it handles patch extraction and positional embeddings, then passes the patch sequence through the Encoder (stack of self-attention layers). The Encoder processes all patches in parallel — there is no recurrence, no locality bias.",
+              "concept_tag": "attention"
+            },
+            {
+              "start_line": 61,
+              "end_line": 61,
+              "explanation": "patch_size=32 on a 256×256 image produces an 8×8 grid = 64 patch tokens. Smaller patches mean more tokens (finer detail) at the cost of quadratic attention cost. RT-2 uses 16×16 patches in the paper for higher-resolution PaLI-X inputs.",
+              "concept_tag": "convolution"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "cross-attending-decoder",
+      "title": "The Cross-Attending Language Decoder",
+      "narrative": "The language decoder in RT-2 is an autoregressive transformer: it consumes a sequence of tokens (the language instruction) and produces the next token at each step. What makes it special is *cross-attention* — at every layer, the decoder attends not only to previous tokens in the sequence, but also to the image embeddings produced by the ViT encoder.\n\nThis is the architectural embodiment of vision-language grounding. When the model is generating the action token for \"move arm left 3 cm,\" it can attend directly to the patch embeddings showing the target object. Language and vision share the same attention mechanism — they're not separate pipelines stitched together at the end.\n\nTwo other notable design choices here: `attn_kv_heads=2` uses grouped-query attention (GQA), where multiple query heads share a single key/value head. This dramatically reduces the KV-cache memory during inference — critical for deploying a 55B-parameter model on a robot. `qk_norm=True` normalizes queries and keys before the dot product, stabilizing attention scores for very deep or large models.",
+      "code_blocks": [
+        {
+          "label": "Transformer decoder with cross-attention to image context",
+          "source": "        self.decoder = Transformer(\n            num_tokens=num_tokens,\n            max_seq_len=max_seq_len,\n            use_abs_pos_emb=use_abs_pos_emb,\n            attn_layers=Decoder(\n                dim=decoder_dim,\n                depth=decoder_depth,\n                heads=decoder_heads,\n                cross_attend=cross_attend,\n                attn_kv_heads=attn_kv_heads,\n                attn_flash=attn_flash,\n                qk_norm=qk_norm,\n            ),\n        )\n\n        self.decoder = AutoregressiveWrapper(self.decoder)",
+          "source_start_line": 67,
+          "file_path": "rt2/model.py",
+          "annotations": [
+            {
+              "start_line": 75,
+              "end_line": 75,
+              "explanation": "cross_attend=True inserts cross-attention sublayers between the causal self-attention and feed-forward layers. At each decoder layer, every output token can attend to all image patch embeddings — giving the model visual grounding at every depth.",
+              "concept_tag": "attention"
+            },
+            {
+              "start_line": 76,
+              "end_line": 76,
+              "explanation": "Grouped-query attention (attn_kv_heads=2): 8 query heads share 2 key/value heads. This cuts KV-cache size by 4× with negligible quality loss — essential for the 55B RT-2 model to run in real-time on robot hardware.",
+              "concept_tag": "attention"
+            },
+            {
+              "start_line": 82,
+              "end_line": 82,
+              "explanation": "AutoregressiveWrapper turns the decoder into a generative model: given a prefix (the instruction tokens), it generates the next token, appends it, generates the next, and so on. This is how the model produces a 7-token action sequence one step at a time.",
+              "concept_tag": "other:autoregressive"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "forward-pass",
+      "title": "The Two-Step Forward Pass",
+      "narrative": "The RT-2 forward pass has a clean two-step structure: encode first, then decode.\n\nIn the encode step, the image is converted to a sequence of patch embeddings by the ViT encoder. These embeddings summarize \"what is visible\" — the objects, their positions, their attributes. Crucially, `return_embeddings=True` returns the full sequence of patch vectors rather than a single pooled representation, preserving spatial information.\n\nIn the decode step, the language token sequence (the instruction) is fed into the autoregressive decoder, along with the image embeddings as *context*. The decoder generates the output token by token. For training, the target sequence is the instruction plus the ground-truth action tokens; the model is trained with next-token prediction loss over the entire sequence, treating action tokens no differently from language tokens.\n\nAt inference on a real robot, the instruction tokens are the prompt and the model autoregressively generates exactly 7 action tokens, which are then de-tokenized back to continuous robot control signals.",
+      "code_blocks": [
+        {
+          "label": "Forward: encode image, decode text conditioned on image",
+          "source": "    def forward(self, img: torch.Tensor, text: torch.Tensor) -> torch.Tensor:\n        \"\"\"\n        Forward pass of the RT2 model.\n\n        Args:\n            img (torch.Tensor): Input image tensor.\n            text (torch.Tensor): Input text tensor.\n\n        Returns:\n            torch.Tensor: Output tensor.\n\n        Raises:\n            Exception: If an error occurs during the forward pass.\n\n        \"\"\"\n        try:\n            encoded = self.encoder(img, return_embeddings=True)\n            return self.decoder(text, context=encoded)\n        except Exception as error:\n            print(f\"Failed in forward method: {error}\")\n            raise",
+          "source_start_line": 84,
+          "file_path": "rt2/model.py",
+          "annotations": [
+            {
+              "start_line": 100,
+              "end_line": 100,
+              "explanation": "return_embeddings=True returns the full patch embedding sequence (shape: [batch, num_patches, encoder_dim]) rather than a single pooled vector. This gives the decoder 64 spatially distinct image tokens to attend to.",
+              "concept_tag": "embedding"
+            },
+            {
+              "start_line": 101,
+              "end_line": 101,
+              "explanation": "context=encoded passes the image embeddings as cross-attention keys and values into every decoder layer. The text sequence attends to these at each depth — visual grounding permeates the entire generation process, not just the first layer.",
+              "concept_tag": "attention"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "co-finetuning",
+      "title": "Co-Fine-Tuning: Keeping Web Knowledge Alive",
+      "narrative": "The most important training decision in RT-2 is not the architecture — it's the data mixture.\n\nA naive approach would fine-tune the VLM exclusively on robotics data. This works, but it causes *catastrophic forgetting*: the model's web-scale visual-language understanding is gradually overwritten by the narrow robot dataset. A fine-tuned model that has forgotten how to reason about novel objects has lost precisely the capability that makes it interesting.\n\nRT-2 avoids this with co-fine-tuning: the training data is a mixture of the original vision-language tasks (image captioning, visual QA, OCR) *and* the robot trajectory data. Both are formatted as token sequences. The model sees language tasks and robotics tasks interleaved throughout training, preventing forgetting.\n\nThe result is striking. In experiments, RT-2 demonstrates *emergent capabilities* that were never explicitly present in the robot training data:\n- **Novel object generalization**: asked to pick up \"the object that can be used as a stress ball,\" the model picks a soft toy — never seen in training but identified via web knowledge\n- **Reasoning chains**: when prompted \"think step by step,\" RT-2 produces a natural language rationale before generating action tokens, a direct transfer of chain-of-thought from web pretraining\n- **Symbol understanding**: instructed to place an object on \"the country whose flag has a dragon,\" the model correctly identifies Wales\n\nNone of these capabilities exist in a model trained only on robot data. They emerge specifically from the retained web-scale pretraining, preserved by the co-fine-tuning data mixture.",
+      "code_blocks": []
+    },
+    {
+      "id": "inference-example",
+      "title": "End-to-End: Image + Language → Action Tokens",
+      "narrative": "At inference time, the RT-2 pipeline is simple: provide an image of the robot's current view and a natural language instruction, and the model generates the next action as a sequence of tokens.\n\nThe input image tensor has shape `(batch, 3, H, W)` — a standard RGB image. The text tensor contains tokenized integers representing the instruction (e.g., \"pick up the green cup\" encoded as token IDs). The output has shape `(batch, seq_len, num_tokens)` — a probability distribution over the vocabulary at each position.\n\nDuring robot deployment, only the last 7 positions of the output matter: these are the action token predictions. The argmax at each position gives the discrete bin index for each action dimension, which is then linearly de-tokenized back to a continuous control value. The 7 values (Δx, Δy, Δz, Δroll, Δpitch, Δyaw, gripper) are sent directly to the robot's low-level controller.\n\nThe whole VLM runs at ~3 Hz on the RT-2 robot hardware — fast enough for closed-loop robot control where images are re-sampled at each timestep.",
+      "code_blocks": [
+        {
+          "label": "Running RT2: image + instruction token sequence → action logits",
+          "source": "import torch\nfrom rt2.model import RT2\n\n# img: (batch_size, 3, 256, 256)\n# caption: (batch_size, 1024)\nimg = torch.randn(1, 3, 256, 256)\ncaption = torch.randint(0, 20000, (1, 1024))\n\n# model: RT2\nmodel = RT2()\n\n# Run model on img and caption\noutput = model(img, caption)\nprint(output)  # (1, 1024, 20000)",
+          "source_start_line": 1,
+          "file_path": "example.py",
+          "annotations": [
+            {
+              "start_line": 6,
+              "end_line": 7,
+              "explanation": "Inputs: a 256×256 RGB image and a 1024-length token sequence. In real deployment, the image is the robot's current camera frame and the caption is the tokenized natural language instruction (e.g., \"pick up the blue block\").",
+              "concept_tag": "embedding"
+            },
+            {
+              "start_line": 13,
+              "end_line": 14,
+              "explanation": "Output shape (1, 1024, 20000): logits over the 20,000-token vocabulary at each of the 1024 sequence positions. During robot control, only the last 7 positions are consumed — one per action dimension — and the argmax gives the action bin index.",
+              "concept_tag": "other:action-tokenization"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "putting-it-all-together",
+      "title": "Putting It All Together: A VLM That Acts",
+      "narrative": "RT-2 is best understood as a proof of concept about *what VLMs already know*. The architecture is standard — a ViT encoder and a cross-attending autoregressive decoder. The training is fine-tuning, not a new learning algorithm. The novelty is entirely in the framing: actions are tokens, the VLM vocabulary is the action space, and web-scale knowledge transfers to robot control for free.\n\nThe full pipeline:\n1. **Perception**: ViT encodes the camera image into a sequence of 64 patch embeddings\n2. **Language grounding**: the instruction (\"pick up the ripe fruit\") is tokenized into integer IDs\n3. **Action generation**: the cross-attending decoder processes the instruction token by token, attending to image context at every layer, and generates 7 action tokens autoregressively\n4. **De-tokenization**: the 7 token IDs are mapped back to continuous Δx, Δy, Δz, Δroll, Δpitch, Δyaw, gripper values\n5. **Execution**: the continuous values are sent to the robot's low-level controller\n\nThe key architectural insight is that steps 1–4 are handled by a single model with a single forward pass. There is no separate perception model, no separate language parser, no separate action planner — the boundaries between these functions dissolve inside the shared transformer.\n\nThe key training insight is co-fine-tuning. By keeping language tasks alive during robot fine-tuning, RT-2 retains the reasoning capabilities that make it generalize: novel object categories, attribute understanding, chain-of-thought, and commonsense world knowledge — all inherited from the web, all now available to a robot arm.",
+      "code_blocks": [
+        {
+          "label": "Complete RT2 model: ViT encoder + cross-attending autoregressive decoder",
+          "source": "class RT2(nn.Module):\n    \"\"\"\n    RT2 model implementation.\n\n    Args:\n        image_size (int): Size of the input image.\n        patch_size (int): Size of each image patch.\n        encoder_dim (int): Dimension of the encoder.\n        encoder_depth (int): Depth of the encoder.\n        encoder_heads (int): Number of attention heads in the encoder.\n        num_tokens (int): Number of tokens in the decoder.\n        max_seq_len (int): Maximum sequence length in the decoder.\n        decoder_dim (int): Dimension of the decoder.\n        decoder_depth (int): Depth of the decoder.\n        decoder_heads (int): Number of attention heads in the decoder.\n        attn_kv_heads (int): Number of attention heads for key-value projection.\n        use_abs_pos_emb (bool): Whether to use absolute positional embeddings.\n        cross_attend (bool): Whether to enable cross-attention in the decoder.\n        attn_flash (bool): Whether to enable flash attention in the decoder.\n        qk_norm (bool): Whether to normalize queries and keys in attention.\n\n    Attributes:\n        encoder (ViTransformerWrapper): Encoder module.\n        decoder (AutoregressiveWrapper): Decoder module.\n\n    \"\"\"\n\n    def __init__(\n        self,\n        image_size: int = 256,\n        patch_size: int = 32,\n        encoder_dim: int = 512,\n        encoder_depth: int = 6,\n        encoder_heads: int = 8,\n        num_tokens: int = 20000,\n        max_seq_len: int = 1024,\n        decoder_dim: int = 512,\n        decoder_depth: int = 6,\n        decoder_heads: int = 8,\n        attn_kv_heads: int = 2,\n        use_abs_pos_emb: bool = False,\n        cross_attend: bool = True,\n        attn_flash: bool = True,\n        qk_norm: bool = True,\n    ):\n        super(RT2, self).__init__()\n\n        self.encoder = ViTransformerWrapper(\n            image_size=image_size,\n            patch_size=patch_size,\n            attn_layers=Encoder(\n                dim=encoder_dim, depth=encoder_depth, heads=encoder_heads\n            ),\n        )\n\n        self.decoder = Transformer(\n            num_tokens=num_tokens,\n            max_seq_len=max_seq_len,\n            use_abs_pos_emb=use_abs_pos_emb,\n            attn_layers=Decoder(\n                dim=decoder_dim,\n                depth=decoder_depth,\n                heads=decoder_heads,\n                cross_attend=cross_attend,\n                attn_kv_heads=attn_kv_heads,\n                attn_flash=attn_flash,\n                qk_norm=qk_norm,\n            ),\n        )\n\n        self.decoder = AutoregressiveWrapper(self.decoder)\n\n    def forward(self, img: torch.Tensor, text: torch.Tensor) -> torch.Tensor:\n        \"\"\"\n        Forward pass of the RT2 model.\n\n        Args:\n            img (torch.Tensor): Input image tensor.\n            text (torch.Tensor): Input text tensor.\n\n        Returns:\n            torch.Tensor: Output tensor.\n\n        Raises:\n            Exception: If an error occurs during the forward pass.\n\n        \"\"\"\n        try:\n            encoded = self.encoder(img, return_embeddings=True)\n            return self.decoder(text, context=encoded)\n        except Exception as error:\n            print(f\"Failed in forward method: {error}\")\n            raise",
+          "source_start_line": 12,
+          "file_path": "rt2/model.py",
+          "annotations": [
+            {
+              "start_line": 57,
+              "end_line": 66,
+              "explanation": "The ViT encoder: takes an image, splits it into patches, runs self-attention across all patches. Returns patch embeddings that spatially represent the visual scene. This is the \"eyes\" of the robot.",
+              "concept_tag": "attention"
+            },
+            {
+              "start_line": 67,
+              "end_line": 81,
+              "explanation": "The decoder: a language model with cross-attention. It sees the instruction tokens causally and attends to image patch embeddings at every layer. The AutoregressiveWrapper enables generation — producing one token at a time until the 7-token action sequence is complete.",
+              "concept_tag": "attention"
+            },
+            {
+              "start_line": 93,
+              "end_line": 94,
+              "explanation": "The entire VLM-to-robot pipeline in two lines: encode the visual scene, then decode a language+action sequence conditioned on that visual context. The action tokens are predicted exactly like language tokens — same loss, same vocabulary, same generation mechanism.",
+              "concept_tag": "other:autoregressive"
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "summary": "RT-2 fine-tunes a large vision-language model (PaLI-X 55B or PaLM-E 562B) to directly output robot actions as tokens in its existing vocabulary. Continuous actions are discretized into 256 bins per dimension, mapped to low-frequency token IDs, and generated autoregressively alongside language. The key is co-fine-tuning: mixing robotics data with original vision-language tasks preserves web-scale knowledge, enabling emergent capabilities like novel object generalization, chain-of-thought reasoning, and symbol understanding — none of which were present in the robot training data."
+}
