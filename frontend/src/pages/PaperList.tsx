@@ -4,89 +4,75 @@ import { fetchIndex } from '../api/papers'
 import type { PaperIndexEntry } from '../types'
 
 // ---------------------------------------------------------------------------
-// Grid layout constants
+// Layout constants
 // ---------------------------------------------------------------------------
-const CARD_W = 220
-const CARD_H = 165
-const COL_GAP = 52    // horizontal space between columns (holds horizontal arrows)
-const ROW_GAP = 72    // vertical space between rows (holds cross-row wires)
-const LABEL_H = 26    // height of the group-label band sitting above each row
-const PAD_X = 32
-const PAD_Y = 48
+const CARD_W   = 220
+const CARD_H   = 158
+const COL_GAP  = 96   // horizontal gap between tracks — cross-track wires live here
+const ROW_GAP  = 56   // vertical gap between papers in same track — vertical arrows here
+const HEADER_H = 40   // height of track column header
+const PAD_X    = 32
+const PAD_Y    = 28
 
-const COL_STRIDE = CARD_W + COL_GAP   // 272
-const ROW_STRIDE = LABEL_H + CARD_H + ROW_GAP  // 263
-
-/** Pixel x of a card's left edge given its column */
-function colX(col: number) { return PAD_X + col * COL_STRIDE }
-/** Pixel y of a card's top edge given its row */
-function rowY(row: number) { return PAD_Y + row * ROW_STRIDE + LABEL_H }
-/** Pixel y of the centre of the label band above a row */
-function rowLabelCY(row: number) { return PAD_Y + row * ROW_STRIDE + LABEL_H / 2 }
-
-const MAX_COL = 4
-const MAX_ROW = 1
-const SVG_W = PAD_X * 2 + (MAX_COL + 1) * CARD_W + MAX_COL * COL_GAP  // 1372
-const SVG_H = PAD_Y * 2 + (MAX_ROW + 1) * (LABEL_H + CARD_H) + MAX_ROW * ROW_GAP  // 554
+/** Pixel x of a card's left edge in the given track */
+function cardX(track: number) { return PAD_X + track * (CARD_W + COL_GAP) }
+/** Pixel y of a card's top edge at the given row */
+function cardY(row: number)   { return PAD_Y + HEADER_H + row * (CARD_H + ROW_GAP) }
 
 // ---------------------------------------------------------------------------
-// Paper → grid position  (this is the single source of truth for layout)
+// Paper positions  (track = vertical lane index, row = position within lane)
+// Adding a new paper: pick the right track and the next free row.
 // ---------------------------------------------------------------------------
-interface GridPos { col: number; row: number }
+interface TrackPos { track: number; row: number }
 
-const PAPER_POSITIONS: Record<string, GridPos> = {
-  dinov3:             { col: 0, row: 0 },
-  dit:                { col: 1, row: 0 },
-  'diffusion-policy': { col: 0, row: 1 },
-  rt1:                { col: 1, row: 1 },
-  rt2:                { col: 2, row: 1 },
-  pi0:                { col: 3, row: 1 },
-  groot:              { col: 4, row: 1 },
+const PAPER_POSITIONS: Record<string, TrackPos> = {
+  dinov3:             { track: 0, row: 0 },
+  dit:                { track: 0, row: 1 },
+  'diffusion-policy': { track: 1, row: 0 },
+  rt1:                { track: 1, row: 1 },
+  rt2:                { track: 1, row: 2 },
+  pi0:                { track: 1, row: 3 },
+  groot:              { track: 1, row: 4 },
 }
 
 // ---------------------------------------------------------------------------
-// Row group metadata  (visual bands behind the cards)
+// Track configuration  (one entry per vertical lane, left-to-right order)
 // ---------------------------------------------------------------------------
-interface RowConfig {
+interface TrackConfig {
   id: string
   label: string
   color: string
   borderColor: string
-  colRange: [number, number]   // [minCol, maxCol] occupied in this row
 }
 
-const ROWS: RowConfig[] = [
-  {
-    id: 'foundations',
-    label: 'Vision & Generative Foundations',
-    color: '#eff6ff',
-    borderColor: '#bfdbfe',
-    colRange: [0, 1],
-  },
-  {
-    id: 'robot-learning',
-    label: 'Robot Foundation Models',
-    color: '#f0fdf4',
-    borderColor: '#bbf7d0',
-    colRange: [0, 4],
-  },
+const TRACKS: TrackConfig[] = [
+  { id: 'foundations',    label: 'Vision & Generative Foundations', color: '#eff6ff', borderColor: '#bfdbfe' },
+  { id: 'robot-learning', label: 'Robot Foundation Models',          color: '#f0fdf4', borderColor: '#bbf7d0' },
 ]
 
 // ---------------------------------------------------------------------------
-// Directed edges
+// Dependency edges
 // ---------------------------------------------------------------------------
 interface Edge { from: string; to: string; dashed?: boolean }
 
 const EDGES: Edge[] = [
-  // Robot learning lineage (solid)
+  // Same-track lineage (solid vertical arrows)
   { from: 'diffusion-policy', to: 'rt1' },
   { from: 'rt1',              to: 'rt2' },
   { from: 'rt2',              to: 'pi0' },
   { from: 'pi0',              to: 'groot' },
-  // Cross-group influences (dashed purple)
+  // Cross-track architectural borrowing (dashed horizontal fork)
   { from: 'dit', to: 'pi0',   dashed: true },
   { from: 'dit', to: 'groot', dashed: true },
 ]
+
+// ---------------------------------------------------------------------------
+// SVG canvas dimensions — auto-computed from PAPER_POSITIONS
+// ---------------------------------------------------------------------------
+const _nTracks = Math.max(...Object.values(PAPER_POSITIONS).map(p => p.track)) + 1
+const _maxRow  = Math.max(...Object.values(PAPER_POSITIONS).map(p => p.row))
+const SVG_W    = PAD_X * 2 + _nTracks * CARD_W + (_nTracks - 1) * COL_GAP
+const SVG_H    = cardY(_maxRow) + CARD_H + PAD_Y
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -117,7 +103,6 @@ function PaperCard({ paper, onClick }: { paper: PaperIndexEntry; onClick: () => 
       onMouseEnter={(e) => (e.currentTarget.style.boxShadow = '0 4px 14px rgba(0,0,0,0.10)')}
       onMouseLeave={(e) => (e.currentTarget.style.boxShadow = 'none')}
     >
-      {/* Title + chapter badge */}
       <div style={{ display: 'flex', justifyContent: 'space-between', gap: 6, marginBottom: 4 }}>
         <h3 style={{ margin: 0, fontSize: 12, fontWeight: 600, lineHeight: 1.35, color: '#111827' }}>
           {paper.title}
@@ -129,18 +114,12 @@ function PaperCard({ paper, onClick }: { paper: PaperIndexEntry; onClick: () => 
           {paper.chapter_count} chapter{paper.chapter_count !== 1 ? 's' : ''}
         </span>
       </div>
-
-      {/* Authors */}
       <p style={{ margin: '0 0 5px', fontSize: 10, color: '#9ca3af' }}>
         {formatAuthors(paper.authors)}
       </p>
-
-      {/* Abstract excerpt */}
       <p style={{ margin: '0 0 8px', fontSize: 11, color: '#374151', lineHeight: 1.55, flexGrow: 1, overflow: 'hidden' }}>
         {abstract}
       </p>
-
-      {/* Footer links */}
       <div style={{ display: 'flex', gap: 8 }}>
         <a href={paper.arxiv_url} target="_blank" rel="noopener noreferrer"
           onClick={(e) => e.stopPropagation()}
@@ -155,103 +134,163 @@ function PaperCard({ paper, onClick }: { paper: PaperIndexEntry; onClick: () => 
 }
 
 // ---------------------------------------------------------------------------
-// SVG wiring layer
+// SVG wiring
 // ---------------------------------------------------------------------------
 const AH = 6  // arrowhead size in px
 
-function ArrowheadRight({ x, y, color }: { x: number; y: number; color: string }) {
-  return <polygon points={`${x},${y - AH / 2} ${x + AH},${y} ${x},${y + AH / 2}`} fill={color} />
-}
-function ArrowheadDown({ x, y, color }: { x: number; y: number; color: string }) {
-  return <polygon points={`${x - AH / 2},${y} ${x},${y + AH} ${x + AH / 2},${y}`} fill={color} />
-}
-
 function Wiring() {
-  const SOLID_COLOR  = '#94a3b8'
-  const DASHED_COLOR = '#a78bfa'
+  const SOLID  = '#94a3b8'
+  const DASHED = '#a78bfa'
 
-  const rowBgs = ROWS.map((row, i) => {
-    const bgX = colX(row.colRange[0]) - 12
-    const bgRight = colX(row.colRange[1]) + CARD_W + 12
-    const bgY = PAD_Y + i * ROW_STRIDE - 8
-    const bgH = LABEL_H + CARD_H + 16
+  // Compute max row per track for background heights
+  const trackMaxRow = new Map<number, number>()
+  Object.values(PAPER_POSITIONS).forEach(({ track, row }) => {
+    trackMaxRow.set(track, Math.max(trackMaxRow.get(track) ?? 0, row))
+  })
+
+  // Track background bands + column headers
+  const trackBgs = TRACKS.map((trk, i) => {
+    const maxR = trackMaxRow.get(i) ?? 0
+    const bgX  = cardX(i) - 12
+    const bgY  = PAD_Y - 8
+    const bgW  = CARD_W + 24
+    const bgH  = HEADER_H + (maxR + 1) * CARD_H + maxR * ROW_GAP + 16
     return (
-      <g key={row.id}>
-        <rect x={bgX} y={bgY} width={bgRight - bgX} height={bgH}
-          rx={8} fill={row.color} stroke={row.borderColor} strokeWidth={1} />
+      <g key={trk.id}>
+        <rect x={bgX} y={bgY} width={bgW} height={bgH}
+          rx={8} fill={trk.color} stroke={trk.borderColor} strokeWidth={1} />
         <text
-          x={bgX + 10} y={rowLabelCY(i) + 4}
-          fontSize={11} fontWeight={600} fill="#6b7280"
+          x={cardX(i) + CARD_W / 2} y={PAD_Y + HEADER_H / 2 + 4}
+          textAnchor="middle" fontSize={11} fontWeight={600} fill="#374151"
           fontFamily="system-ui, -apple-system, sans-serif"
         >
-          {row.label}
+          {trk.label}
         </text>
       </g>
     )
   })
 
-  const wires = EDGES.map((edge) => {
+  // Separate same-track vs cross-track edges; group cross-track by source
+  type ResolvedEdge = Edge & { fp: TrackPos; tp: TrackPos }
+  const sameTrackEdges: ResolvedEdge[] = []
+  const crossBySource  = new Map<string, ResolvedEdge[]>()
+
+  EDGES.forEach((edge) => {
     const fp = PAPER_POSITIONS[edge.from]
     const tp = PAPER_POSITIONS[edge.to]
-    if (!fp || !tp) return null
-
-    const color = edge.dashed ? DASHED_COLOR : SOLID_COLOR
-    const dash  = edge.dashed ? '5,3' : undefined
-
-    if (fp.row === tp.row) {
-      // Horizontal arrow: right-middle of source → left-middle of target
-      const y  = rowY(fp.row) + CARD_H / 2
-      const x1 = colX(fp.col) + CARD_W
-      const x2 = colX(tp.col)
-      return (
-        <g key={`${edge.from}→${edge.to}`}>
-          <line x1={x1} y1={y} x2={x2 - AH} y2={y}
-            stroke={color} strokeWidth={1.5} strokeDasharray={dash} />
-          <ArrowheadRight x={x2 - AH} y={y} color={color} />
-        </g>
-      )
+    if (!fp || !tp) return
+    const re: ResolvedEdge = { ...edge, fp, tp }
+    if (fp.track === tp.track) {
+      sameTrackEdges.push(re)
     } else {
-      // Cross-row bezier: bottom-centre of source → top-centre of target
-      const x1 = colX(fp.col) + CARD_W / 2
-      const y1 = rowY(fp.row) + CARD_H
-      const x2 = colX(tp.col) + CARD_W / 2
-      const y2 = rowY(tp.row)
-      const cy = (y1 + y2) / 2
-      const d  = `M${x1},${y1} C${x1},${cy} ${x2},${cy} ${x2},${y2 - AH}`
-      return (
-        <g key={`${edge.from}→${edge.to}`}>
-          <path d={d} stroke={color} strokeWidth={1.5} fill="none" strokeDasharray={dash} />
-          <ArrowheadDown x={x2} y={y2 - AH} color={color} />
-        </g>
-      )
+      if (!crossBySource.has(edge.from)) crossBySource.set(edge.from, [])
+      crossBySource.get(edge.from)!.push(re)
     }
   })
 
-  // Legend
-  const LX = SVG_W - PAD_X - 160
-  const LY = PAD_Y - 8
+  // Vertical same-track arrows (bottom-centre → top-centre)
+  const vertWires = sameTrackEdges.map((e) => {
+    const cx = cardX(e.fp.track) + CARD_W / 2
+    const y1 = cardY(e.fp.row) + CARD_H
+    const y2 = cardY(e.tp.row)
+    return (
+      <g key={`${e.from}→${e.to}`}>
+        <line x1={cx} y1={y1} x2={cx} y2={y2 - AH} stroke={SOLID} strokeWidth={1.5} />
+        <polygon
+          points={`${cx - AH / 2},${y2 - AH} ${cx},${y2} ${cx + AH / 2},${y2 - AH}`}
+          fill={SOLID}
+        />
+      </g>
+    )
+  })
+
+  // Cross-track wires: bus topology — shared trunk + individual branches
+  //
+  //   source ───┤         (horizontal stub to trunk x)
+  //             │         (vertical trunk through gap)
+  //             ├──────→  target A
+  //             │
+  //             └──────→  target B
+  //
+  const crossWires: JSX.Element[] = []
+  crossBySource.forEach((edges, sourceId) => {
+    const fp    = edges[0].fp
+    const color = edges[0].dashed ? DASHED : SOLID
+    const dash  = edges[0].dashed ? '5,3' : undefined
+
+    const x1   = cardX(fp.track) + CARD_W       // right edge of source card
+    const y1   = cardY(fp.row) + CARD_H / 2      // vertical centre of source
+    const xMid = x1 + COL_GAP / 2               // trunk x, centred in the gap
+
+    const targets = [...edges].sort((a, b) => a.tp.row - b.tp.row)
+    const yLast   = cardY(targets[targets.length - 1].tp.row) + CARD_H / 2
+
+    crossWires.push(
+      <g key={`fork-${sourceId}`}>
+        {/* Horizontal stub: source right-edge → trunk */}
+        <line x1={x1} y1={y1} x2={xMid} y2={y1}
+          stroke={color} strokeWidth={1.5} strokeDasharray={dash} />
+        {/* Vertical trunk: source y → last target y */}
+        <line x1={xMid} y1={y1} x2={xMid} y2={yLast}
+          stroke={color} strokeWidth={1.5} strokeDasharray={dash} />
+        {/* Dot where stub meets trunk */}
+        <circle cx={xMid} cy={y1} r={2.5} fill={color} />
+
+        {/* Branch for each target */}
+        {targets.map((e) => {
+          const ty = cardY(e.tp.row) + CARD_H / 2
+          const tx = cardX(e.tp.track)
+          return (
+            <g key={e.to}>
+              {/* Horizontal branch: trunk → target left-edge */}
+              <line x1={xMid} y1={ty} x2={tx - AH} y2={ty}
+                stroke={color} strokeWidth={1.5} strokeDasharray={dash} />
+              {/* Arrowhead */}
+              <polygon
+                points={`${tx - AH},${ty - AH / 2} ${tx},${ty} ${tx - AH},${ty + AH / 2}`}
+                fill={color}
+              />
+              {/* Dot at branch point on trunk */}
+              <circle cx={xMid} cy={ty} r={2.5} fill={color} />
+            </g>
+          )
+        })}
+      </g>
+    )
+  })
 
   return (
     <svg width={SVG_W} height={SVG_H}
       style={{ position: 'absolute', top: 0, left: 0, pointerEvents: 'none' }}>
-
-      {/* Row backgrounds */}
-      {rowBgs}
-
-      {/* Dependency wires */}
-      {wires}
-
-      {/* Legend */}
-      <g>
-        <line x1={LX} y1={LY + 8} x2={LX + 24} y2={LY + 8} stroke={SOLID_COLOR} strokeWidth={1.5} />
-        <polygon points={`${LX + 18},${LY + 8 - AH / 2} ${LX + 24},${LY + 8} ${LX + 18},${LY + 8 + AH / 2}`} fill={SOLID_COLOR} />
-        <text x={LX + 30} y={LY + 12} fontSize={10} fill="#6b7280" fontFamily="system-ui, sans-serif">direct lineage</text>
-
-        <line x1={LX} y1={LY + 24} x2={LX + 24} y2={LY + 24} stroke={DASHED_COLOR} strokeWidth={1.5} strokeDasharray="5,3" />
-        <polygon points={`${LX + 18},${LY + 24 - AH / 2} ${LX + 24},${LY + 24} ${LX + 18},${LY + 24 + AH / 2}`} fill={DASHED_COLOR} />
-        <text x={LX + 30} y={LY + 28} fontSize={10} fill="#6b7280" fontFamily="system-ui, sans-serif">borrows architecture</text>
-      </g>
+      {trackBgs}
+      {vertWires}
+      {crossWires}
     </svg>
+  )
+}
+
+// ---------------------------------------------------------------------------
+// Legend
+// ---------------------------------------------------------------------------
+function Legend() {
+  const SOLID  = '#94a3b8'
+  const DASHED = '#a78bfa'
+  return (
+    <div style={{ display: 'flex', gap: 20, justifyContent: 'flex-end', marginBottom: 10 }}>
+      {[
+        { color: SOLID,  dash: undefined, label: 'direct lineage' },
+        { color: DASHED, dash: '4,3',     label: 'borrows architecture' },
+      ].map(({ color, dash, label }) => (
+        <div key={label} style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+          <svg width={28} height={12} style={{ overflow: 'visible' }}>
+            <line x1={0} y1={6} x2={20} y2={6}
+              stroke={color} strokeWidth={1.5} strokeDasharray={dash} />
+            <polygon points={`14,3 20,6 14,9`} fill={color} />
+          </svg>
+          <span style={{ fontSize: 11, color: '#6b7280' }}>{label}</span>
+        </div>
+      ))}
+    </div>
   )
 }
 
@@ -282,9 +321,9 @@ export function PaperList() {
       .catch((e: Error) => setError(e.message))
   }, [])
 
-  const paperMap   = new Map(papers?.map((p) => [p.id, p]) ?? [])
+  const paperMap    = new Map(papers?.map((p) => [p.id, p]) ?? [])
   const assignedIds = new Set(Object.keys(PAPER_POSITIONS))
-  const ungrouped  = papers?.filter((p) => !assignedIds.has(p.id)) ?? []
+  const ungrouped   = papers?.filter((p) => !assignedIds.has(p.id)) ?? []
 
   return (
     <div style={{ minHeight: '100vh', background: '#f9fafb' }}>
@@ -295,7 +334,7 @@ export function PaperList() {
         </p>
       </header>
 
-      <main style={{ maxWidth: 1450, margin: '0 auto', padding: '32px 24px' }}>
+      <main style={{ maxWidth: 800, margin: '0 auto', padding: '32px 24px' }}>
         {/* Error */}
         {error && (
           <div role="alert" style={{
@@ -324,13 +363,13 @@ export function PaperList() {
           </div>
         )}
 
-        {/* 2-D lineage grid */}
+        {/* Vertical track grid */}
         {papers !== null && papers.length > 0 && (
           <>
             <section style={{ marginBottom: 48 }}>
-              {/* horizontally scrollable on narrow viewports */}
-              <div style={{ overflowX: 'auto', paddingBottom: 8 }}>
-                <div style={{ position: 'relative', width: SVG_W, height: SVG_H, flexShrink: 0 }}>
+              <Legend />
+              <div style={{ overflowX: 'auto' }}>
+                <div style={{ position: 'relative', width: SVG_W, height: SVG_H }}>
                   <Wiring />
                   {Object.entries(PAPER_POSITIONS).map(([id, pos]) => {
                     const paper = paperMap.get(id)
@@ -338,7 +377,12 @@ export function PaperList() {
                     return (
                       <div
                         key={id}
-                        style={{ position: 'absolute', left: colX(pos.col), top: rowY(pos.row), zIndex: 1 }}
+                        style={{
+                          position: 'absolute',
+                          left: cardX(pos.track),
+                          top: cardY(pos.row),
+                          zIndex: 1,
+                        }}
                       >
                         <PaperCard paper={paper} onClick={() => navigate(`/paper/${id}`)} />
                       </div>
@@ -348,7 +392,7 @@ export function PaperList() {
               </div>
             </section>
 
-            {/* Catch-all for papers not in the grid */}
+            {/* Papers not yet placed in any track */}
             {ungrouped.length > 0 && (
               <section>
                 <h2 style={{ margin: '0 0 16px', fontSize: 17, fontWeight: 700, color: '#111827' }}>

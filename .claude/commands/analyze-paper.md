@@ -33,13 +33,13 @@ Then execute the following phases:
 ### Phase 4: Metadata
 9. Write `data/papers/<paper-id>/meta.json`
 10. Update `data/papers/index.json` (add entry, don't duplicate)
-11. Place the paper in the 2D lineage grid — edit `frontend/src/pages/PaperList.tsx`:
-    - Add a `{col, row}` entry to `PAPER_POSITIONS`. Pick the next free column in the appropriate row, or start a new row (increment `MAX_ROW` and update `SVG_H` accordingly).
+11. Place the paper in the vertical track layout — edit `frontend/src/pages/PaperList.tsx`:
+    - Add `'<paper-id>': { track: N, row: R }` to `PAPER_POSITIONS`. Pick the right track and the next free row within it. SVG dimensions auto-compute — no other constants need updating.
     - Add directed edges to `EDGES`:
-      - `{ from: 'predecessor', to: '<paper-id>' }` — solid grey arrow for direct lineage
-      - `{ from: 'other-paper', to: '<paper-id>', dashed: true }` — dashed purple arrow when the paper borrows an architecture from another group
-    - If the paper belongs to a new conceptual group (new row), add a corresponding entry to `ROWS` with `id`, `label`, `color`, `borderColor`, and `colRange`.
-    - Papers not added to `PAPER_POSITIONS` automatically appear in the "Other Papers" catch-all section — use that as a staging area if the grid placement is unclear.
+      - `{ from: 'predecessor', to: '<paper-id>' }` — solid grey arrow for direct lineage (same track, vertical)
+      - `{ from: 'other-paper', to: '<paper-id>', dashed: true }` — dashed purple arrow for cross-track architectural borrowing. Multiple edges from the same source are automatically rendered as a forked bus.
+    - If the paper belongs to a genuinely new conceptual group, add a new entry to `TRACKS` with `id`, `label`, `color`, and `borderColor`, and use the corresponding new track index.
+    - Papers not added to `PAPER_POSITIONS` automatically appear in the "Other Papers" catch-all — use that as a staging area if placement is unclear.
 
 ### Phase 5: Verify and Ship
 11. TypeScript check: `frontend/node_modules/.bin/tsc.cmd --noEmit --project frontend/tsconfig.json`

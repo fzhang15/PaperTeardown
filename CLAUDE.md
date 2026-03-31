@@ -127,16 +127,18 @@ Update `data/papers/index.json` to include the new paper entry.
 
 The gallery uses a fixed column/row grid with an SVG wiring layer. Three static objects control the layout:
 
-- `PAPER_POSITIONS` — maps each paper ID to `{col, row}`. Current layout:
-  - Row 0 (foundations): `dinov3` col 0, `dit` col 1
-  - Row 1 (robot-learning): `diffusion-policy` col 0, `rt1` col 1, `rt2` col 2, `pi0` col 3, `groot` col 4
-- `EDGES` — directed dependency arrows. Solid (`{}`) for direct lineage; dashed (`{dashed: true}`) when borrowing architecture cross-row.
-- `ROWS` — one entry per row with `id`, `label`, `color`, `borderColor`, `colRange`.
+The gallery uses a vertical-track layout: each conceptual group is a vertical lane, and papers flow top-to-bottom within it. Three objects control the layout:
+
+- `PAPER_POSITIONS` — maps each paper ID to `{track, row}`. Current layout:
+  - Track 0 (foundations): `dinov3` row 0, `dit` row 1
+  - Track 1 (robot-learning): `diffusion-policy` row 0, `rt1` row 1, `rt2` row 2, `pi0` row 3, `groot` row 4
+- `EDGES` — directed dependency arrows. Solid for direct lineage (same track); dashed (`{dashed: true}`) for cross-track architectural borrowing. Multiple edges from the same source are automatically rendered as a forked bus.
+- `TRACKS` — one entry per vertical lane with `id`, `label`, `color`, `borderColor`. SVG dimensions are auto-computed from `PAPER_POSITIONS`.
 
 For each new paper:
-1. Add `'<paper-id>': { col: N, row: R }` to `PAPER_POSITIONS` (next free column in the right row, or a new row)
+1. Add `'<paper-id>': { track: N, row: R }` to `PAPER_POSITIONS` (next available row in the right track)
 2. Add edges to `EDGES` pointing from its predecessors
-3. If adding a new row, add an entry to `ROWS` and update `MAX_ROW` / `SVG_H`
+3. If it belongs to a new conceptual group, add a new entry to `TRACKS` (use the next track index)
 4. Papers omitted from `PAPER_POSITIONS` automatically appear in the "Other Papers" catch-all below the grid
 
 ### Step 5: Start frontend and verify
