@@ -1,0 +1,12 @@
+{
+  "id": "mobile-aloha",
+  "title": "Mobile ALOHA: Learning Bimanual Mobile Manipulation with Low-Cost Whole-Body Teleoperation",
+  "authors": ["Zipeng Fu", "Tony Z. Zhao", "Chelsea Finn"],
+  "arxiv_url": "https://arxiv.org/abs/2401.02117",
+  "repo_url": "https://github.com/MarkFzp/mobile-aloha",
+  "abstract": "We present Mobile ALOHA, a low-cost whole-body teleoperation system for data collection and mobile manipulation. Mobile ALOHA augments the ALOHA setup with a mobile base, enabling the robot to perform complex household tasks such as cooking, cleaning, and navigating multi-room environments. To learn from the small number of collected demonstrations (50 per task), we co-train with existing static ALOHA datasets. Co-training with ACT (Action Chunking with Transformers) enables Mobile ALOHA to achieve over 80% success on 7 complex mobile manipulation tasks, demonstrating that high-quality bimanual whole-body manipulation can be learned from very few real-world demonstrations.",
+  "introduction_excerpt": "Recent advances in robot learning have demonstrated impressive capabilities in tabletop manipulation tasks. However, most of these systems are constrained to stationary platforms, limiting their applicability to tasks that require mobility. Household tasks, in particular, often require coordinating whole-body movement with bimanual manipulation — cooking requires traversing the kitchen, cleaning requires moving between rooms, and doing laundry requires multi-floor navigation.",
+  "module_count": 5,
+  "pytorch_file_count": 8,
+  "ingested_at": "2026-04-01T00:00:00Z"
+}

@@ -1,0 +1,309 @@
+{
+  "chapters": [
+    {
+      "id": "the-problem",
+      "title": "The Problem: Household Tasks Need a Whole Body",
+      "narrative": "Most robot learning research fixes the robot in place. The arm bolts to a table, the camera points at a workspace, and the policy learns to manipulate objects within reach. That works for sorting, assembly, and pick-and-place. But real household tasks are fundamentally different.\n\nCooking requires moving between the sink, stove, and counter. Cleaning requires navigating room to room. Doing laundry requires carrying loads up and down stairs. All of these require a mobile platform coordinated with two capable arms — the full body working as a unit.\n\nMobile ALOHA solves this by building a low-cost whole-body teleoperation system. A human operator controls both arms and the wheeled base simultaneously, collecting demonstrations of complex household tasks. The key insight: you don't need hundreds of thousands of demonstrations. With good teleoperation hardware and a smart co-training strategy, 50 demonstrations of a new mobile task is enough.\n\nThe robot learns from two data sources working together: 50 mobile demonstrations of the new task, and an existing corpus of static bimanual ALOHA demonstrations. The static data teaches general manipulation; the mobile data teaches how to combine motion with manipulation. The policy that emerges — ACT, Action Chunking with Transformers — can cook, clean, and navigate real home environments.\n\nThis teardown follows the system from hardware to policy: how observations are defined, how demonstrations are collected, how the CVAE-based ACT model compresses and replays action sequences, and how the co-training trick makes it all work with minimal data.",
+      "code_blocks": []
+    },
+    {
+      "id": "hardware-platform",
+      "title": "Hardware: The Mobile ALOHA Platform",
+      "narrative": "The hardware is deliberately minimal. Two ViperX 300s robotic arms (6-DOF each) are mounted on an AgileX Tracer wheeled base. Four cameras provide visual input: one high camera for global scene context, one low camera for close-up view, and two wrist-mounted cameras that follow the arms.\n\nThe action space is 14-dimensional for the arms and grippers, plus 2 dimensions for the base (linear and angular velocity), totalling 16 in the full mobile setting. Gripper positions are normalized to [0, 1] to simplify policy learning.\n\nThe observation includes joint positions (qpos) and velocities (qvel) for both arms and grippers, plus the raw pixel images from all four cameras at 480×640 resolution. This is everything the policy sees at inference time.\n\nThe `RealEnv` class formalizes this interface:",
+      "code_blocks": [
+        {
+          "label": "RealEnv: action and observation space definition",
+          "source": "class RealEnv:\n    \"\"\"\n    Environment for real robot bi-manual manipulation\n    Action space:      [left_arm_qpos (6),             # absolute joint position\n                        left_gripper_positions (1),    # normalized gripper position (0: close, 1: open)\n                        right_arm_qpos (6),            # absolute joint position\n                        right_gripper_positions (1),]  # normalized gripper position (0: close, 1: open)\n\n    Observation space: {\"qpos\": Concat[ left_arm_qpos (6),          # absolute joint position\n                                        left_gripper_position (1),  # normalized gripper position (0: close, 1: open)\n                                        right_arm_qpos (6),         # absolute joint position\n                                        right_gripper_qpos (1)]     # normalized gripper position (0: close, 1: open)\n                        \"qvel\": Concat[ left_arm_qvel (6),         # absolute joint velocity (rad)\n                                        left_gripper_velocity (1),  # normalized gripper velocity (pos: opening, neg: closing)\n                                        right_arm_qvel (6),         # absolute joint velocity (rad)\n                                        right_gripper_qvel (1)]     # normalized gripper velocity (pos: opening, neg: closing)\n                        \"images\": {\"cam_high\": (480x640x3),        # h, w, c, dtype='uint8'\n                                   \"cam_low\": (480x640x3),         # h, w, c, dtype='uint8'\n                                   \"cam_left_wrist\": (480x640x3),  # h, w, c, dtype='uint8'\n                                   \"cam_right_wrist\": (480x640x3)} # h, w, c, dtype='uint8'\n    \"\"\"",
+          "source_start_line": 22,
+          "file_path": "aloha_scripts/real_env.py",
+          "annotations": [
+            {
+              "start_line": 24,
+              "end_line": 28,
+              "explanation": "The 14D arm+gripper action space. Each side: 6 joint positions + 1 normalized gripper position (0=closed, 1=open). During mobile operation, 2 base velocity dimensions are appended to make 16D total.",
+              "concept_tag": "other:action-space"
+            },
+            {
+              "start_line": 30,
+              "end_line": 42,
+              "explanation": "The observation has three parts: qpos (14D joint state), qvel (14D joint velocities), and images from 4 cameras. The policy only uses qpos and images at inference; qvel is recorded for analysis but not fed to ACT.",
+              "concept_tag": "other:observation-space"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "teleoperation",
+      "title": "Teleoperation: Collecting Demonstrations via Leader-Follower",
+      "narrative": "Demonstrations are collected using a leader-follower teleoperation setup. The operator grips two smaller \"master\" arms (wx250s) and moves them naturally. The system reads their joint positions in real time and commands the larger \"puppet\" arms (vx300s) to mirror the same positions.\n\nThis approach is called kinesthetic teaching or leader-follower teleoperation. It's intuitive: you hold the replica of the robot arm and do the task yourself, and the robot copies you exactly. There's no VR headset, no game controller mapping, no training period.\n\nThe `get_action` function reads the master arm state and packages it as the target action for the puppet arms. Gripper commands are normalized using a linear mapping that converts raw motor joint angles to the [0, 1] range expected by the environment:",
+      "code_blocks": [
+        {
+          "label": "get_action: read master arm state as puppet target",
+          "source": "def get_action(master_bot_left, master_bot_right):\n    action = np.zeros(14) # 6 joint + 1 gripper, for two arms\n    # Arm actions\n    action[:6] = master_bot_left.dxl.joint_states.position[:6]\n    action[7:7+6] = master_bot_right.dxl.joint_states.position[:6]\n    # Gripper actions\n    action[6] = MASTER_GRIPPER_JOINT_NORMALIZE_FN(master_bot_left.dxl.joint_states.position[6])\n    action[7+6] = MASTER_GRIPPER_JOINT_NORMALIZE_FN(master_bot_right.dxl.joint_states.position[6])\n\n    return action",
+          "source_start_line": 211,
+          "file_path": "aloha_scripts/real_env.py",
+          "annotations": [
+            {
+              "start_line": 214,
+              "end_line": 215,
+              "explanation": "Arm positions: indices 0-5 for left arm, 7-12 for right arm. Index 6 and 13 are reserved for grippers. This asymmetric packing (7-based offset) mirrors the robot's physical joint ordering.",
+              "concept_tag": "other:action-space"
+            },
+            {
+              "start_line": 217,
+              "end_line": 218,
+              "explanation": "MASTER_GRIPPER_JOINT_NORMALIZE_FN maps raw Dynamixel motor positions to [0, 1]. The master and puppet arms have different physical ranges, so both arms use their own normalization functions defined in constants.py.",
+              "concept_tag": "other:preprocessing"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "detrvae-architecture",
+      "title": "The DETRVAE Architecture: A CVAE Built on DETR",
+      "narrative": "The core model is DETRVAE — a Conditional Variational Autoencoder grafted onto the DETR object-detection transformer. The CVAE structure gives ACT its key property: the encoder compresses a demonstration's action sequence into a low-dimensional latent variable z, which the decoder conditions on to reproduce that sequence (or generate new ones from a prior).\n\nAt training time, the encoder sees the full action chunk and compresses it to z. At inference time, the encoder is discarded and z is sampled from a standard Normal prior — the decoder then generates a coherent action chunk conditioned only on the current visual and proprioceptive observations.\n\nThe model has several learned components:\n- **Visual backbones** (one per camera): ResNet18 feature extractors\n- **Transformer**: a full encoder-decoder transformer for the CVAE decoder\n- **Encoder**: a second transformer used only at training time as the CVAE encoder\n- **Query embeddings**: `num_queries` learned slots, one per predicted future action\n- **Latent projection head**: maps encoder output → (μ, σ) for the reparametrization trick\n- **Additional positional embeddings**: learned positions for the latent z token and proprioceptive input token\n\nThe `num_queries` hyperparameter directly controls the chunk size — how many future actions are predicted at once. Larger chunks trade off reactivity for smoother, more coherent motion.",
+      "code_blocks": [
+        {
+          "label": "DETRVAE.__init__: all learned components",
+          "source": "class DETRVAE(nn.Module):\n    \"\"\" This is the DETR module that performs object detection \"\"\"\n    def __init__(self, backbones, transformer, encoder, state_dim, num_queries, camera_names, vq, vq_class, vq_dim, action_dim):\n        \"\"\" Initializes the model.\n        Parameters:\n            backbones: torch module of the backbone to be used. See backbone.py\n            transformer: torch module of the transformer architecture. See transformer.py\n            state_dim: robot state dimension of the environment\n            num_queries: number of object queries, ie detection slot. This is the maximal number of objects\n                         DETR can detect in a single image. For COCO, we recommend 100 queries.\n            aux_loss: True if auxiliary decoding losses (loss at each decoder layer) are to be used.\n        \"\"\"\n        super().__init__()\n        self.num_queries = num_queries\n        self.camera_names = camera_names\n        self.transformer = transformer\n        self.encoder = encoder\n        self.vq, self.vq_class, self.vq_dim = vq, vq_class, vq_dim\n        self.state_dim, self.action_dim = state_dim, action_dim\n        hidden_dim = transformer.d_model\n        self.action_head = nn.Linear(hidden_dim, action_dim)\n        self.is_pad_head = nn.Linear(hidden_dim, 1)\n        self.query_embed = nn.Embedding(num_queries, hidden_dim)\n        if backbones is not None:\n            self.input_proj = nn.Conv2d(backbones[0].num_channels, hidden_dim, kernel_size=1)\n            self.backbones = nn.ModuleList(backbones)\n            self.input_proj_robot_state = nn.Linear(state_dim, hidden_dim)\n        else:\n            # input_dim = 14 + 7 # robot_state + env_state\n            self.input_proj_robot_state = nn.Linear(state_dim, hidden_dim)\n            self.input_proj_env_state = nn.Linear(7, hidden_dim)\n            self.pos = torch.nn.Embedding(2, hidden_dim)\n            self.backbones = None\n\n        # encoder extra parameters\n        self.latent_dim = 32 # final size of latent z # TODO tune\n        self.cls_embed = nn.Embedding(1, hidden_dim) # extra cls token embedding\n        self.encoder_action_proj = nn.Linear(action_dim, hidden_dim) # project action to embedding\n        self.encoder_joint_proj = nn.Linear(state_dim, hidden_dim)  # project qpos to embedding\n\n        print(f'Use VQ: {self.vq}, {self.vq_class}, {self.vq_dim}')\n        if self.vq:\n            self.latent_proj = nn.Linear(hidden_dim, self.vq_class * self.vq_dim)\n        else:\n            self.latent_proj = nn.Linear(hidden_dim, self.latent_dim*2) # project hidden state to latent std, var\n        self.register_buffer('pos_table', get_sinusoid_encoding_table(1+1+num_queries, hidden_dim)) # [CLS], qpos, a_seq\n\n        # decoder extra parameters\n        if self.vq:\n            self.latent_out_proj = nn.Linear(self.vq_class * self.vq_dim, hidden_dim)\n        else:\n            self.latent_out_proj = nn.Linear(self.latent_dim, hidden_dim) # project latent sample to embedding\n        self.additional_pos_embed = nn.Embedding(2, hidden_dim) # learned position embedding for proprio and latent",
+          "source_start_line": 35,
+          "file_path": "detr/models/detr_vae.py",
+          "annotations": [
+            {
+              "start_line": 55,
+              "end_line": 57,
+              "explanation": "The three output heads: action_head predicts the actual joint positions (action_dim=16), is_pad_head predicts a binary mask for padded timesteps, and query_embed holds num_queries learnable vectors — one slot per future action in the predicted chunk.",
+              "concept_tag": "linear"
+            },
+            {
+              "start_line": 69,
+              "end_line": 73,
+              "explanation": "CVAE encoder components. encoder_action_proj maps the action sequence to the transformer's hidden dimension. encoder_joint_proj maps qpos similarly. cls_embed is an extra learnable [CLS] token prepended to the sequence — only its output is used to produce the latent z.",
+              "concept_tag": "embedding"
+            },
+            {
+              "start_line": 79,
+              "end_line": 80,
+              "explanation": "latent_proj maps the [CLS] output to 2*latent_dim — the first half is μ, the second is log-σ for the reparametrization trick. pos_table holds sinusoidal positional encodings for the encoder sequence: [CLS, qpos, a_1, ..., a_T].",
+              "concept_tag": "linear"
+            },
+            {
+              "start_line": 86,
+              "end_line": 87,
+              "explanation": "latent_out_proj maps the sampled z back to hidden_dim so it can be used as a token in the decoder. additional_pos_embed gives 2 learned position embeddings: one for the latent token, one for the proprioceptive (qpos) token prepended to the visual feature sequence.",
+              "concept_tag": "embedding"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "cvae-encoder",
+      "title": "The CVAE Encoder: Compressing Demonstrations",
+      "narrative": "During training, the CVAE encoder sees the ground-truth action sequence and compresses it into a latent variable z. This z captures the \"style\" of the demonstration — not just the nominal trajectory, but the particular way this human operator moved, how much they hesitated, how they coordinated both arms. At inference time, z is sampled from a unit Normal prior, so the decoder must produce valid actions without access to the true future.\n\nThe encoder is itself a transformer. The input sequence is: [CLS], qpos_embedding, a_1, a_2, ..., a_T — where each action a_i is linearly projected to hidden_dim. Sinusoidal positional encodings are added. The encoder runs self-attention over this sequence, and only the [CLS] token's output is used to produce μ and log-σ. The KL divergence term in the loss pushes μ→0 and σ→1, ensuring the distribution stays close to a standard Normal so the prior is a good approximation at test time.\n\nThe reparametrization trick makes the sampling step differentiable: instead of sampling from N(μ, σ) directly, sample ε ~ N(0, I) and compute z = μ + σ·ε. Gradients flow through σ but not through ε.",
+      "code_blocks": [
+        {
+          "label": "DETRVAE.encode: CVAE encoder forward pass",
+          "source": "    def encode(self, qpos, actions=None, is_pad=None, vq_sample=None):\n        bs, _ = qpos.shape\n        if self.encoder is None:\n            latent_sample = torch.zeros([bs, self.latent_dim], dtype=torch.float32).to(qpos.device)\n            latent_input = self.latent_out_proj(latent_sample)\n            probs = binaries = mu = logvar = None\n        else:\n            # cvae encoder\n            is_training = actions is not None # train or val\n            ### Obtain latent z from action sequence\n            if is_training:\n                # project action sequence to embedding dim, and concat with a CLS token\n                action_embed = self.encoder_action_proj(actions) # (bs, seq, hidden_dim)\n                qpos_embed = self.encoder_joint_proj(qpos)  # (bs, hidden_dim)\n                qpos_embed = torch.unsqueeze(qpos_embed, axis=1)  # (bs, 1, hidden_dim)\n                cls_embed = self.cls_embed.weight # (1, hidden_dim)\n                cls_embed = torch.unsqueeze(cls_embed, axis=0).repeat(bs, 1, 1) # (bs, 1, hidden_dim)\n                encoder_input = torch.cat([cls_embed, qpos_embed, action_embed], axis=1) # (bs, seq+1, hidden_dim)\n                encoder_input = encoder_input.permute(1, 0, 2) # (seq+1, bs, hidden_dim)\n                # do not mask cls token\n                cls_joint_is_pad = torch.full((bs, 2), False).to(qpos.device) # False: not a padding\n                is_pad = torch.cat([cls_joint_is_pad, is_pad], axis=1)  # (bs, seq+1)\n                # obtain position embedding\n                pos_embed = self.pos_table.clone().detach()\n                pos_embed = pos_embed.permute(1, 0, 2)  # (seq+1, 1, hidden_dim)\n                # query model\n                encoder_output = self.encoder(encoder_input, pos=pos_embed, src_key_padding_mask=is_pad)\n                encoder_output = encoder_output[0] # take cls output only\n                latent_info = self.latent_proj(encoder_output)\n                \n                if self.vq:\n                    logits = latent_info.reshape([*latent_info.shape[:-1], self.vq_class, self.vq_dim])\n                    probs = torch.softmax(logits, dim=-1)\n                    binaries = F.one_hot(torch.multinomial(probs.view(-1, self.vq_dim), 1).squeeze(-1), self.vq_dim).view(-1, self.vq_class, self.vq_dim).float()\n                    binaries_flat = binaries.view(-1, self.vq_class * self.vq_dim)\n                    probs_flat = probs.view(-1, self.vq_class * self.vq_dim)\n                    straigt_through = binaries_flat - probs_flat.detach() + probs_flat\n                    latent_input = self.latent_out_proj(straigt_through)\n                    mu = logvar = None\n                else:\n                    probs = binaries = None\n                    mu = latent_info[:, :self.latent_dim]\n                    logvar = latent_info[:, self.latent_dim:]\n                    latent_sample = reparametrize(mu, logvar)\n                    latent_input = self.latent_out_proj(latent_sample)\n\n            else:\n                mu = logvar = binaries = probs = None\n                if self.vq:\n                    latent_input = self.latent_out_proj(vq_sample.view(-1, self.vq_class * self.vq_dim))\n                else:\n                    latent_sample = torch.zeros([bs, self.latent_dim], dtype=torch.float32).to(qpos.device)\n                    latent_input = self.latent_out_proj(latent_sample)\n\n        return latent_input, probs, binaries, mu, logvar",
+          "source_start_line": 90,
+          "file_path": "detr/models/detr_vae.py",
+          "annotations": [
+            {
+              "start_line": 100,
+              "end_line": 107,
+              "explanation": "Building the encoder input sequence: CLS token + qpos embedding + action embeddings, concatenated along the sequence axis and permuted to (seq, batch, dim) as expected by PyTorch's transformer. The CLS token goes first so its position (index 0) is always available as the sequence summary.",
+              "concept_tag": "embedding"
+            },
+            {
+              "start_line": 116,
+              "end_line": 119,
+              "explanation": "Run the transformer encoder over the full sequence. Only encoder_output[0] — the CLS token's output — is used to produce the latent. This is the same pooling strategy as BERT: the [CLS] position learns to aggregate the full sequence.",
+              "concept_tag": "attention"
+            },
+            {
+              "start_line": 130,
+              "end_line": 134,
+              "explanation": "The standard Gaussian CVAE path: split latent_info into μ and log-σ (logvar), then reparametrize by sampling ε ~ N(0,I) and computing z = μ + σ·ε. This makes the sampling step differentiable for backpropagation through the latent.",
+              "concept_tag": "other:vae"
+            },
+            {
+              "start_line": 138,
+              "end_line": 143,
+              "explanation": "At inference time (no actions provided), z is sampled from the prior: a zero vector that latent_out_proj maps to the prior mean. This lets the decoder run without seeing any future actions — it generates entirely from the current observation and latent prior.",
+              "concept_tag": "other:vae"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "transformer-decoder",
+      "title": "The Transformer Decoder: Predicting All T Actions in Parallel",
+      "narrative": "The CVAE decoder is where the prediction actually happens. It uses a full encoder-decoder transformer from DETR: the encoder processes the concatenated visual and proprioceptive features, and the decoder cross-attends to that context using learned query vectors — one per future action step.\n\nBefore the visual features enter the transformer encoder, two extra tokens are prepended: the latent z token (from the CVAE encoder) and the proprioceptive qpos token. These are prepended with their own learned positional embeddings so the transformer knows they're not spatial image patches.\n\nThe decoder then runs self-attention among the T query vectors, cross-attention to the context (image + proprio + latent), and ultimately projects each query to a predicted action. All T actions are predicted simultaneously in a single forward pass — this is the \"chunking\" in Action Chunking with Transformers.",
+      "code_blocks": [
+        {
+          "label": "DETRVAE.forward: assemble visual + latent context, decode action chunk",
+          "source": "    def forward(self, qpos, image, env_state, actions=None, is_pad=None, vq_sample=None):\n        \"\"\"\n        qpos: batch, qpos_dim\n        image: batch, num_cam, channel, height, width\n        env_state: None\n        actions: batch, seq, action_dim\n        \"\"\"\n        latent_input, probs, binaries, mu, logvar = self.encode(qpos, actions, is_pad, vq_sample)\n\n        # cvae decoder\n        if self.backbones is not None:\n            # Image observation features and position embeddings\n            all_cam_features = []\n            all_cam_pos = []\n            for cam_id, cam_name in enumerate(self.camera_names):\n                features, pos = self.backbones[cam_id](image[:, cam_id])\n                features = features[0] # take the last layer feature\n                pos = pos[0]\n                all_cam_features.append(self.input_proj(features))\n                all_cam_pos.append(pos)\n            # proprioception features\n            proprio_input = self.input_proj_robot_state(qpos)\n            # fold camera dimension into width dimension\n            src = torch.cat(all_cam_features, axis=3)\n            pos = torch.cat(all_cam_pos, axis=3)\n            hs = self.transformer(src, None, self.query_embed.weight, pos, latent_input, proprio_input, self.additional_pos_embed.weight)[0]\n        else:\n            qpos = self.input_proj_robot_state(qpos)\n            env_state = self.input_proj_env_state(env_state)\n            transformer_input = torch.cat([qpos, env_state], axis=1) # seq length = 2\n            hs = self.transformer(transformer_input, None, self.query_embed.weight, self.pos.weight)[0]\n        a_hat = self.action_head(hs)\n        is_pad_hat = self.is_pad_head(hs)\n        return a_hat, is_pad_hat, [mu, logvar], probs, binaries",
+          "source_start_line": 146,
+          "file_path": "detr/models/detr_vae.py",
+          "annotations": [
+            {
+              "start_line": 160,
+              "end_line": 165,
+              "explanation": "Each camera's ResNet backbone produces spatial feature maps. The feature maps are projected to hidden_dim via a 1×1 conv (input_proj). Multiple camera feature maps are concatenated along the width dimension — the transformer sees them as a wider spatial context.",
+              "concept_tag": "convolution"
+            },
+            {
+              "start_line": 167,
+              "end_line": 171,
+              "explanation": "proprio_input projects the 14D joint state to hidden_dim. The latent and proprio tokens are passed separately to the transformer so they can be prepended before the spatial image tokens with their own positional embeddings.",
+              "concept_tag": "linear"
+            },
+            {
+              "start_line": 177,
+              "end_line": 179,
+              "explanation": "hs has shape (num_layers, batch, num_queries, hidden_dim). Taking [0] gives the final decoder layer's outputs. action_head projects each query's output to the action dimension, yielding the full predicted chunk. is_pad_hat predicts which timesteps are padding so the loss can ignore them.",
+              "concept_tag": "linear"
+            }
+          ]
+        },
+        {
+          "label": "Transformer.forward: inject latent + proprio, then encode-decode",
+          "source": "    def forward(self, src, mask, query_embed, pos_embed, latent_input=None, proprio_input=None, additional_pos_embed=None):\n        # TODO flatten only when input has H and W\n        if len(src.shape) == 4: # has H and W\n            # flatten NxCxHxW to HWxNxC\n            bs, c, h, w = src.shape\n            src = src.flatten(2).permute(2, 0, 1)\n            pos_embed = pos_embed.flatten(2).permute(2, 0, 1).repeat(1, bs, 1)\n            query_embed = query_embed.unsqueeze(1).repeat(1, bs, 1)\n            # mask = mask.flatten(1)\n\n            additional_pos_embed = additional_pos_embed.unsqueeze(1).repeat(1, bs, 1) # seq, bs, dim\n            pos_embed = torch.cat([additional_pos_embed, pos_embed], axis=0)\n\n            addition_input = torch.stack([latent_input, proprio_input], axis=0)\n            src = torch.cat([addition_input, src], axis=0)\n        else:\n            assert len(src.shape) == 3\n            # flatten NxHWxC to HWxNxC\n            bs, hw, c = src.shape\n            src = src.permute(1, 0, 2)\n            pos_embed = pos_embed.unsqueeze(1).repeat(1, bs, 1)\n            query_embed = query_embed.unsqueeze(1).repeat(1, bs, 1)\n\n        tgt = torch.zeros_like(query_embed)\n        memory = self.encoder(src, src_key_padding_mask=mask, pos=pos_embed)\n        hs = self.decoder(tgt, memory, memory_key_padding_mask=mask,\n                          pos=pos_embed, query_pos=query_embed)\n        hs = hs.transpose(1, 2)\n        return hs",
+          "source_start_line": 49,
+          "file_path": "detr/models/transformer.py",
+          "annotations": [
+            {
+              "start_line": 59,
+              "end_line": 63,
+              "explanation": "The latent z token and proprioceptive token are prepended to the spatial image tokens. additional_pos_embed gives these two tokens their own positional identifiers — without it, the transformer couldn't distinguish them from image patches.",
+              "concept_tag": "embedding"
+            },
+            {
+              "start_line": 72,
+              "end_line": 74,
+              "explanation": "tgt is initialized to all zeros — the decoder queries start blank and attend to the context to build up action predictions. memory is the encoder output (image + latent + proprio context). The T query vectors in query_embed each learn to extract one timestep's action from this context.",
+              "concept_tag": "attention"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "act-policy-training",
+      "title": "ACT Policy: Training with KL + L1 Loss",
+      "narrative": "The ACTPolicy class wraps DETRVAE and manages the training objective. At training time, it receives the current observation (qpos + images) and the ground-truth action chunk, runs the full CVAE forward pass, and computes two losses:\n\n1. **L1 reconstruction loss**: how well the predicted actions match the ground-truth chunk. L1 is used instead of L2 because L1 is more robust to outliers and produces crisper predictions for multi-modal distributions.\n\n2. **KL divergence**: pushes the learned posterior N(μ, σ) toward the prior N(0, I). This is what ensures the decoder can run at inference time using a simple zero-mean prior.\n\nThe total loss is L1 + β·KL where β (kl_weight) is typically set to 10. Padding is handled explicitly: `is_pad` marks which timesteps extend beyond the actual episode, and the L1 loss is masked so padded timesteps don't contribute.\n\nAt inference, the encoder is bypassed entirely — z is sampled from the prior (a zero vector), and the decoder generates a full action chunk from the current observation alone.",
+      "code_blocks": [
+        {
+          "label": "ACTPolicy: training and inference paths",
+          "source": "class ACTPolicy(nn.Module):\n    def __init__(self, args_override):\n        super().__init__()\n        model, optimizer = build_ACT_model_and_optimizer(args_override)\n        self.model = model # CVAE decoder\n        self.optimizer = optimizer\n        self.kl_weight = args_override['kl_weight']\n        self.vq = args_override['vq']\n        print(f'KL Weight {self.kl_weight}')\n\n    def __call__(self, qpos, image, actions=None, is_pad=None, vq_sample=None):\n        env_state = None\n        normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],\n                                         std=[0.229, 0.224, 0.225])\n        image = normalize(image)\n        if actions is not None: # training time\n            actions = actions[:, :self.model.num_queries]\n            is_pad = is_pad[:, :self.model.num_queries]\n\n            loss_dict = dict()\n            a_hat, is_pad_hat, (mu, logvar), probs, binaries = self.model(qpos, image, env_state, actions, is_pad, vq_sample)\n            if self.vq or self.model.encoder is None:\n                total_kld = [torch.tensor(0.0)]\n            else:\n                total_kld, dim_wise_kld, mean_kld = kl_divergence(mu, logvar)\n            if self.vq:\n                loss_dict['vq_discrepancy'] = F.l1_loss(probs, binaries, reduction='mean')\n            all_l1 = F.l1_loss(actions, a_hat, reduction='none')\n            l1 = (all_l1 * ~is_pad.unsqueeze(-1)).mean()\n            loss_dict['l1'] = l1\n            loss_dict['kl'] = total_kld[0]\n            loss_dict['loss'] = loss_dict['l1'] + loss_dict['kl'] * self.kl_weight\n            return loss_dict\n        else: # inference time\n            a_hat, _, (_, _), _, _ = self.model(qpos, image, env_state, vq_sample=vq_sample) # no action, sample from prior\n            return a_hat",
+          "source_start_line": 199,
+          "file_path": "policy.py",
+          "annotations": [
+            {
+              "start_line": 211,
+              "end_line": 214,
+              "explanation": "ImageNet normalization is applied to all camera images before the backbone. This is important because the ResNet backbone was pretrained on ImageNet, so keeping the input distribution consistent improves feature quality.",
+              "concept_tag": "normalization"
+            },
+            {
+              "start_line": 226,
+              "end_line": 228,
+              "explanation": "L1 reconstruction loss, masked by is_pad. The mask prevents the policy from being penalized for predictions at timesteps that extend beyond the actual episode. ~is_pad flips the mask (True where we DO want to compute loss).",
+              "concept_tag": "loss"
+            },
+            {
+              "start_line": 229,
+              "end_line": 231,
+              "explanation": "Total loss = L1 + kl_weight * KL. kl_weight is typically 10. The KL term regularizes the latent space toward the prior; without it, the posterior would overfit to training trajectories and the policy would fail when sampling z from N(0,I) at inference.",
+              "concept_tag": "loss"
+            },
+            {
+              "start_line": 233,
+              "end_line": 234,
+              "explanation": "Inference mode: no actions provided, so the CVAE encoder is skipped. z is sampled from the prior (zeros). The decoder generates a_hat — a full action chunk — from only the current qpos and camera images.",
+              "concept_tag": "other:inference"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "temporal-aggregation",
+      "title": "Temporal Aggregation: Smoothing Predictions Over Time",
+      "narrative": "ACT predicts a chunk of T future actions at each timestep. The naive approach is to execute all T actions, then query the policy again for the next chunk. But this introduces discontinuities at chunk boundaries: the policy switches abruptly from one predicted trajectory to another.\n\nTemporal aggregation solves this by querying the policy at every timestep and blending overlapping predictions. At time t, the policy produces actions [a_t, a_{t+1}, ..., a_{t+T-1}]. At time t+1, it produces [a_{t+1}', a_{t+2}', ..., a_{t+T}']. These overlap at positions t+1 through t+T-1. Rather than discarding the old prediction and using only the new one, temporal aggregation combines them using exponential weighting.\n\nOlder predictions receive less weight (exponential decay with k=0.01), newer predictions receive more. The blended action is smoother and more stable than any single chunk prediction alone. The cost is increased compute: the policy runs every timestep instead of every T timesteps.",
+      "code_blocks": [
+        {
+          "label": "Temporal aggregation: exponentially-weighted blending of overlapping predictions",
+          "source": "                    if temporal_agg:\n                        all_time_actions[[t], t:t+num_queries] = all_actions\n                        actions_for_curr_step = all_time_actions[:, t]\n                        actions_populated = torch.all(actions_for_curr_step != 0, axis=1)\n                        actions_for_curr_step = actions_for_curr_step[actions_populated]\n                        k = 0.01\n                        exp_weights = np.exp(-k * np.arange(len(actions_for_curr_step)))\n                        exp_weights = exp_weights / exp_weights.sum()\n                        exp_weights = torch.from_numpy(exp_weights).cuda().unsqueeze(dim=1)\n                        raw_action = (actions_for_curr_step * exp_weights).sum(dim=0, keepdim=True)",
+          "source_start_line": 402,
+          "file_path": "imitate_episodes.py",
+          "annotations": [
+            {
+              "start_line": 403,
+              "end_line": 404,
+              "explanation": "all_time_actions is a (max_T, max_T + num_queries, 16) buffer. Row t stores the chunk predicted at timestep t. Column t collects all predictions that cover the current timestep t — one from each previous query that included t in its chunk window.",
+              "concept_tag": "other:temporal-aggregation"
+            },
+            {
+              "start_line": 407,
+              "end_line": 411,
+              "explanation": "Exponential decay weights: the oldest prediction of the current timestep gets weight e^{-k*(n-1)}, the newest gets e^{0}=1. With k=0.01 and typical chunk sizes ~100, the oldest prediction gets weight ~e^{-1} ≈ 0.37 — old predictions are down-weighted but not ignored. The weighted sum gives a smoothly blended final action.",
+              "concept_tag": "other:temporal-aggregation"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "co-training",
+      "title": "Putting It All Together: Co-Training with Static ALOHA Data",
+      "narrative": "The most surprising result in the paper is how few mobile demonstrations are needed. 50 demonstrations of a new task — washing a pan, wiping a counter, cooking shrimp — are enough to train a policy that succeeds at over 80% of test trials. The secret is co-training.\n\nCo-training mixes the 50 mobile ALOHA episodes with a much larger corpus of existing static ALOHA demonstrations (~800 episodes across various tasks). The mobile episodes teach the policy to combine base movement with arm control. The static episodes prevent overfitting and teach robust manipulation priors. Both datasets are sampled at each training step according to configurable weights.\n\nThe `BatchSampler` implements this as a weighted infinite sampler. Each dataset has a sample_weight that determines how often it's drawn from. The mobile task config uses weights like [5, 5] (equal mixing) or [7.5, 2.5] (more mobile data). This simple mechanism is central to the whole contribution: it lets the model transfer manipulation knowledge from hundreds of static episodes to a new mobile task learned from only 50.\n\nWithin `EpisodicDataset.__getitem__`, mobile episodes are identified by the presence of a `/base_action` key in the HDF5 file. Static episodes lack this key, so a zero base_action is appended to match the 16D action space expected by the model.",
+      "code_blocks": [
+        {
+          "label": "BatchSampler: weighted sampling across multiple datasets",
+          "source": "def BatchSampler(batch_size, episode_len_l, sample_weights):\n    sample_probs = np.array(sample_weights) / np.sum(sample_weights) if sample_weights is not None else None\n    sum_dataset_len_l = np.cumsum([0] + [np.sum(episode_len) for episode_len in episode_len_l])\n    while True:\n        batch = []\n        for _ in range(batch_size):\n            episode_idx = np.random.choice(len(episode_len_l), p=sample_probs)\n            step_idx = np.random.randint(sum_dataset_len_l[episode_idx], sum_dataset_len_l[episode_idx + 1])\n            batch.append(step_idx)\n        yield batch",
+          "source_start_line": 209,
+          "file_path": "utils.py",
+          "annotations": [
+            {
+              "start_line": 210,
+              "end_line": 210,
+              "explanation": "sample_probs normalizes the raw weights to a probability distribution. For [5, 5] weights, each dataset contributes exactly 50% of each batch. For [7.5, 2.5], the mobile task provides 75% and the static corpus provides 25%.",
+              "concept_tag": "other:co-training"
+            },
+            {
+              "start_line": 215,
+              "end_line": 217,
+              "explanation": "Each sample picks a dataset first (by weight), then picks a random transition within that dataset. sum_dataset_len_l holds the cumulative episode lengths as an index boundary, so step_idx is a unique global index into the concatenated dataset.",
+              "concept_tag": "other:co-training"
+            }
+          ]
+        },
+        {
+          "label": "EpisodicDataset: handling base_action for mobile vs static episodes",
+          "source": "                if '/base_action' in root:\n                    base_action = root['/base_action'][()]\n                    base_action = preprocess_base_action(base_action)\n                    action = np.concatenate([root['/action'][()], base_action], axis=-1)\n                else:  \n                    action = root['/action'][()]\n                    dummy_base_action = np.zeros([action.shape[0], 2])\n                    action = np.concatenate([action, dummy_base_action], axis=-1)",
+          "source_start_line": 59,
+          "file_path": "utils.py",
+          "annotations": [
+            {
+              "start_line": 59,
+              "end_line": 62,
+              "explanation": "Mobile ALOHA HDF5 files contain a /base_action key with [linear_vel, angular_vel] at each timestep. These are preprocessed (smoothed with a 5-step moving average) and concatenated to the arm actions to form the full 16D action vector.",
+              "concept_tag": "other:co-training"
+            },
+            {
+              "start_line": 63,
+              "end_line": 66,
+              "explanation": "Static ALOHA episodes have no /base_action. A zero dummy is appended so all episodes share the same 16D action space. The policy learns that static episodes always have zero base velocity — it can train on them without needing to unlearn mobile navigation.",
+              "concept_tag": "other:co-training"
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "summary": "Mobile ALOHA extends the ALOHA bimanual robot with a wheeled mobile base and demonstrates that household tasks requiring whole-body coordination — cooking, cleaning, navigating — can be learned from only 50 demonstrations. The key algorithmic contribution is ACT (Action Chunking with Transformers): a CVAE where the encoder compresses a demonstration's action sequence into a latent style variable, and a DETR-style transformer decoder predicts a full chunk of T future actions in a single forward pass. At inference time, overlapping chunk predictions are blended via exponential temporal aggregation to produce smooth, continuous motion. The practical contribution is co-training: mixing 50 mobile task episodes with hundreds of static ALOHA demonstrations prevents overfitting and transfers robust manipulation priors to the mobile domain, achieving over 80% success on complex household tasks."
+}

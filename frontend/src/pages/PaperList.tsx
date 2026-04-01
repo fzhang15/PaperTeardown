@@ -34,6 +34,8 @@ const PAPER_POSITIONS: Record<string, TrackPos> = {
   rt2:                { track: 1, row: 3 },
   pi0:                { track: 1, row: 4 },
   groot:              { track: 1, row: 5 },
+  'mobile-aloha':     { track: 1, row: 6 },
+  '3d-vla':           { track: 1, row: 7 },
 }
 
 // ---------------------------------------------------------------------------
@@ -66,6 +68,11 @@ const EDGES: Edge[] = [
   // Cross-track architectural borrowing (dashed horizontal fork)
   { from: 'dit', to: 'pi0',   dashed: true },
   { from: 'dit', to: 'groot', dashed: true },
+  // Mobile ALOHA: ACT is a direct successor to diffusion-policy-era imitation learning
+  { from: 'diffusion-policy', to: 'mobile-aloha', dashed: true },
+  // 3D-VLA: extends VLA paradigm (RT-2 lineage) to 3D grounding + world models
+  { from: 'mobile-aloha', to: '3d-vla' },
+  { from: 'rt2',           to: '3d-vla', dashed: true },
 ]
 
 // ---------------------------------------------------------------------------

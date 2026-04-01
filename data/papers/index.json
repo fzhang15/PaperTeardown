@@ -70,6 +70,16 @@
     "ingested_at": "2026-03-31T00:00:00Z"
   },
   {
+    "id": "mobile-aloha",
+    "title": "Mobile ALOHA: Learning Bimanual Mobile Manipulation with Low-Cost Whole-Body Teleoperation",
+    "authors": ["Zipeng Fu", "Tony Z. Zhao", "Chelsea Finn"],
+    "arxiv_url": "https://arxiv.org/abs/2401.02117",
+    "repo_url": "https://github.com/MarkFzp/mobile-aloha",
+    "abstract": "We present Mobile ALOHA, a low-cost whole-body teleoperation system for data collection and mobile manipulation. Mobile ALOHA augments the ALOHA setup with a mobile base, enabling the robot to perform complex household tasks. Co-training with ACT (Action Chunking with Transformers) enables Mobile ALOHA to achieve over 80% success on 7 complex mobile manipulation tasks from only 50 demonstrations each.",
+    "chapter_count": 9,
+    "ingested_at": "2026-04-01T00:00:00Z"
+  },
+  {
     "id": "pi0",
     "title": "pi0: A Vision-Language-Action Flow Model for General Robot Control",
     "authors": ["Kevin Black", "Noah Brown", "Danny Driess", "Chelsea Finn", "Karol Hausman", "Sergey Levine", "et al."],
