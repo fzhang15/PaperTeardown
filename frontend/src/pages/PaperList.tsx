@@ -59,29 +59,33 @@ const TRACKS: TrackConfig[] = [
 interface Edge { from: string; to: string; dashed?: boolean }
 
 const EDGES: Edge[] = [
-  // Same-track lineage (solid vertical arrows)
-  { from: 'act',              to: 'diffusion-policy' },
-  { from: 'diffusion-policy', to: 'rt1' },
-  { from: 'rt1',              to: 'rt2' },
-  { from: 'rt2',              to: 'pi0' },
-  { from: 'pi0',              to: 'groot' },
-  // Cross-track architectural borrowing (dashed horizontal fork)
-  { from: 'dit', to: 'pi0',   dashed: true },
-  { from: 'dit', to: 'groot', dashed: true },
-  // Mobile ALOHA: ACT is a direct successor to diffusion-policy-era imitation learning
-  { from: 'diffusion-policy', to: 'mobile-aloha', dashed: true },
-  // 3D-VLA: extends VLA paradigm (RT-2 lineage) to 3D grounding + world models
-  { from: 'mobile-aloha', to: '3d-vla' },
-  { from: 'rt2',           to: '3d-vla', dashed: true },
+  // Same-track lineage — solid vertical arrows between adjacent rows
+  { from: 'rt1',  to: 'rt2' },
+  { from: 'rt2',  to: 'pi0' },
+  { from: 'pi0',  to: 'groot' },
+  // Cross-track architectural borrowing — dashed bus wires through the column gap
+  { from: 'dit',  to: 'pi0',   dashed: true },
+  { from: 'dit',  to: 'groot', dashed: true },
+  // Skip-row same-track influence — dashed right-bypass wires (rendered around card stack)
+  { from: 'act',  to: 'mobile-aloha', dashed: true },  // Mobile ALOHA = ACT + mobile base
+  { from: 'rt2',  to: '3d-vla',       dashed: true },  // 3D-VLA extends the VLA paradigm
 ]
 
 // ---------------------------------------------------------------------------
 // SVG canvas dimensions — auto-computed from PAPER_POSITIONS
 // ---------------------------------------------------------------------------
-const _nTracks = Math.max(...Object.values(PAPER_POSITIONS).map(p => p.track)) + 1
-const _maxRow  = Math.max(...Object.values(PAPER_POSITIONS).map(p => p.row))
-const SVG_W    = PAD_X * 2 + _nTracks * CARD_W + (_nTracks - 1) * COL_GAP
-const SVG_H    = cardY(_maxRow) + CARD_H + PAD_Y
+const AH = 6  // arrowhead size in px (needed for SVG_W calculation below)
+
+const _nTracks   = Math.max(...Object.values(PAPER_POSITIONS).map(p => p.track)) + 1
+const _maxRow    = Math.max(...Object.values(PAPER_POSITIONS).map(p => p.row))
+// Count skip-row same-track edges so we can widen SVG to fit right-bypass wires
+const _skipCount = EDGES.filter(e => {
+  const fp = PAPER_POSITIONS[e.from], tp = PAPER_POSITIONS[e.to]
+  return fp && tp && fp.track === tp.track && tp.row > fp.row + 1
+}).length
+const SVG_W = PAD_X * 2 + _nTracks * CARD_W + (_nTracks - 1) * COL_GAP +
+              (_skipCount > 0 ? 16 + (_skipCount - 1) * 12 + AH + 8 : 0)
+const SVG_H = cardY(_maxRow) + CARD_H + PAD_Y
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -145,8 +149,6 @@ function PaperCard({ paper, onClick }: { paper: PaperIndexEntry; onClick: () => 
 // ---------------------------------------------------------------------------
 // SVG wiring
 // ---------------------------------------------------------------------------
-const AH = 6  // arrowhead size in px
-
 function Wiring() {
   const SOLID  = '#94a3b8'
   const DASHED = '#a78bfa'
@@ -197,18 +199,47 @@ function Wiring() {
     }
   })
 
-  // Vertical same-track arrows (bottom-centre → top-centre)
-  const vertWires = sameTrackEdges.map((e) => {
-    const cx = cardX(e.fp.track) + CARD_W / 2
-    const y1 = cardY(e.fp.row) + CARD_H
-    const y2 = cardY(e.tp.row)
+  // Adjacent same-track arrows (bottom-centre → top-centre, no cards between them)
+  const adjEdges  = sameTrackEdges.filter(e => e.tp.row === e.fp.row + 1)
+  const skipEdges = sameTrackEdges.filter(e => e.tp.row >  e.fp.row + 1)
+
+  const vertWires = adjEdges.map((e) => {
+    const cx    = cardX(e.fp.track) + CARD_W / 2
+    const y1    = cardY(e.fp.row) + CARD_H
+    const y2    = cardY(e.tp.row)
+    const color = e.dashed ? DASHED : SOLID
+    const dash  = e.dashed ? '5,3' : undefined
     return (
       <g key={`${e.from}→${e.to}`}>
-        <line x1={cx} y1={y1} x2={cx} y2={y2 - AH} stroke={SOLID} strokeWidth={1.5} />
+        <line x1={cx} y1={y1} x2={cx} y2={y2 - AH} stroke={color} strokeWidth={1.5} strokeDasharray={dash} />
         <polygon
           points={`${cx - AH / 2},${y2 - AH} ${cx},${y2} ${cx + AH / 2},${y2 - AH}`}
-          fill={SOLID}
+          fill={color}
         />
+      </g>
+    )
+  })
+
+  // Skip-row same-track wires: route RIGHT of the track column to avoid crossing cards
+  //
+  //   source ─────────────┐   (stub right to bypass column)
+  //                       │   (vertical bypass outside card stack)
+  //             target ←──┘   (stub left into target's right edge)
+  //
+  const bypassWires = skipEdges.map((e, idx) => {
+    const bx  = cardX(e.fp.track) + CARD_W + 16 + idx * 12   // bypass column x
+    const x1  = cardX(e.fp.track) + CARD_W                    // right edge of source
+    const y1  = cardY(e.fp.row)   + CARD_H / 2
+    const x2  = cardX(e.tp.track) + CARD_W                    // right edge of target
+    const y2  = cardY(e.tp.row)   + CARD_H / 2
+    return (
+      <g key={`bypass-${e.from}→${e.to}`}>
+        <line x1={x1} y1={y1} x2={bx} y2={y1} stroke={DASHED} strokeWidth={1.5} strokeDasharray="5,3" />
+        <line x1={bx} y1={y1} x2={bx} y2={y2} stroke={DASHED} strokeWidth={1.5} strokeDasharray="5,3" />
+        <line x1={bx} y1={y2} x2={x2 + AH} y2={y2} stroke={DASHED} strokeWidth={1.5} strokeDasharray="5,3" />
+        <polygon points={`${x2},${y2} ${x2 + AH},${y2 - AH / 2} ${x2 + AH},${y2 + AH / 2}`} fill={DASHED} />
+        <circle cx={bx} cy={y1} r={2.5} fill={DASHED} />
+        <circle cx={bx} cy={y2} r={2.5} fill={DASHED} />
       </g>
     )
   })
@@ -273,6 +304,7 @@ function Wiring() {
       style={{ position: 'absolute', top: 0, left: 0, pointerEvents: 'none' }}>
       {trackBgs}
       {vertWires}
+      {bypassWires}
       {crossWires}
     </svg>
   )
