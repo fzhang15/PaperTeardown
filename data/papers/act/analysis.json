@@ -1,0 +1,506 @@
+{
+  "chapters": [
+    {
+      "id": "problem",
+      "title": "What Problem Does ACT Solve?",
+      "narrative": "Imitation learning — training a robot to mimic expert demonstrations — sounds simple: collect human teleoperation data, train a neural network to predict actions from observations, and deploy. In practice, two fundamental problems make this hard.\n\nThe first is **compounding errors**. A policy that predicts one action at a time drifts slightly from the expert's trajectory. Each small error shifts the robot into states it has never seen, causing larger errors, which cause even larger errors — a snowball effect. Prior work (DAgger, behavioral cloning with data augmentation) tried to address this, but the core single-step prediction paradigm remained fragile.\n\nThe second is **multimodal action distributions**. When a human demonstrates the same task multiple times, they may use different strategies — reaching from the left or the right, for example. A standard regression network trained with MSE loss averages these modes together, producing an action that lies between the two strategies and belongs to neither. The robot ends up doing something no human ever demonstrated.\n\nACT (Action Chunking with Transformers) addresses both problems with two key ideas:\n\n1. **Action chunking**: Instead of predicting one action at a time, the policy predicts a *chunk* of k future actions at once (e.g., k=100). During execution, it re-queries the policy every k steps (or every step with temporal aggregation). This reduces the effective horizon by a factor of k, dramatically cutting compounding errors.\n\n2. **CVAE training**: The policy is trained as a Conditional Variational Autoencoder. A \"style encoder\" compresses each demonstration's action sequence into a low-dimensional latent variable z. At training time, z captures which mode the demonstration belongs to. At inference time, z is sampled from a standard Gaussian prior, allowing the model to commit to one coherent strategy rather than averaging.\n\nThe architecture is built on DETR (Detection Transformer), repurposed from object detection to action prediction. The DETR decoder's \"object queries\" become \"action queries\" — one per timestep in the chunk — and the encoder processes image and proprioception inputs alongside the CVAE latent.",
+      "code_blocks": []
+    },
+    {
+      "id": "policy-wrapper",
+      "title": "The ACT Policy: Training vs Inference",
+      "narrative": "The top-level ACTPolicy class handles the split between training and inference. During training, it receives ground-truth actions and computes the CVAE loss (L1 reconstruction + KL divergence). During inference, it simply predicts an action chunk without any ground-truth input.\n\nThe loss has two terms:\n- **L1 reconstruction loss**: measures how well the predicted action chunk matches the ground-truth, ignoring padded timesteps (demonstrations can be shorter than the chunk size)\n- **KL divergence**: regularizes the CVAE encoder's posterior q(z|actions, observations) toward the prior p(z) = N(0, I), weighted by a hyperparameter `kl_weight` (typically 10)\n\nThe `kl_weight` is critical: too high and the model ignores z (posterior collapse), too low and the model overfits to specific demonstrations without learning a useful latent space.",
+      "code_blocks": [
+        {
+          "label": "ACTPolicy: training loss and inference branching",
+          "source": "class ACTPolicy(nn.Module):\n    def __init__(self, args_override):\n        super().__init__()\n        model, optimizer = build_ACT_model_and_optimizer(args_override)\n        self.model = model # CVAE decoder\n        self.optimizer = optimizer\n        self.kl_weight = args_override['kl_weight']\n        print(f'KL Weight {self.kl_weight}')\n\n    def __call__(self, qpos, image, actions=None, is_pad=None):\n        env_state = None\n        normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],\n                                         std=[0.229, 0.224, 0.225])\n        image = normalize(image)\n        if actions is not None: # training time\n            actions = actions[:, :self.model.num_queries]\n            is_pad = is_pad[:, :self.model.num_queries]\n\n            a_hat, is_pad_hat, (mu, logvar) = self.model(qpos, image, env_state, actions, is_pad)\n            total_kld, dim_wise_kld, mean_kld = kl_divergence(mu, logvar)\n            loss_dict = dict()\n            all_l1 = F.l1_loss(actions, a_hat, reduction='none')\n            l1 = (all_l1 * ~is_pad.unsqueeze(-1)).mean()\n            loss_dict['l1'] = l1\n            loss_dict['kl'] = total_kld[0]\n            loss_dict['loss'] = loss_dict['l1'] + loss_dict['kl'] * self.kl_weight\n            return loss_dict\n        else: # inference time\n            a_hat, _, (_, _) = self.model(qpos, image, env_state) # no action, sample from prior\n            return a_hat\n\n    def configure_optimizers(self):\n        return self.optimizer",
+          "source_start_line": 9,
+          "file_path": "policy.py",
+          "annotations": [
+            {
+              "start_line": 19,
+              "end_line": 22,
+              "explanation": "Images are normalized with ImageNet statistics before being fed to the ResNet backbone. Actions are truncated to num_queries length — this is the chunk size k.",
+              "concept_tag": "normalization"
+            },
+            {
+              "start_line": 24,
+              "end_line": 24,
+              "explanation": "The core CVAE forward pass: during training, the model receives ground-truth actions and returns predicted actions (a_hat), padding predictions, and the posterior parameters (mu, logvar) for computing KL divergence.",
+              "concept_tag": "other:cvae"
+            },
+            {
+              "start_line": 26,
+              "end_line": 28,
+              "explanation": "L1 loss (not MSE) is used for action reconstruction — it's more robust to outliers. The ~is_pad mask zeros out the loss for padded timesteps so only real actions contribute to the gradient.",
+              "concept_tag": "loss"
+            },
+            {
+              "start_line": 30,
+              "end_line": 30,
+              "explanation": "The total loss is L1 + kl_weight * KL. The kl_weight (typically 10) balances reconstruction accuracy against latent space regularization.",
+              "concept_tag": "loss"
+            },
+            {
+              "start_line": 32,
+              "end_line": 33,
+              "explanation": "At inference time, no actions are passed. The model samples z from the prior N(0,I) instead of encoding ground-truth actions, and predicts a full action chunk.",
+              "concept_tag": "other:cvae"
+            }
+          ]
+        },
+        {
+          "label": "KL divergence computation for the CVAE",
+          "source": "def kl_divergence(mu, logvar):\n    batch_size = mu.size(0)\n    assert batch_size != 0\n    if mu.data.ndimension() == 4:\n        mu = mu.view(mu.size(0), mu.size(1))\n    if logvar.data.ndimension() == 4:\n        logvar = logvar.view(logvar.size(0), logvar.size(1))\n\n    klds = -0.5 * (1 + logvar - mu.pow(2) - logvar.exp())\n    total_kld = klds.sum(1).mean(0, True)\n    dimension_wise_kld = klds.mean(0)\n    mean_kld = klds.mean(1).mean(0, True)\n\n    return total_kld, dimension_wise_kld, mean_kld",
+          "source_start_line": 71,
+          "file_path": "policy.py",
+          "annotations": [
+            {
+              "start_line": 79,
+              "end_line": 79,
+              "explanation": "The closed-form KL divergence between the learned posterior q(z|x) = N(mu, sigma^2) and the unit Gaussian prior p(z) = N(0, I). This is the standard VAE KL formula: -0.5 * sum(1 + log(sigma^2) - mu^2 - sigma^2).",
+              "concept_tag": "loss"
+            },
+            {
+              "start_line": 80,
+              "end_line": 80,
+              "explanation": "total_kld sums across all latent dimensions (32-d) per sample, then averages across the batch. This is the scalar used in the training loss.",
+              "concept_tag": "loss"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "cvae-encoder",
+      "title": "The CVAE Encoder: Compressing Actions into a Style Variable",
+      "narrative": "The key innovation in ACT is the CVAE encoder — a separate transformer encoder that only runs during training. Its job is to compress a full action sequence into a compact latent variable z (32 dimensions), which captures the \"style\" of a demonstration.\n\nThe encoder receives three types of tokens:\n1. A learnable **[CLS] token** — its output will be projected to produce the latent z\n2. The current **joint position** (qpos), projected to the hidden dimension\n3. The full **action sequence** from the demonstration, each action projected to the hidden dimension\n\nThese tokens are concatenated into a sequence and processed by a 4-layer transformer encoder with sinusoidal positional embeddings. The [CLS] token's output is projected to produce mean (mu) and log-variance (logvar) of a Gaussian, from which z is sampled via the reparameterization trick.\n\nAt inference time, the CVAE encoder is not used at all — z is simply sampled from the prior N(0, I). This is what makes the CVAE structure crucial: the KL loss during training ensures the posterior stays close to this prior, so sampling from the prior at test time produces coherent z values.",
+      "code_blocks": [
+        {
+          "label": "CVAE encoder parameters in DETRVAE.__init__",
+          "source": "        # encoder extra parameters\n        self.latent_dim = 32 # final size of latent z # TODO tune\n        self.cls_embed = nn.Embedding(1, hidden_dim) # extra cls token embedding\n        self.encoder_action_proj = nn.Linear(14, hidden_dim) # project action to embedding\n        self.encoder_joint_proj = nn.Linear(14, hidden_dim)  # project qpos to embedding\n        self.latent_proj = nn.Linear(hidden_dim, self.latent_dim*2) # project hidden state to latent std, var\n        self.register_buffer('pos_table', get_sinusoid_encoding_table(1+1+num_queries, hidden_dim)) # [CLS], qpos, a_seq\n\n        # decoder extra parameters\n        self.latent_out_proj = nn.Linear(self.latent_dim, hidden_dim) # project latent sample to embedding\n        self.additional_pos_embed = nn.Embedding(2, hidden_dim) # learned position embedding for proprio and latent",
+          "source_start_line": 67,
+          "file_path": "detr/models/detr_vae.py",
+          "annotations": [
+            {
+              "start_line": 68,
+              "end_line": 68,
+              "explanation": "The latent z is only 32 dimensions — much smaller than the hidden_dim (512). This bottleneck forces the encoder to compress the action sequence into a compact \"style\" representation.",
+              "concept_tag": "embedding"
+            },
+            {
+              "start_line": 69,
+              "end_line": 69,
+              "explanation": "A single learnable [CLS] token, following the BERT/ViT pattern. After the encoder processes all tokens, only the [CLS] output is used to produce the latent z.",
+              "concept_tag": "embedding"
+            },
+            {
+              "start_line": 72,
+              "end_line": 72,
+              "explanation": "Projects the [CLS] output to 64 dimensions (32*2) — the first 32 are the mean, the second 32 are the log-variance of the posterior distribution.",
+              "concept_tag": "linear"
+            },
+            {
+              "start_line": 73,
+              "end_line": 73,
+              "explanation": "Sinusoidal positional encoding table for the encoder sequence: 1 CLS + 1 qpos + num_queries action tokens. These fixed positions tell the encoder the temporal order of the action sequence.",
+              "concept_tag": "embedding"
+            },
+            {
+              "start_line": 76,
+              "end_line": 77,
+              "explanation": "Decoder-side parameters: latent_out_proj maps z back to the hidden dimension, and additional_pos_embed provides learned position embeddings for the two extra tokens (latent z and proprioception) prepended to the decoder's encoder memory.",
+              "concept_tag": "embedding"
+            }
+          ]
+        },
+        {
+          "label": "CVAE encoder forward: encoding actions into latent z",
+          "source": "    def forward(self, qpos, image, env_state, actions=None, is_pad=None):\n        \"\"\"\n        qpos: batch, qpos_dim\n        image: batch, num_cam, channel, height, width\n        env_state: None\n        actions: batch, seq, action_dim\n        \"\"\"\n        is_training = actions is not None # train or val\n        bs, _ = qpos.shape\n        ### Obtain latent z from action sequence\n        if is_training:\n            # project action sequence to embedding dim, and concat with a CLS token\n            action_embed = self.encoder_action_proj(actions) # (bs, seq, hidden_dim)\n            qpos_embed = self.encoder_joint_proj(qpos)  # (bs, hidden_dim)\n            qpos_embed = torch.unsqueeze(qpos_embed, axis=1)  # (bs, 1, hidden_dim)\n            cls_embed = self.cls_embed.weight # (1, hidden_dim)\n            cls_embed = torch.unsqueeze(cls_embed, axis=0).repeat(bs, 1, 1) # (bs, 1, hidden_dim)\n            encoder_input = torch.cat([cls_embed, qpos_embed, action_embed], axis=1) # (bs, seq+1, hidden_dim)\n            encoder_input = encoder_input.permute(1, 0, 2) # (seq+1, bs, hidden_dim)\n            # do not mask cls token\n            cls_joint_is_pad = torch.full((bs, 2), False).to(qpos.device) # False: not a padding\n            is_pad = torch.cat([cls_joint_is_pad, is_pad], axis=1)  # (bs, seq+1)\n            # obtain position embedding\n            pos_embed = self.pos_table.clone().detach()\n            pos_embed = pos_embed.permute(1, 0, 2)  # (seq+1, 1, hidden_dim)\n            # query model\n            encoder_output = self.encoder(encoder_input, pos=pos_embed, src_key_padding_mask=is_pad)\n            encoder_output = encoder_output[0] # take cls output only\n            latent_info = self.latent_proj(encoder_output)\n            mu = latent_info[:, :self.latent_dim]\n            logvar = latent_info[:, self.latent_dim:]\n            latent_sample = reparametrize(mu, logvar)\n            latent_input = self.latent_out_proj(latent_sample)\n        else:\n            mu = logvar = None\n            latent_sample = torch.zeros([bs, self.latent_dim], dtype=torch.float32).to(qpos.device)\n            latent_input = self.latent_out_proj(latent_sample)",
+          "source_start_line": 78,
+          "file_path": "detr/models/detr_vae.py",
+          "annotations": [
+            {
+              "start_line": 85,
+              "end_line": 86,
+              "explanation": "The training/inference split is determined by whether ground-truth actions are provided. This is the core CVAE pattern: the encoder (posterior) only exists during training.",
+              "concept_tag": "other:cvae"
+            },
+            {
+              "start_line": 90,
+              "end_line": 96,
+              "explanation": "Building the encoder input sequence: [CLS, qpos, a_1, a_2, ..., a_k]. Each 14-dim action/joint vector is projected to hidden_dim. The [CLS] token is a learnable embedding repeated across the batch.",
+              "concept_tag": "embedding"
+            },
+            {
+              "start_line": 104,
+              "end_line": 106,
+              "explanation": "After the transformer encoder processes the full sequence, only the [CLS] token output (index 0) is kept. It's projected to produce mu and logvar — the posterior distribution q(z|actions, qpos).",
+              "concept_tag": "other:cvae"
+            },
+            {
+              "start_line": 109,
+              "end_line": 110,
+              "explanation": "Reparameterization trick: z = mu + sigma * epsilon, where epsilon ~ N(0,I). This makes sampling differentiable so gradients flow through the encoder.",
+              "concept_tag": "other:cvae"
+            },
+            {
+              "start_line": 111,
+              "end_line": 114,
+              "explanation": "At inference time: no encoder is run. z is simply set to zeros (the mean of the prior N(0,I)), then projected to hidden_dim. The model must produce reasonable actions from this fixed z.",
+              "concept_tag": "other:cvae"
+            }
+          ]
+        },
+        {
+          "label": "Reparameterization trick",
+          "source": "def reparametrize(mu, logvar):\n    std = logvar.div(2).exp()\n    eps = Variable(std.data.new(std.size()).normal_())\n    return mu + std * eps",
+          "source_start_line": 17,
+          "file_path": "detr/models/detr_vae.py",
+          "annotations": [
+            {
+              "start_line": 18,
+              "end_line": 20,
+              "explanation": "The reparameterization trick: convert logvar to std (exp(logvar/2) = sigma), sample noise epsilon ~ N(0,I), and compute z = mu + sigma * epsilon. This makes the sampling step differentiable w.r.t. mu and logvar.",
+              "concept_tag": "other:cvae"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "image-backbone",
+      "title": "Image Backbone: ResNet18 with Positional Encoding",
+      "narrative": "ACT processes camera images through a ResNet18 backbone with frozen batch normalization, inherited from the DETR codebase. The backbone extracts spatial feature maps from each camera view, and a sinusoidal 2D positional encoding is added so the transformer knows where each feature came from spatially.\n\nThe architecture supports multiple cameras (e.g., top and wrist cameras in the ALOHA setup). Each camera image is processed independently through the same backbone, producing feature maps that are concatenated along the width dimension. This simple concatenation treats multi-camera input as a single wide image — no explicit cross-camera attention is needed.\n\nThe Joiner module combines the ResNet backbone with positional encoding into a single module. It extracts intermediate layer features from ResNet (specifically layer4, producing 512-channel features for ResNet18) and computes 2D sinusoidal positional embeddings at the same spatial resolution.",
+      "code_blocks": [
+        {
+          "label": "ResNet backbone with frozen BatchNorm",
+          "source": "class Backbone(BackboneBase):\n    \"\"\"ResNet backbone with frozen BatchNorm.\"\"\"\n    def __init__(self, name: str,\n                 train_backbone: bool,\n                 return_interm_layers: bool,\n                 dilation: bool):\n        backbone = getattr(torchvision.models, name)(\n            replace_stride_with_dilation=[False, False, dilation],\n            pretrained=is_main_process(), norm_layer=FrozenBatchNorm2d) # pretrained # TODO do we want frozen batch_norm??\n        num_channels = 512 if name in ('resnet18', 'resnet34') else 2048\n        super().__init__(backbone, train_backbone, num_channels, return_interm_layers)",
+          "source_start_line": 86,
+          "file_path": "detr/models/backbone.py",
+          "annotations": [
+            {
+              "start_line": 92,
+              "end_line": 94,
+              "explanation": "Loads a pretrained ResNet (resnet18 by default) with FrozenBatchNorm2d replacing standard BatchNorm. Frozen batch norm uses fixed running statistics from ImageNet pretraining — this stabilizes training when fine-tuning with small batch sizes typical of robot learning.",
+              "concept_tag": "normalization"
+            },
+            {
+              "start_line": 95,
+              "end_line": 95,
+              "explanation": "ResNet18/34 produce 512-channel features from layer4, while ResNet50+ produce 2048 channels. ACT uses ResNet18 for efficiency — robot learning datasets are much smaller than ImageNet.",
+              "concept_tag": "convolution"
+            }
+          ]
+        },
+        {
+          "label": "Joiner: backbone + positional encoding",
+          "source": "class Joiner(nn.Sequential):\n    def __init__(self, backbone, position_embedding):\n        super().__init__(backbone, position_embedding)\n\n    def forward(self, tensor_list: NestedTensor):\n        xs = self[0](tensor_list)\n        out: List[NestedTensor] = []\n        pos = []\n        for name, x in xs.items():\n            out.append(x)\n            # position encoding\n            pos.append(self[1](x).to(x.dtype))\n\n        return out, pos",
+          "source_start_line": 99,
+          "file_path": "detr/models/backbone.py",
+          "annotations": [
+            {
+              "start_line": 104,
+              "end_line": 112,
+              "explanation": "The Joiner runs the image through ResNet (self[0]) to get spatial feature maps, then computes 2D sinusoidal position embeddings (self[1]) at the same spatial resolution. Both are returned as lists — one entry per intermediate layer (only layer4 output is used in ACT).",
+              "concept_tag": "embedding"
+            }
+          ]
+        },
+        {
+          "label": "2D sinusoidal position encoding for image features",
+          "source": "class PositionEmbeddingSine(nn.Module):\n    \"\"\"\n    This is a more standard version of the position embedding, very similar to the one\n    used by the Attention is all you need paper, generalized to work on images.\n    \"\"\"\n    def __init__(self, num_pos_feats=64, temperature=10000, normalize=False, scale=None):\n        super().__init__()\n        self.num_pos_feats = num_pos_feats\n        self.temperature = temperature\n        self.normalize = normalize\n        if scale is not None and normalize is False:\n            raise ValueError(\"normalize should be True if scale is passed\")\n        if scale is None:\n            scale = 2 * math.pi\n        self.scale = scale\n\n    def forward(self, tensor):\n        x = tensor\n\n        not_mask = torch.ones_like(x[0, [0]])\n        y_embed = not_mask.cumsum(1, dtype=torch.float32)\n        x_embed = not_mask.cumsum(2, dtype=torch.float32)\n        if self.normalize:\n            eps = 1e-6\n            y_embed = y_embed / (y_embed[:, -1:, :] + eps) * self.scale\n            x_embed = x_embed / (x_embed[:, :, -1:] + eps) * self.scale\n\n        dim_t = torch.arange(self.num_pos_feats, dtype=torch.float32, device=x.device)\n        dim_t = self.temperature ** (2 * (dim_t // 2) / self.num_pos_feats)\n\n        pos_x = x_embed[:, :, :, None] / dim_t\n        pos_y = y_embed[:, :, :, None] / dim_t\n        pos_x = torch.stack((pos_x[:, :, :, 0::2].sin(), pos_x[:, :, :, 1::2].cos()), dim=4).flatten(3)\n        pos_y = torch.stack((pos_y[:, :, :, 0::2].sin(), pos_y[:, :, :, 1::2].cos()), dim=4).flatten(3)\n        pos = torch.cat((pos_y, pos_x), dim=3).permute(0, 3, 1, 2)\n        return pos",
+          "source_start_line": 14,
+          "file_path": "detr/models/position_encoding.py",
+          "annotations": [
+            {
+              "start_line": 33,
+              "end_line": 36,
+              "explanation": "Creates cumulative position indices along height (y) and width (x), then normalizes them to [0, 2*pi]. This extends the 1D sinusoidal encoding from the original Transformer to 2D spatial grids.",
+              "concept_tag": "embedding"
+            },
+            {
+              "start_line": 44,
+              "end_line": 49,
+              "explanation": "Applies sin/cos at different frequencies to the x and y positions (just like the original Transformer positional encoding, but in 2D). The result is a (batch, hidden_dim, H, W) tensor — each spatial position gets a unique positional signature.",
+              "concept_tag": "embedding"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "detr-transformer",
+      "title": "The DETR Transformer: From Object Detection to Action Prediction",
+      "narrative": "ACT repurposes the DETR (Detection Transformer) architecture for action prediction. In the original DETR, the transformer decoder uses learnable \"object queries\" to attend to image features and predict bounding boxes. In ACT, these become \"action queries\" — one per timestep in the action chunk — and the decoder predicts joint positions instead of boxes.\n\nThe key modification is how the CVAE latent z and proprioception (current joint positions) are injected. Rather than designing a special conditioning mechanism, ACT simply prepends them as two extra tokens to the encoder memory. The decoder's cross-attention then naturally attends to z and proprioception alongside the image features.\n\nThe transformer has two roles:\n1. **Encoder**: processes the flattened image features (from all cameras concatenated along width) plus the two prepended tokens (latent z and proprioception)\n2. **Decoder**: takes action queries and cross-attends to the encoder memory to predict one action per query position",
+      "code_blocks": [
+        {
+          "label": "Transformer forward: prepending latent z and proprioception",
+          "source": "    def forward(self, src, mask, query_embed, pos_embed, latent_input=None, proprio_input=None, additional_pos_embed=None):\n        # TODO flatten only when input has H and W\n        if len(src.shape) == 4: # has H and W\n            # flatten NxCxHxW to HWxNxC\n            bs, c, h, w = src.shape\n            src = src.flatten(2).permute(2, 0, 1)\n            pos_embed = pos_embed.flatten(2).permute(2, 0, 1).repeat(1, bs, 1)\n            query_embed = query_embed.unsqueeze(1).repeat(1, bs, 1)\n            # mask = mask.flatten(1)\n\n            additional_pos_embed = additional_pos_embed.unsqueeze(1).repeat(1, bs, 1) # seq, bs, dim\n            pos_embed = torch.cat([additional_pos_embed, pos_embed], axis=0)\n\n            addition_input = torch.stack([latent_input, proprio_input], axis=0)\n            src = torch.cat([addition_input, src], axis=0)\n        else:\n            assert len(src.shape) == 3\n            # flatten NxHWxC to HWxNxC\n            bs, hw, c = src.shape\n            src = src.permute(1, 0, 2)\n            pos_embed = pos_embed.unsqueeze(1).repeat(1, bs, 1)\n            query_embed = query_embed.unsqueeze(1).repeat(1, bs, 1)\n\n        tgt = torch.zeros_like(query_embed)\n        memory = self.encoder(src, src_key_padding_mask=mask, pos=pos_embed)\n        hs = self.decoder(tgt, memory, memory_key_padding_mask=mask,\n                          pos=pos_embed, query_pos=query_embed)\n        hs = hs.transpose(1, 2)\n        return hs",
+          "source_start_line": 49,
+          "file_path": "detr/models/transformer.py",
+          "annotations": [
+            {
+              "start_line": 53,
+              "end_line": 54,
+              "explanation": "Image features (batch, channels, H, W) are flattened into a sequence of HW tokens, each with channel-dim features. This converts the 2D spatial grid into a 1D sequence for the transformer.",
+              "concept_tag": "embedding"
+            },
+            {
+              "start_line": 59,
+              "end_line": 60,
+              "explanation": "Learned position embeddings for the two extra tokens (latent z and proprioception) are prepended to the spatial position embeddings. The transformer now has positions for [z, proprio, pixel_1, pixel_2, ..., pixel_HW].",
+              "concept_tag": "embedding"
+            },
+            {
+              "start_line": 62,
+              "end_line": 63,
+              "explanation": "The latent z and proprioception are stacked as two tokens and prepended to the flattened image features. This is the simplest possible conditioning mechanism: the decoder's cross-attention can attend to z and proprio just like any image token.",
+              "concept_tag": "other:conditioning"
+            },
+            {
+              "start_line": 72,
+              "end_line": 75,
+              "explanation": "Standard DETR encoder-decoder flow: the encoder processes all tokens (z + proprio + image), producing memory. The decoder takes zero-initialized targets with action query embeddings and cross-attends to memory, producing one output per query position.",
+              "concept_tag": "attention"
+            }
+          ]
+        },
+        {
+          "label": "DETRVAE: assembling camera features and calling the transformer",
+          "source": "        if self.backbones is not None:\n            # Image observation features and position embeddings\n            all_cam_features = []\n            all_cam_pos = []\n            for cam_id, cam_name in enumerate(self.camera_names):\n                features, pos = self.backbones[0](image[:, cam_id]) # HARDCODED\n                features = features[0] # take the last layer feature\n                pos = pos[0]\n                all_cam_features.append(self.input_proj(features))\n                all_cam_pos.append(pos)\n            # proprioception features\n            proprio_input = self.input_proj_robot_state(qpos)\n            # fold camera dimension into width dimension\n            src = torch.cat(all_cam_features, axis=3)\n            pos = torch.cat(all_cam_pos, axis=3)\n            hs = self.transformer(src, None, self.query_embed.weight, pos, latent_input, proprio_input, self.additional_pos_embed.weight)[0]",
+          "source_start_line": 116,
+          "file_path": "detr/models/detr_vae.py",
+          "annotations": [
+            {
+              "start_line": 121,
+              "end_line": 125,
+              "explanation": "Each camera image is independently processed through the same ResNet backbone (self.backbones[0]). The 512-channel features are projected to hidden_dim (512) via a 1x1 convolution (input_proj). All cameras share the same backbone weights.",
+              "concept_tag": "convolution"
+            },
+            {
+              "start_line": 129,
+              "end_line": 130,
+              "explanation": "Multi-camera features are concatenated along the width dimension. With 2 cameras producing 15x20 feature maps each, the result is a single 15x40 feature map — the transformer treats it as one wide image.",
+              "concept_tag": "embedding"
+            },
+            {
+              "start_line": 131,
+              "end_line": 131,
+              "explanation": "The full transformer call: image features (src) with positional embeddings (pos), action queries (query_embed), latent z (latent_input), and proprioception (proprio_input) all flow together. The output hs contains one hidden state per action query.",
+              "concept_tag": "attention"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "action-heads",
+      "title": "Action and Padding Prediction Heads",
+      "narrative": "The transformer decoder outputs one hidden state per action query. Two simple linear heads convert these into predictions:\n\n1. **action_head**: maps each hidden state to a 14-dimensional action vector (7 joint positions per arm in the bimanual ALOHA setup)\n2. **is_pad_head**: maps each hidden state to a scalar logit predicting whether this timestep is padding\n\nThe padding prediction is a minor auxiliary task — it helps the model learn which parts of the action sequence are real vs. padded. The main output is the action chunk: a (batch, chunk_size, 14) tensor of predicted joint positions.",
+      "code_blocks": [
+        {
+          "label": "Action head initialization and output",
+          "source": "        super().__init__()\n        self.num_queries = num_queries\n        self.camera_names = camera_names\n        self.transformer = transformer\n        self.encoder = encoder\n        hidden_dim = transformer.d_model\n        self.action_head = nn.Linear(hidden_dim, state_dim)\n        self.is_pad_head = nn.Linear(hidden_dim, 1)\n        self.query_embed = nn.Embedding(num_queries, hidden_dim)",
+          "source_start_line": 46,
+          "file_path": "detr/models/detr_vae.py",
+          "annotations": [
+            {
+              "start_line": 52,
+              "end_line": 53,
+              "explanation": "Two linear heads: action_head projects each decoder output to the action dimension (14 = 7 joints per arm), and is_pad_head predicts whether each timestep is padding (binary classification).",
+              "concept_tag": "linear"
+            },
+            {
+              "start_line": 54,
+              "end_line": 54,
+              "explanation": "num_queries learnable action query embeddings — one per timestep in the action chunk. These play the same role as object queries in DETR, but instead of detecting objects they predict future actions.",
+              "concept_tag": "embedding"
+            }
+          ]
+        },
+        {
+          "label": "Producing the final action predictions",
+          "source": "        hs = self.transformer(src, None, self.query_embed.weight, pos, latent_input, proprio_input, self.additional_pos_embed.weight)[0]\n        else:\n            qpos = self.input_proj_robot_state(qpos)\n            env_state = self.input_proj_env_state(env_state)\n            transformer_input = torch.cat([qpos, env_state], axis=1) # seq length = 2\n            hs = self.transformer(transformer_input, None, self.query_embed.weight, self.pos.weight)[0]\n        a_hat = self.action_head(hs)\n        is_pad_hat = self.is_pad_head(hs)\n        return a_hat, is_pad_hat, [mu, logvar]",
+          "source_start_line": 131,
+          "file_path": "detr/models/detr_vae.py",
+          "annotations": [
+            {
+              "start_line": 137,
+              "end_line": 138,
+              "explanation": "The action and padding heads are applied to the decoder output hs. a_hat has shape (batch, num_queries, 14) — a full chunk of predicted actions. is_pad_hat has shape (batch, num_queries, 1).",
+              "concept_tag": "linear"
+            },
+            {
+              "start_line": 139,
+              "end_line": 139,
+              "explanation": "The model returns three things: predicted actions, padding predictions, and the CVAE posterior parameters [mu, logvar]. During inference, mu and logvar are None since the encoder isn't run.",
+              "concept_tag": "other:cvae"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "temporal-aggregation",
+      "title": "Temporal Aggregation: Smoothing Overlapping Action Chunks",
+      "narrative": "At inference time, ACT can operate in two modes:\n\n1. **Simple chunking**: Query the policy every k steps, execute the full chunk, then query again. This is the simplest approach but creates discontinuities at chunk boundaries.\n\n2. **Temporal aggregation**: Query the policy every single step, accumulating overlapping action chunks. For any given timestep t, multiple chunks have predicted an action for it — the chunk queried at t, the one queried at t-1, the one at t-2, and so on. These overlapping predictions are combined using exponentially-weighted averaging, with more recent predictions weighted higher.\n\nTemporal aggregation produces much smoother motions because chunk boundaries are blended rather than hard-switched. The exponential weighting (with decay constant k=0.01) means the most recent prediction contributes the most, while older predictions provide a stabilizing \"inertia\" that prevents jittery behavior.\n\nThis is a key practical insight: action chunking reduces compounding errors by predicting multiple steps at once, but temporal aggregation makes the execution smooth by blending overlapping chunks.",
+      "code_blocks": [
+        {
+          "label": "Temporal aggregation during evaluation",
+          "source": "                ### query policy\n                if config['policy_class'] == \"ACT\":\n                    if t % query_frequency == 0:\n                        all_actions = policy(qpos, curr_image)\n                    if temporal_agg:\n                        all_time_actions[[t], t:t+num_queries] = all_actions\n                        actions_for_curr_step = all_time_actions[:, t]\n                        actions_populated = torch.all(actions_for_curr_step != 0, axis=1)\n                        actions_for_curr_step = actions_for_curr_step[actions_populated]\n                        k = 0.01\n                        exp_weights = np.exp(-k * np.arange(len(actions_for_curr_step)))\n                        exp_weights = exp_weights / exp_weights.sum()\n                        exp_weights = torch.from_numpy(exp_weights).cuda().unsqueeze(dim=1)\n                        raw_action = (actions_for_curr_step * exp_weights).sum(dim=0, keepdim=True)\n                    else:\n                        raw_action = all_actions[:, t % query_frequency]",
+          "source_start_line": 247,
+          "file_path": "imitate_episodes.py",
+          "annotations": [
+            {
+              "start_line": 249,
+              "end_line": 250,
+              "explanation": "With temporal aggregation, query_frequency=1 so the policy is called every step. Without it, query_frequency=chunk_size so the policy is called every k steps. Either way, all_actions contains a full (1, chunk_size, 14) action chunk.",
+              "concept_tag": "other:inference"
+            },
+            {
+              "start_line": 252,
+              "end_line": 252,
+              "explanation": "all_time_actions is a (max_timesteps, max_timesteps+chunk_size, 14) buffer. Row t stores the action chunk predicted at timestep t. Column t then contains all predictions that overlap at timestep t.",
+              "concept_tag": "other:inference"
+            },
+            {
+              "start_line": 256,
+              "end_line": 260,
+              "explanation": "Exponential weighting: exp(-0.01 * i) where i is how many steps ago the chunk was predicted. Recent chunks get weight ~1.0, older chunks decay gradually. The weighted sum produces a smooth action that blends all overlapping predictions.",
+              "concept_tag": "other:inference"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "transformer-layers",
+      "title": "Inside the Transformer: Encoder and Decoder Layers",
+      "narrative": "ACT uses a standard DETR transformer with post-norm encoder and decoder layers. The encoder has 4 layers and the decoder has 7 layers, each with 8 attention heads and a hidden dimension of 512.\n\nThe encoder layers use standard self-attention: each token (latent z, proprioception, and all image feature pixels) attends to every other token. Positional embeddings are added to queries and keys (but not values), following the DETR convention.\n\nThe decoder layers have two attention stages per layer:\n1. **Self-attention** among action queries: each query can see all other queries, allowing the model to coordinate the action chunk (e.g., ensuring the arm doesn't predict contradictory positions at adjacent timesteps)\n2. **Cross-attention** from queries to encoder memory: each action query attends to all encoder outputs (z, proprio, image features), gathering the information it needs to predict its specific timestep's action\n\nThis architecture means every action query has direct access to the latent style variable z, the current robot state, and the full spatial image features — all through standard attention, with no special conditioning layers.",
+      "code_blocks": [
+        {
+          "label": "Transformer decoder layer: self-attention + cross-attention",
+          "source": "class TransformerDecoderLayer(nn.Module):\n\n    def __init__(self, d_model, nhead, dim_feedforward=2048, dropout=0.1,\n                 activation=\"relu\", normalize_before=False):\n        super().__init__()\n        self.self_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout)\n        self.multihead_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout)\n        # Implementation of Feedforward model\n        self.linear1 = nn.Linear(d_model, dim_feedforward)\n        self.dropout = nn.Dropout(dropout)\n        self.linear2 = nn.Linear(dim_feedforward, d_model)\n\n        self.norm1 = nn.LayerNorm(d_model)\n        self.norm2 = nn.LayerNorm(d_model)\n        self.norm3 = nn.LayerNorm(d_model)\n        self.dropout1 = nn.Dropout(dropout)\n        self.dropout2 = nn.Dropout(dropout)\n        self.dropout3 = nn.Dropout(dropout)\n\n        self.activation = _get_activation_fn(activation)\n        self.normalize_before = normalize_before",
+          "source_start_line": 204,
+          "file_path": "detr/models/transformer.py",
+          "annotations": [
+            {
+              "start_line": 209,
+              "end_line": 210,
+              "explanation": "Two separate attention modules: self_attn for query-to-query attention (action queries coordinate with each other), and multihead_attn for query-to-memory cross-attention (action queries attend to image features, z, and proprio).",
+              "concept_tag": "attention"
+            },
+            {
+              "start_line": 212,
+              "end_line": 214,
+              "explanation": "Standard transformer FFN: linear(d_model → 2048) → ReLU → dropout → linear(2048 → d_model). This provides the per-token nonlinear transformation after attention.",
+              "concept_tag": "linear"
+            }
+          ]
+        },
+        {
+          "label": "Decoder layer forward: the attention flow",
+          "source": "    def forward_post(self, tgt, memory,\n                     tgt_mask: Optional[Tensor] = None,\n                     memory_mask: Optional[Tensor] = None,\n                     tgt_key_padding_mask: Optional[Tensor] = None,\n                     memory_key_padding_mask: Optional[Tensor] = None,\n                     pos: Optional[Tensor] = None,\n                     query_pos: Optional[Tensor] = None):\n        q = k = self.with_pos_embed(tgt, query_pos)\n        tgt2 = self.self_attn(q, k, value=tgt, attn_mask=tgt_mask,\n                              key_padding_mask=tgt_key_padding_mask)[0]\n        tgt = tgt + self.dropout1(tgt2)\n        tgt = self.norm1(tgt)\n        tgt2 = self.multihead_attn(query=self.with_pos_embed(tgt, query_pos),\n                                   key=self.with_pos_embed(memory, pos),\n                                   value=memory, attn_mask=memory_mask,\n                                   key_padding_mask=memory_key_padding_mask)[0]\n        tgt = tgt + self.dropout2(tgt2)\n        tgt = self.norm2(tgt)\n        tgt2 = self.linear2(self.dropout(self.activation(self.linear1(tgt))))\n        tgt = tgt + self.dropout3(tgt2)\n        tgt = self.norm3(tgt)\n        return tgt",
+          "source_start_line": 229,
+          "file_path": "detr/models/transformer.py",
+          "annotations": [
+            {
+              "start_line": 236,
+              "end_line": 240,
+              "explanation": "Step 1 — Self-attention among action queries: positional embeddings are added to Q and K (but not V), so the model knows which timestep each query represents. This lets action queries coordinate with each other.",
+              "concept_tag": "attention"
+            },
+            {
+              "start_line": 241,
+              "end_line": 245,
+              "explanation": "Step 2 — Cross-attention to encoder memory: action queries (Q) attend to encoder outputs (K, V) which include the latent z token, proprioception token, and all image feature tokens. Positional embeddings ensure the model distinguishes spatial image positions from the z/proprio tokens.",
+              "concept_tag": "attention"
+            },
+            {
+              "start_line": 247,
+              "end_line": 249,
+              "explanation": "Step 3 — Feedforward network with residual connection and layer norm. Each of the three sub-layers (self-attn, cross-attn, FFN) follows the residual + dropout + LayerNorm pattern.",
+              "concept_tag": "residual"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "training-loop",
+      "title": "The Training Loop",
+      "narrative": "ACT is trained with standard behavioral cloning: given a dataset of expert demonstrations (human teleoperation), each training step samples a batch of (image, joint_position, action_sequence) tuples and minimizes the CVAE loss.\n\nThe training configuration uses:\n- **Chunk size**: 100 actions (configurable via --chunk_size)\n- **Hidden dim**: 512\n- **Encoder layers**: 4 (for the CVAE encoder)\n- **Decoder layers**: 7 (for the DETR transformer)\n- **Attention heads**: 8\n- **Learning rate**: 1e-5 for the backbone, higher for the rest\n- **KL weight**: 10\n\nThe training loop validates every epoch and saves the best checkpoint by validation loss. Data normalization is handled by pre-computing mean and standard deviation of joint positions (qpos) and actions from the training set.",
+      "code_blocks": [
+        {
+          "label": "ACT policy configuration and hyperparameters",
+          "source": "    # fixed parameters\n    state_dim = 14\n    lr_backbone = 1e-5\n    backbone = 'resnet18'\n    if policy_class == 'ACT':\n        enc_layers = 4\n        dec_layers = 7\n        nheads = 8\n        policy_config = {'lr': args['lr'],\n                         'num_queries': args['chunk_size'],\n                         'kl_weight': args['kl_weight'],\n                         'hidden_dim': args['hidden_dim'],\n                         'dim_feedforward': args['dim_feedforward'],\n                         'lr_backbone': lr_backbone,\n                         'backbone': backbone,\n                         'enc_layers': enc_layers,\n                         'dec_layers': dec_layers,\n                         'nheads': nheads,\n                         'camera_names': camera_names,\n                         }",
+          "source_start_line": 49,
+          "file_path": "imitate_episodes.py",
+          "annotations": [
+            {
+              "start_line": 50,
+              "end_line": 51,
+              "explanation": "state_dim=14 for the ALOHA bimanual setup: 7 joint positions per arm (6 DOF + gripper). The backbone learning rate (1e-5) is lower than the main model to preserve pretrained ImageNet features.",
+              "concept_tag": "other:config"
+            },
+            {
+              "start_line": 53,
+              "end_line": 56,
+              "explanation": "The CVAE encoder has 4 layers, the DETR decoder has 7 layers, with 8 attention heads. num_queries = chunk_size maps directly to how many future actions the model predicts per forward pass.",
+              "concept_tag": "other:config"
+            }
+          ]
+        },
+        {
+          "label": "Forward pass and training step",
+          "source": "def forward_pass(data, policy):\n    image_data, qpos_data, action_data, is_pad = data\n    image_data, qpos_data, action_data, is_pad = image_data.cuda(), qpos_data.cuda(), action_data.cuda(), is_pad.cuda()\n    return policy(qpos_data, image_data, action_data, is_pad) # TODO remove None",
+          "source_start_line": 316,
+          "file_path": "imitate_episodes.py",
+          "annotations": [
+            {
+              "start_line": 317,
+              "end_line": 319,
+              "explanation": "Each training batch contains: multi-camera images, current joint positions (qpos), the ground-truth action sequence, and a padding mask. All are moved to GPU and passed to the policy, which returns the loss dictionary.",
+              "concept_tag": "other:training"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "putting-it-together",
+      "title": "Putting It All Together",
+      "narrative": "Let's trace the complete data flow through ACT, from observations to robot actions.\n\n**Training time (CVAE posterior):**\n1. Camera images (e.g., 2 views at 480x640) pass through a shared ResNet18 backbone → 512-channel feature maps (15x20 per camera)\n2. Features are projected to hidden_dim=512 via 1×1 conv, concatenated across cameras → (512, 15, 40)\n3. The CVAE encoder takes [CLS, qpos, a_1, ..., a_k] (the ground-truth action sequence) through 4 transformer layers\n4. The [CLS] output is projected to (mu, logvar) of a 32-dim Gaussian; z is sampled via reparameterization\n5. z and proprioception are prepended to the image features as extra tokens\n6. The DETR transformer encoder (4 layers) processes [z, proprio, pixel_1, ..., pixel_HW]\n7. The DETR decoder (7 layers) cross-attends 100 action queries to the encoder memory\n8. Two linear heads produce: a_hat (100 × 14 actions) and is_pad_hat (100 × 1 padding logits)\n9. Loss = L1(a_hat, a_gt) + 10 × KL(q(z|a,obs) || N(0,I))\n\n**Inference time (CVAE prior):**\n1. Same image backbone processing\n2. No CVAE encoder — z = zeros(32) (prior mean)\n3. Same DETR transformer and action heads → predicted 100-step action chunk\n4. Either execute the full chunk and re-query, or use temporal aggregation (exponentially-weighted blending of overlapping chunks)\n\n**Why it works:** Action chunking reduces the effective decision horizon from T to T/k, cutting compounding errors. The CVAE latent z captures demonstration \"style\" during training and samples from a coherent prior at test time, avoiding mode-averaging. The DETR architecture provides a natural way to predict a variable-length sequence of actions through its query mechanism.",
+      "code_blocks": [
+        {
+          "label": "Model construction: assembling all components",
+          "source": "def build(args):\n    state_dim = 14 # TODO hardcode\n\n    # From state\n    # backbone = None # from state for now, no need for conv nets\n    # From image\n    backbones = []\n    backbone = build_backbone(args)\n    backbones.append(backbone)\n\n    transformer = build_transformer(args)\n\n    encoder = build_encoder(args)\n\n    model = DETRVAE(\n        backbones,\n        transformer,\n        encoder,\n        state_dim=state_dim,\n        num_queries=args.num_queries,\n        camera_names=args.camera_names,\n    )\n\n    n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)\n    print(\"number of parameters: %.2fM\" % (n_parameters/1e6,))\n\n    return model",
+          "source_start_line": 229,
+          "file_path": "detr/models/detr_vae.py",
+          "annotations": [
+            {
+              "start_line": 236,
+              "end_line": 237,
+              "explanation": "build_backbone creates a Joiner(ResNet18, PositionEmbeddingSine) — the image feature extractor with 2D positional encoding.",
+              "concept_tag": "convolution"
+            },
+            {
+              "start_line": 239,
+              "end_line": 241,
+              "explanation": "Two separate transformer components: the DETR transformer (encoder + decoder for image→action) and the CVAE encoder (action sequence → latent z). They do not share weights despite both being transformer encoders.",
+              "concept_tag": "attention"
+            },
+            {
+              "start_line": 243,
+              "end_line": 250,
+              "explanation": "DETRVAE receives all components: image backbones, the DETR transformer, the CVAE encoder, the action dimensionality (14), chunk size (num_queries), and camera names. Everything is assembled in __init__ with the linear heads and embeddings.",
+              "concept_tag": "other:architecture"
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "summary": "ACT (Action Chunking with Transformers) is an imitation learning method that tackles compounding errors and multimodal action distributions in robot manipulation. It predicts chunks of k future actions at once using a DETR-style transformer, trained as a Conditional VAE where a style encoder compresses demonstration action sequences into a 32-dim latent variable z. At inference, z is sampled from a standard Gaussian prior, and overlapping action chunks are blended via temporal aggregation for smooth execution. The architecture processes multi-camera images through a shared ResNet18 backbone, prepends the CVAE latent and proprioception as extra tokens to the transformer encoder memory, and uses learnable action queries in the decoder to predict the full action chunk in parallel."
+}

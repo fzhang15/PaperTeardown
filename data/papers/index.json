@@ -1,5 +1,15 @@
 [
   {
+    "id": "act",
+    "title": "Learning Fine-Grained Bimanual Manipulation with Low-Cost Hardware (ACT)",
+    "authors": ["Tony Z. Zhao", "Vikash Kumar", "Sergey Levine", "Chelsea Finn"],
+    "arxiv_url": "https://arxiv.org/abs/2304.13705",
+    "repo_url": "https://github.com/tonyzhaozh/act",
+    "abstract": "We present Action Chunking with Transformers (ACT), an imitation learning algorithm for fine-grained bimanual manipulation tasks. ACT addresses compounding errors in behavioral cloning by predicting chunks of future actions instead of single actions, reducing the effective horizon. To handle multimodal action distributions, ACT uses a Conditional VAE that encodes demonstration action sequences into a low-dimensional style variable, sampled from a learned prior at inference time.",
+    "chapter_count": 10,
+    "ingested_at": "2026-03-31T00:00:00Z"
+  },
+  {
     "id": "diffusion-policy",
     "title": "Diffusion Policy: Visuomotor Policy Learning via Action Diffusion",
     "authors": ["Cheng Chi", "Siyuan Feng", "Yilun Du", "Zhenjia Xu", "Eric Cousineau", "Benjamin Burchfiel", "Shuran Song"],

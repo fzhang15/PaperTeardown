@@ -1,0 +1,12 @@
+{
+  "id": "act",
+  "title": "Learning Fine-Grained Bimanual Manipulation with Low-Cost Hardware (ACT)",
+  "authors": ["Tony Z. Zhao", "Vikash Kumar", "Sergey Levine", "Chelsea Finn"],
+  "arxiv_url": "https://arxiv.org/abs/2304.13705",
+  "repo_url": "https://github.com/tonyzhaozh/act",
+  "abstract": "We present Action Chunking with Transformers (ACT), an imitation learning algorithm for fine-grained bimanual manipulation tasks. ACT addresses compounding errors in behavioral cloning by predicting chunks of future actions instead of single actions, reducing the effective horizon. To handle multimodal action distributions, ACT uses a Conditional VAE that encodes demonstration action sequences into a low-dimensional style variable, sampled from a learned prior at inference time. The architecture adapts DETR (Detection Transformer) for action prediction, using learnable action queries to predict entire action chunks in parallel. Combined with temporal aggregation for smooth execution, ACT achieves 80-90% success rates on challenging bimanual tasks with the low-cost ALOHA hardware platform.",
+  "introduction_excerpt": "Fine-grained manipulation tasks such as opening a zip lock bag, slotting a battery, and threading a velcro cable require precise coordination of two robot arms. We present ACT, a simple yet effective approach for learning such tasks from a small number of human demonstrations.",
+  "module_count": 6,
+  "pytorch_file_count": 5,
+  "ingested_at": "2026-03-31T00:00:00Z"
+}

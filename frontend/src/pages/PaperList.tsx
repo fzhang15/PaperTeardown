@@ -28,11 +28,12 @@ interface TrackPos { track: number; row: number }
 const PAPER_POSITIONS: Record<string, TrackPos> = {
   dinov3:             { track: 0, row: 0 },
   dit:                { track: 0, row: 1 },
-  'diffusion-policy': { track: 1, row: 0 },
-  rt1:                { track: 1, row: 1 },
-  rt2:                { track: 1, row: 2 },
-  pi0:                { track: 1, row: 3 },
-  groot:              { track: 1, row: 4 },
+  act:                { track: 1, row: 0 },
+  'diffusion-policy': { track: 1, row: 1 },
+  rt1:                { track: 1, row: 2 },
+  rt2:                { track: 1, row: 3 },
+  pi0:                { track: 1, row: 4 },
+  groot:              { track: 1, row: 5 },
 }
 
 // ---------------------------------------------------------------------------
@@ -57,6 +58,7 @@ interface Edge { from: string; to: string; dashed?: boolean }
 
 const EDGES: Edge[] = [
   // Same-track lineage (solid vertical arrows)
+  { from: 'act',              to: 'diffusion-policy' },
   { from: 'diffusion-policy', to: 'rt1' },
   { from: 'rt1',              to: 'rt2' },
   { from: 'rt2',              to: 'pi0' },
