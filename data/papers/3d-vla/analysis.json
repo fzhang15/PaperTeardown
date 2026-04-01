@@ -1,0 +1,307 @@
+{
+  "chapters": [
+    {
+      "id": "problem",
+      "title": "The Problem: From 2D Imitation to 3D Embodied World Models",
+      "narrative": "Almost every robot learning paper before 3D-VLA treats the world as a flat image. The robot sees a camera frame, reads a text instruction, and outputs joint angles or end-effector deltas. This works surprisingly well — but it throws away the most fundamental property of physical manipulation: the scene is three-dimensional, objects have depth and shape, and actions play out in 3D space.\n\n3D-VLA makes the case that 3D understanding is not a nice-to-have but a necessity. When a robot needs to grasp an occluded object, navigate around obstacles, or reason about which face of a block to push, 2D features fundamentally lack the information required. Point clouds preserve the spatial geometry that images collapse.\n\nBut 3D-VLA goes further with a second idea: the generative world model. Rather than directly predicting the next action, the system first imagines what the scene should look like after the task is complete — both as a goal image and as a goal point cloud — and then generates actions conditioned on that imagined future. This \"dream first, act second\" pipeline draws on two observations: (1) humans imagine the end state before executing a task, and (2) if the model can accurately predict future states, it has implicitly learned the physics and geometry of the task.\n\nThe result is a system with three coupled components: a 3D-grounded language model that reasons about the scene and outputs actions as text tokens, a goal image diffusion model that generates a visual target, and a 3D point cloud diffusion model that generates the target geometry. All three are trained separately and composed at inference time.",
+      "code_blocks": []
+    },
+    {
+      "id": "token-vocabulary",
+      "title": "A New Vocabulary: Special Tokens for 3D Space and Robot Action",
+      "narrative": "The central architectural bet of 3D-VLA is that the FlanT5 language model does not need to be redesigned — it just needs a richer vocabulary. Rather than building custom heads for 3D coordinates and actions, the authors extend T5's tokenizer with hundreds of new special tokens that speak the language of space and robotics.\n\nThree families of tokens are added. The first family represents 3D spatial coordinates: `<loc0>` through `<loc255>` discretize each spatial axis into 256 bins. Any 3D position can be represented as a triple of location tokens. The second family controls where 3D features are injected into the text stream: `<scene>` and `</scene>` act as anchors that the model later replaces with Q-Former output embeddings. The third — and most important for action generation — family discretizes the 7 degrees of a robot arm into discrete tokens: 256 bins for position (`<aloc0>`...`<aloc255>`), 256 bins for rotation (`<arot0>`...`<arot255>`), and two binary gripper states (`<gripper0>`, `<gripper1>`). Each action step ends with `<ACT_SEP>` as a delimiter.\n\nThis design means action generation is literally language modeling: the T5 decoder generates a sequence of special tokens like `<aloc42><arot17><aloc38><arot5><gripper1><ACT_SEP>` the same way it generates ordinary text. No custom action head, no separate loss function. The entire action sequence is a string in the robot's vocabulary.",
+      "code_blocks": [
+        {
+          "label": "Extending T5's tokenizer with 3D and action special tokens",
+          "source": "        # ================ Warning: do not change the order of the **below** tokens >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>\n        # ==== Add special tokens ====\n        # Location\n        self.special_token_ids = []\n        location_tokens = []\n        for i in range(256):  # pc -> x,y,z tokens\n            location_tokens.append(\"<loc%d>\" % i)\n        self.t5_tokenizer.add_special_tokens({\"additional_special_tokens\": location_tokens})\n        self.special_token_ids += self.t5_tokenizer.convert_tokens_to_ids(location_tokens)\n        self.start_loc_id = self.t5_tokenizer.convert_tokens_to_ids([\"<loc0>\"])[0]\n        # 3D feature\n        tokens3d = [\"<scene>\", \"</scene>\"]\n        self.t5_tokenizer.add_special_tokens({\"additional_special_tokens\": tokens3d})\n        self.special_token_ids += self.t5_tokenizer.convert_tokens_to_ids(tokens3d)\n        self.tokens3d_id = self.t5_tokenizer.convert_tokens_to_ids([\"<scene>\"])[0]\n        # object\n        object_tokens = [\"<obj>\", \"</obj>\"]\n        self.t5_tokenizer.add_special_tokens({\"additional_special_tokens\": object_tokens})\n        self.special_token_ids += self.t5_tokenizer.convert_tokens_to_ids(object_tokens)\n        self.start_obj_id = self.t5_tokenizer.convert_tokens_to_ids([\"<obj>\"])[0]\n        # Goal image\n        image_tokens = [\"<image>\", \"</image>\"]\n        self.t5_tokenizer.add_special_tokens({\"additional_special_tokens\": image_tokens})\n        self.special_token_ids += self.t5_tokenizer.convert_tokens_to_ids(image_tokens)\n        self.start_image_id = self.t5_tokenizer.convert_tokens_to_ids([\"<image>\"])[0]\n        self.end_image_id = self.t5_tokenizer.convert_tokens_to_ids([\"</image>\"])[0]\n        # Goal PointCloud\n        pcd_tokens = [\"<pcd>\", \"</pcd>\"]\n        self.t5_tokenizer.add_special_tokens({\"additional_special_tokens\": pcd_tokens})\n        self.special_token_ids += self.t5_tokenizer.convert_tokens_to_ids(pcd_tokens)\n        self.start_pc_id = self.t5_tokenizer.convert_tokens_to_ids([\"<pcd>\"])[0]\n        self.end_pc_id = self.t5_tokenizer.convert_tokens_to_ids([\"</pcd>\"])[0]\n        # Action 7D\n        self.num_act_tokens = 256\n        action7d_tokens = []\n        for i in range(self.num_act_tokens):\n            action7d_tokens.append(\"<aloc%d>\" % i)\n            action7d_tokens.append(\"<arot%d>\" % i)\n        action7d_tokens.append(\"<gripper0>\")\n        action7d_tokens.append(\"<gripper1>\")\n        action7d_tokens.append(\"<ACT_SEP>\")\n        self.t5_tokenizer.add_special_tokens({\"additional_special_tokens\": action7d_tokens})\n        self.special_token_ids += self.t5_tokenizer.convert_tokens_to_ids(action7d_tokens)",
+          "source_start_line": 71,
+          "file_path": "lavis/models/blip2_models/blip2_t5.py",
+          "annotations": [
+            {
+              "start_line": 74,
+              "end_line": 80,
+              "explanation": "256 location tokens (<loc0> to <loc255>) discretize 3D coordinates into bins. A point in space becomes three location tokens — one per axis — letting the LLM reason about positions in its standard token-prediction framework.",
+              "concept_tag": "embedding"
+            },
+            {
+              "start_line": 82,
+              "end_line": 85,
+              "explanation": "<scene> is the anchor token: whenever the text input contains a <scene> marker, the model will later splice in the 32 Q-Former output embeddings for that observation. It's a placeholder that the embedding layer fills with real 3D geometry.",
+              "concept_tag": "embedding"
+            },
+            {
+              "start_line": 103,
+              "end_line": 113,
+              "explanation": "Action tokens discretize the 7-DOF robot arm: <alocN> for end-effector position (x,y,z each in 256 bins), <arotN> for rotation, plus binary gripper states. <ACT_SEP> delimits steps in a multi-step action sequence. The T5 decoder generates these exactly as it generates ordinary text.",
+              "concept_tag": "other:action-tokenization"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "3d-encoding",
+      "title": "3D Positional Encoding and Q-Former Compression",
+      "narrative": "A point cloud from an RGB-D camera arrives as N points, each with a feature vector (from a pretrained 3D encoder like PointNet++) and a raw 3D coordinate. Before the Q-Former can compress these into T5-sized tokens, two problems must be solved: the raw coordinates carry no positional bias in the feature space, and N can be thousands of points — far too many to pass directly to an attention-heavy transformer.\n\nThe positional encoding solution is inspired by NLP's sinusoidal position embeddings, but applied in 3D. A PositionalEncoding1D module generates 469-dimensional sinusoidal embeddings for integer positions 0–255. The raw integer coordinates of each point are used to index into this precomputed table, yielding a (3, 469) position tensor per point. These are reshaped and added to the point's feature vector at a weight of 0.1 — a small nudge that injects spatial location into the feature without dominating the semantic content.\n\nWith positional encoding applied, the Q-Former takes over. It is a BERT-based cross-attention module with 32 learnable query vectors. These queries attend to all N point features as keys and values, producing 32 output vectors that summarize the entire scene. This is the same bottleneck used in BLIP-2 for compressing image patches, now applied to 3D point clouds. The output is then projected from the Q-Former's 768-dim space to T5's 2048-dim space via a linear layer.",
+      "code_blocks": [
+        {
+          "label": "3D positional encoding injection and Q-Former compression in prepare_inputs",
+          "source": "    def prepare_inputs(self, pc_embeds, pc, num_feat):\n        B, T, N, _ = pc.shape\n        with torch.cuda.amp.autocast(dtype=torch.float32):\n            all_pcs = torch.zeros((pc_embeds.shape))  # B, T, N, 1408\n            clamped_pc = torch.clamp(pc, 0, self.pos_embedding.shape[0] - 1).long()\n            all_pcs_emb = self.pos_embedding[clamped_pc]  # (B, T, N, 3, 469)\n            all_pcs[..., :1407] = all_pcs_emb.reshape(B, T, N, -1)  # (B, T, N, 1407)\n            all_pcs = all_pcs.cuda()\n            pc_embeds = pc_embeds + all_pcs * 0.1  # B, T, N, 1408\n\n        image_atts = torch.ones(pc_embeds.size()[:-1]).long().to(pc_embeds.device)  # (B, T, N)\n        query_tokens = self.query_tokens.expand(B * T, -1, -1)  # (B * T, 32, 768)\n        query_output = self.Qformer.bert(\n            query_embeds=query_tokens,\n            encoder_hidden_states=pc_embeds.reshape(B * T, N, -1),\n            encoder_attention_mask=image_atts.reshape(B * T, N),\n            return_dict=True,\n        )\n        inputs_t5 = self.t5_proj(query_output.last_hidden_state)  # (B * T, 32, 2048)\n        inputs_t5 = inputs_t5.reshape(B, T, -1, inputs_t5.shape[-1])  # (B, T, 32, 2048)\n        atts_t5 = torch.ones(inputs_t5.size()[:-1]).long().to(pc_embeds.device)  # (B, T, 32)\n\n        return inputs_t5, atts_t5",
+          "source_start_line": 143,
+          "file_path": "lavis/models/blip2_models/blip2_t5.py",
+          "annotations": [
+            {
+              "start_line": 145,
+              "end_line": 151,
+              "explanation": "3D positional encoding: each point's integer coordinates index into a precomputed sinusoidal embedding table (shape [256, 469] per axis). The 3-axis embeddings are concatenated and added to the point features at weight 0.1 — injecting spatial location without drowning the semantic features.",
+              "concept_tag": "embedding"
+            },
+            {
+              "start_line": 153,
+              "end_line": 160,
+              "explanation": "Q-Former cross-attention: 32 learnable query tokens attend to all N point features as keys/values. This compresses an arbitrary-length point cloud (thousands of points) into exactly 32 fixed-size vectors, each summarizing a different aspect of the 3D scene.",
+              "concept_tag": "attention"
+            },
+            {
+              "start_line": 161,
+              "end_line": 163,
+              "explanation": "Linear projection bridges two representation spaces: Q-Former's 768-dim output → T5's 2048-dim hidden space. After reshaping, the output is (B, T, 32, 2048): B batch items, T temporal observations, 32 tokens per observation, each with the T5 embedding dimension.",
+              "concept_tag": "linear"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "qformer-architecture",
+      "title": "The Q-Former: BERT as a Learnable 3D Bottleneck",
+      "narrative": "The Q-Former is borrowed directly from BLIP-2, where it was designed to compress image patches for a language model. In 3D-VLA, it compresses point cloud features instead. The architecture is standard BERT with one crucial modification: every other attention layer is a cross-attention layer that can attend to external features (the 3D point cloud), while alternate layers are self-attention layers over the queries alone.\n\nThe 32 query tokens are learnable parameters initialized from a normal distribution. They play the role of standing questions asked of the scene: \"What objects are present? Where are they? What are their shapes?\" During forward passes, these queries attend to the point cloud features and update their representations based on what they find.\n\nThe key architectural choice — `cross_attention_freq=2` — means cross-attention layers alternate with self-attention layers. Self-attention lets the queries communicate with each other (\"given that query 3 found a cup, query 7 might look for its handle\"), while cross-attention updates each query with information from the full point cloud. This alternating structure makes Q-Former more expressive than pure cross-attention while remaining efficient.",
+      "code_blocks": [
+        {
+          "label": "Q-Former initialization: BERT with alternating cross-attention layers",
+          "source": "    @classmethod\n    def init_Qformer(cls, num_query_token, vision_width, cross_attention_freq=2):\n        encoder_config = BertConfig.from_pretrained(\"bert-base-uncased\", cache_dir=\"./cache\")\n        encoder_config.encoder_width = vision_width\n        # insert cross-attention layer every other block\n        encoder_config.add_cross_attention = True\n        encoder_config.cross_attention_freq = cross_attention_freq\n        encoder_config.query_length = num_query_token\n        Qformer = BertLMHeadModel.from_pretrained(\"bert-base-uncased\", config=encoder_config, cache_dir=\"./cache\")\n        query_tokens = nn.Parameter(torch.zeros(1, num_query_token, encoder_config.hidden_size))\n        query_tokens.data.normal_(mean=0.0, std=encoder_config.initializer_range)\n        return Qformer, query_tokens",
+          "source_start_line": 55,
+          "file_path": "lavis/models/blip2_models/blip2.py",
+          "annotations": [
+            {
+              "start_line": 57,
+              "end_line": 62,
+              "explanation": "BERT is reconfigured as a cross-attention encoder. encoder_width is set to the 3D feature dimension (1408), and cross_attention_freq=2 inserts a cross-attention layer every other BERT block. The query_length setting tells the model how many query vectors to expect.",
+              "concept_tag": "attention"
+            },
+            {
+              "start_line": 64,
+              "end_line": 65,
+              "explanation": "The 32 query tokens are learnable parameters — the key innovation of Q-Former. They are randomly initialized and fine-tuned to ask useful questions of the 3D scene. These are not input-dependent; the same 32 queries are used for every forward pass, updated only during training.",
+              "concept_tag": "embedding"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "scene-token-injection",
+      "title": "Grounding Language with 3D: The <scene> Token Injection",
+      "narrative": "Once the Q-Former has compressed the 3D scene into 32 T5-sized tokens, the question becomes: how do you give the language model access to them? The naive approach — concatenating 3D features to the beginning of the input — works but is inflexible. 3D-VLA uses a more elegant mechanism: `<scene>` placeholder tokens in the text act as injection sites.\n\nThe input text might look like: `\"Describe the scene: <scene>\"` or `\"Move the cup: <scene>. <scene> describes the initial state.\"` Each `<scene>` token is a marker telling the model where to inject one observation's worth of 3D features. The `insert_3d_feats` method scans the tokenized input for `<scene>` positions, then splices in the corresponding 32 Q-Former tokens right after each marker.\n\nThis is done in reverse order (rightmost `<scene>` first) so that inserting earlier does not shift the indices of later markers. The result is a token sequence that looks like: `[text tokens...] [<scene>] [32 3D tokens] [more text...] [<scene>] [32 3D tokens] [...]`. T5 then processes this mixed sequence with its full self-attention, allowing the language model to attend from any text position to any 3D token. The 3D observations are not segregated — they live directly in the token stream.",
+      "code_blocks": [
+        {
+          "label": "Splicing Q-Former outputs into the T5 token stream at <scene> positions",
+          "source": "    def insert_3d_feats(\n        self, batch_input_tokens_input_ids, batch_input_tokens_atts, batch_atts_t5, batch_inputs_t5, num_feat\n    ):\n        B = batch_input_tokens_input_ids.shape[0]\n        inputs_embeds = self.t5_model.encoder.embed_tokens(batch_input_tokens_input_ids)  # (B, L_input, 1024)\n        inputs_list = []\n        atts_list = []\n        for b in range(B):\n            current_embeds = inputs_embeds[b]  # (L_input, 1024)\n            current_att = batch_input_tokens_atts[b]  # (L_input)\n            current_3d_feats = batch_inputs_t5[b]  # (T, 32, 2048)\n            current_3d_att = batch_atts_t5[b]  # (T, 32)\n            feat3d_indices = (batch_input_tokens_input_ids[b] == self.tokens3d_id).nonzero(as_tuple=True)[\n                0\n            ]  # (num_3d_feats)\n            assert len(feat3d_indices) == num_feat[b], f\"{len(feat3d_indices)} != {num_feat[b]}\"\n            for i, idx in enumerate(reversed(feat3d_indices)):\n                left = current_embeds[: idx + 1]\n                right = current_embeds[idx + 1 :]\n                current_embeds = torch.cat([left, current_3d_feats[i], right], dim=0)\n                left = current_att[: idx + 1]\n                right = current_att[idx + 1 :]\n                current_att = torch.cat([left, current_3d_att[i], right], dim=0)\n            inputs_list.append(current_embeds)\n            atts_list.append(current_att)\n        inputs_embeds = torch.nn.utils.rnn.pad_sequence(\n            inputs_list, batch_first=True, padding_value=0\n        )  # (B, L_input + T * 32, 1024)\n        encoder_atts = torch.nn.utils.rnn.pad_sequence(\n            atts_list, batch_first=True, padding_value=0\n        )  # (B, L_input + T * 32)\n        return inputs_embeds, encoder_atts",
+          "source_start_line": 167,
+          "file_path": "lavis/models/blip2_models/blip2_t5.py",
+          "annotations": [
+            {
+              "start_line": 171,
+              "end_line": 171,
+              "explanation": "First, text token IDs are converted to T5 embedding vectors (dimension 2048). The 3D features from Q-Former are already in this space, so they can be concatenated directly.",
+              "concept_tag": "embedding"
+            },
+            {
+              "start_line": 179,
+              "end_line": 181,
+              "explanation": "Scan the token ID sequence for self.tokens3d_id — the ID assigned to the <scene> token. Each match is an injection site. The assertion ensures the number of <scene> markers matches the number of 3D observations for this example.",
+              "concept_tag": "other:scene-grounding"
+            },
+            {
+              "start_line": 183,
+              "end_line": 189,
+              "explanation": "Insertion happens right-to-left (reversed) so earlier indices remain valid after later insertions. For each <scene> position, 32 Q-Former tokens are spliced in after the marker. The attention mask is extended correspondingly so T5 attends fully to the injected 3D tokens.",
+              "concept_tag": "attention"
+            },
+            {
+              "start_line": 192,
+              "end_line": 197,
+              "explanation": "After injection, sequences in the batch have different lengths (different numbers of <scene> tokens). pad_sequence pads them to the maximum length for batched T5 processing.",
+              "concept_tag": "other:sequence-padding"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "action-generation",
+      "title": "Action as Language: Training the 3D-Grounded T5",
+      "narrative": "With 3D features injected into the token stream, the forward pass looks almost identical to standard T5 language modeling. The only differences are the richer input (text + 3D tokens interleaved) and the richer output vocabulary (including action tokens).\n\nFor 3D question-answering tasks, the target is a text string. For action prediction tasks, the target is a sequence of action tokens like `<aloc42><arot17><aloc38><arot5><gripper1><ACT_SEP>`. T5 is trained with teacher forcing: it receives the correct prefix of the output and predicts the next token. The loss is standard cross-entropy masked to ignore padding tokens (masked to -100, which PyTorch ignores in the loss computation).\n\nOne subtle design: the batch expansion loop (lines 238–252). Each training example may have multiple valid answers (for 3D VQA questions with several correct wordings). Rather than averaging losses across answers, the model duplicates the inputs — one copy per answer — and trains all pairs simultaneously. This is more memory-intensive but more stable than computing a single averaged loss.",
+      "code_blocks": [
+        {
+          "label": "Training forward pass: tokenize, insert 3D features, compute T5 loss",
+          "source": "    def forward(self, samples):\n        pc_embeds = samples[\"pc_feat\"]  # B, T, N, 1408\n        pc = samples[\"pc\"].long()  # B, T, N, 3\n        num_feat = samples[\"num_features\"]  # B, each element <= T\n        B, T, N, _ = pc.shape\n\n        inputs_t5, atts_t5 = self.prepare_inputs(pc_embeds, pc, num_feat)\n\n        if self.prompt:\n            text_input = [self.prompt.format(question) for question in samples[\"text_input\"]]\n        else:\n            text_input = samples[\"text_input\"]\n\n        with torch.cuda.amp.autocast(dtype=torch.float32):\n            input_tokens = self.t5_tokenizer(\n                text_input,\n                padding=\"longest\",\n                truncation=True,\n                max_length=300,\n                return_tensors=\"pt\",\n            ).to(\n                pc_embeds.device\n            )  # (B, L_input)\n            output_tokens = self.t5_tokenizer(\n                samples[\"answer\"],\n                padding=\"longest\",\n                truncation=True,\n                max_length=300,\n                return_tensors=\"pt\",\n            ).to(\n                pc_embeds.device\n            )  # (B, L_output)\n\n            batch_input_tokens_input_ids = []\n            batch_input_tokens_atts = []\n            batch_atts_t5 = []\n            batch_inputs_t5 = []\n            batch_num_feat = []\n            for b, n in enumerate(samples[\"n_answers\"]):\n                batch_input_tokens_input_ids += [input_tokens.input_ids[b]] * n\n                batch_input_tokens_atts += [input_tokens.attention_mask[b]] * n\n                batch_atts_t5 += [atts_t5[b]] * n\n                batch_inputs_t5 += [inputs_t5[b]] * n\n                batch_num_feat += [num_feat[b]] * n\n\n            batch_input_tokens_input_ids = torch.stack(batch_input_tokens_input_ids, dim=0)  # (B, L_input)\n            batch_input_tokens_atts = torch.stack(batch_input_tokens_atts, dim=0)  # (B, L_input)\n            batch_atts_t5 = torch.stack(batch_atts_t5, dim=0)  # (B, T, 32)\n            batch_inputs_t5 = torch.stack(batch_inputs_t5, dim=0)  # (B, T, 32, 2048)\n\n            inputs_embeds, encoder_atts = self.insert_3d_feats(\n                batch_input_tokens_input_ids, batch_input_tokens_atts, batch_atts_t5, batch_inputs_t5, batch_num_feat\n            )\n\n            targets = output_tokens.input_ids.masked_fill(\n                output_tokens.input_ids == self.t5_tokenizer.pad_token_id, -100\n            )\n            outputs = self.t5_model(\n                inputs_embeds=inputs_embeds,\n                attention_mask=encoder_atts,\n                decoder_attention_mask=output_tokens.attention_mask,\n                return_dict=True,\n                labels=targets,\n            )\n\n            loss = outputs.loss\n            return {\"loss\": loss}",
+          "source_start_line": 200,
+          "file_path": "lavis/models/blip2_models/blip2_t5.py",
+          "annotations": [
+            {
+              "start_line": 201,
+              "end_line": 206,
+              "explanation": "Point cloud inputs arrive as pc_feat (semantic features from a pretrained 3D encoder, shape B×T×N×1408) and pc (raw integer coordinates, shape B×T×N×3). T is the number of temporal observations, N is the number of points per cloud. prepare_inputs runs the positional encoding + Q-Former pipeline.",
+              "concept_tag": "other:scene-grounding"
+            },
+            {
+              "start_line": 238,
+              "end_line": 252,
+              "explanation": "Multi-answer expansion: each example may have n_answers correct responses. The inputs are duplicated n times — one copy per answer — so the model trains on all valid (input, answer) pairs. After stacking, insert_3d_feats injects 3D features into the expanded batch.",
+              "concept_tag": "other:training"
+            },
+            {
+              "start_line": 254,
+              "end_line": 266,
+              "explanation": "Standard T5 seq2seq loss. Padding tokens in the target are masked to -100 (PyTorch's ignore_index). The model sees the input embeddings (text + injected 3D tokens) via the encoder, and is trained to autoregressively predict the target tokens (text answers or action token sequences) via the decoder.",
+              "concept_tag": "loss"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "goal-image-diffusion",
+      "title": "Dreaming Goal Images: InstructPix2Pix for Visual Imagination",
+      "narrative": "The world model component begins with goal image generation: given the current observation and a language instruction, generate an image of what the scene should look like after the task succeeds. This is the \"imagination\" capability — the robot dreams the future before acting.\n\n3D-VLA uses a fine-tuned Stable Diffusion model in the InstructPix2Pix style. The standard InstructPix2Pix setup takes a source image and an edit instruction and produces an edited version. Here, the source image is the current robot observation and the instruction is the task goal (\"pick up the red cup\"), and the model generates the target scene.\n\nThe key modification from standard image diffusion: the UNet's first convolution layer is expanded from 4 input channels to 8 (or 16 with depth). The extra channels carry the current observation image, encoded through the VAE to a latent and concatenated with the noisy goal latent. This conditioning mechanism lets the model see both the current state and the text instruction simultaneously, enabling it to hallucinate a geometrically consistent target scene.\n\nClassifier-free guidance is supported via conditioning dropout during training: both text and image conditioning are randomly masked to zero with a small probability, forcing the model to learn unconditional generation. At inference time, the guidance scale controls how strongly the generated goal adheres to the instruction.",
+      "code_blocks": [
+        {
+          "label": "InstructPix2Pix-style goal image diffusion training loop",
+          "source": "                latents = latents * vae.config.scaling_factor\n\n                # Sample noise that we'll add to the latents\n                noise = torch.randn_like(latents)\n                bsz = latents.shape[0]\n                # Sample a random timestep for each image\n                timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (bsz,), device=latents.device)\n                timesteps = timesteps.long()\n\n                # Add noise to the latents according to the noise magnitude at each timestep\n                # (this is the forward diffusion process)\n                noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)\n\n                # Get the text embedding for conditioning.\n                encoder_hidden_states = text_encoder(batch[\"input_ids\"])[0]\n\n                # Get the additional image embedding for conditioning.\n                # Instead of getting a diagonal Gaussian here, we simply take the mode.\n                if args.include_depth:\n                    rgb, d = torch.split(batch[\"original_pixel_values\"].to(weight_dtype), 3, dim=1)\n                    original_image_embeds_rgb = vae.encode(rgb).latent_dist.mode()\n                    original_image_embeds_d = vae.encode(d).latent_dist.mode()\n                    original_image_embeds = torch.cat([original_image_embeds_rgb, original_image_embeds_d], dim=1)\n                else:\n                    original_image_embeds = vae.encode(\n                        batch[\"original_pixel_values\"].to(weight_dtype)\n                    ).latent_dist.mode()\n\n                # Conditioning dropout to support classifier-free guidance during inference. For more details\n                # check out the section 3.2.1 of the original paper https://arxiv.org/abs/2211.09800.\n                if args.conditioning_dropout_prob is not None:\n                    random_p = torch.rand(bsz, device=latents.device, generator=generator)\n                    # Sample masks for the edit prompts.\n                    prompt_mask = random_p < 2 * args.conditioning_dropout_prob\n                    prompt_mask = prompt_mask.reshape(bsz, 1, 1)\n                    # Final text conditioning.\n                    null_conditioning = text_encoder(tokenize_captions([\"\"]).to(accelerator.device))[0]\n                    encoder_hidden_states = torch.where(prompt_mask, null_conditioning, encoder_hidden_states)\n\n                    # Sample masks for the original images.\n                    image_mask_dtype = original_image_embeds.dtype\n                    image_mask = 1 - (\n                        (random_p >= args.conditioning_dropout_prob).to(image_mask_dtype)\n                        * (random_p < 3 * args.conditioning_dropout_prob).to(image_mask_dtype)\n                    )\n                    image_mask = image_mask.reshape(bsz, 1, 1, 1)\n                    # Final image conditioning.\n                    original_image_embeds = image_mask * original_image_embeds\n\n                # Concatenate the `original_image_embeds` with the `noisy_latents`.\n                concatenated_noisy_latents = torch.cat([noisy_latents, original_image_embeds], dim=1)\n\n                # Get the target for loss depending on the prediction type\n                if noise_scheduler.config.prediction_type == \"epsilon\":\n                    target = noise\n                elif noise_scheduler.config.prediction_type == \"v_prediction\":\n                    target = noise_scheduler.get_velocity(latents, noise, timesteps)\n                else:\n                    raise ValueError(f\"Unknown prediction type {noise_scheduler.config.prediction_type}\")\n\n                # Predict the noise residual and compute loss\n                model_pred = unet(concatenated_noisy_latents, timesteps, encoder_hidden_states).sample\n                loss = F.mse_loss(model_pred.float(), target.float(), reduction=\"mean\")",
+          "source_start_line": 756,
+          "file_path": "train_ldm_goal_image.py",
+          "annotations": [
+            {
+              "start_line": 756,
+              "end_line": 767,
+              "explanation": "Standard DDPM forward process: the goal image is encoded to a latent by the VAE (scaled by the VAE scaling factor), then noise is added at a randomly sampled diffusion timestep. The model learns to reverse this process — i.e., to denoise the goal image latent from the noisy version.",
+              "concept_tag": "other:diffusion"
+            },
+            {
+              "start_line": 769,
+              "end_line": 770,
+              "explanation": "The CLIP text encoder converts the task instruction into a conditioning vector (cross-attention key/value in the UNet). This is the language guidance signal — the model learns to generate goal images consistent with the instruction.",
+              "concept_tag": "embedding"
+            },
+            {
+              "start_line": 779,
+              "end_line": 782,
+              "explanation": "The current observation is encoded through the VAE and used as an additional conditioning signal. Using .mode() instead of .sample() avoids adding stochastic noise to the conditioning image — we want a deterministic representation of what the scene looks like right now.",
+              "concept_tag": "other:diffusion"
+            },
+            {
+              "start_line": 805,
+              "end_line": 806,
+              "explanation": "InstructPix2Pix's key trick: concatenate the noisy goal latent with the current image latent along the channel dimension. The UNet input is now 8 channels (4 from the noisy target + 4 from the current observation), allowing the model to directly compare current and desired states.",
+              "concept_tag": "other:diffusion"
+            },
+            {
+              "start_line": 817,
+              "end_line": 818,
+              "explanation": "The UNet predicts the noise residual (epsilon prediction) given the concatenated 8-channel latent, the timestep, and the text conditioning. MSE loss against the actual noise drives learning. At inference, this iterative denoising produces the goal image.",
+              "concept_tag": "loss"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "goal-pcd-diffusion",
+      "title": "Dreaming Goal Point Clouds: 3D Future State Prediction",
+      "narrative": "The goal image captures appearance, but not geometry. The second world model component generates the goal point cloud: the 3D structure of the scene after task completion. This is harder than image generation because point clouds are unordered sets in continuous 3D space, not regular grids.\n\n3D-VLA adapts Point-E, OpenAI's point cloud diffusion model, for this task. Point-E uses a transformer-based DDPM over sets of 3D points. The architecture (called `GoalPointDiffusionTransformer`) takes a noisy target point cloud and a CLIP text embedding as input, and predicts the denoising residual.\n\nThe critical adaptation is `modify_layer()`: Point-E's original model processes 3D points (xyz, 3 channels). For goal prediction, the model needs to take the concatenation of the noisy goal point cloud (6 channels: xyz+rgb) and the input point cloud (6 channels: xyz+rgb of the current scene), giving 12 input channels total. The output similarly expands to 6 channels. The `modify_layer` method surgically replaces the first and last linear layers with larger versions, copying the pretrained weights into the first 3 or 6 channel slots and zeroing the rest — a careful weight initialization that preserves pretrained knowledge while extending to the new channel count.\n\nDuring training, the DDPM noise scheduler adds noise to the target point cloud (the scene after the task), while the input point cloud (the scene before the task) is concatenated as conditioning. This forces the model to learn the 3D transformation between initial and goal states, conditioned on the text instruction.",
+      "code_blocks": [
+        {
+          "label": "GoalPointDiffusionTransformer: surgically expanding Point-E's input/output layers",
+          "source": "    def modify_layer(self):\n        device = self.input_proj.weight.device\n        dtype = self.input_proj.weight.dtype\n        with torch.no_grad():\n            new_linear_in = nn.Linear(12, self.input_proj.out_features, bias=True, device=device, dtype=dtype)\n            new_linear_in.weight.zero_()\n            new_linear_in.weight[:, :6].copy_(self.input_proj.weight)\n            self.input_proj = new_linear_in\n\n            new_linear_out = nn.Linear(self.output_proj.in_features, 6, bias=True, device=device, dtype=dtype)\n            new_linear_out.weight.zero_()\n            new_linear_out.weight.copy_(self.output_proj.weight[:6])\n            self.output_proj = new_linear_out",
+          "source_start_line": 693,
+          "file_path": "lavis/models/pointe/transformer.py",
+          "annotations": [
+            {
+              "start_line": 697,
+              "end_line": 700,
+              "explanation": "Expand input from 3→12 channels to accept [noisy goal xyz+rgb (6) | current scene xyz+rgb (6)]. Pretrained weights (for 3D xyz) are copied into the first 6 slots; the extra 6 channels start at zero — so the model initially ignores conditioning before learning to use it.",
+              "concept_tag": "linear"
+            },
+            {
+              "start_line": 702,
+              "end_line": 705,
+              "explanation": "Expand output from 3→6 channels to predict noise residuals for both xyz and rgb of the goal point cloud. Only the first 6 rows of the pretrained output weights are retained (for xyz prediction), extended to predict rgb noise as well.",
+              "concept_tag": "linear"
+            }
+          ]
+        },
+        {
+          "label": "DDPM training loop for goal point cloud generation",
+          "source": "        model.train()\n        for step, batch in enumerate(train_dataloader):\n            pointcloud = batch[\"start_pc\"].type(torch.float32).permute(0, 2, 1)  # [-1,1]\n            target = batch[\"end_pc\"].type(torch.float32).permute(0, 2, 1)  # [-1,1]\n\n            # Sample noise to add to the images\n            noise = torch.randn(pointcloud.shape, device=pointcloud.device)\n            bs = pointcloud.shape[0]\n\n            text = batch[\"instruction\"]\n\n            # Sample a random timestep for each image\n            timesteps = torch.randint(\n                0, noise_scheduler.config.num_train_timesteps, (bs,), device=pointcloud.device, dtype=torch.int64\n            )\n\n            # Add noise to the clean images according to the noise magnitude at each timestep\n            # (this is the forward diffusion process)\n            noisy_pointcloud = noise_scheduler.add_noise(target, noise, timesteps)\n            noisy_pointcloud = torch.cat([noisy_pointcloud, pointcloud], dim=1)\n\n            with accelerator.accumulate(model):\n                # Predict the noise residual\n                noise_pred = model(noisy_pointcloud, timesteps, pointcloud, texts=text)\n                loss = F.mse_loss(noise_pred, noise)\n                accelerator.backward(loss)",
+          "source_start_line": 87,
+          "file_path": "train_pe_goal_pcd.py",
+          "annotations": [
+            {
+              "start_line": 89,
+              "end_line": 90,
+              "explanation": "start_pc is the initial point cloud (before the task), end_pc is the target state (after the task). Both are loaded from the RLBench dataset as arrays of xyz+rgb points, normalized to the [-1, 1] range.",
+              "concept_tag": "other:diffusion"
+            },
+            {
+              "start_line": 105,
+              "end_line": 106,
+              "explanation": "DDPM forward process: noise is added to the goal point cloud at a random timestep. The noisy goal is then concatenated with the clean input point cloud along the channel dimension — yielding 12-channel input that the model uses to denoise the goal while conditioning on the current state.",
+              "concept_tag": "other:diffusion"
+            },
+            {
+              "start_line": 110,
+              "end_line": 111,
+              "explanation": "The model predicts the noise residual, conditioned on the timestep (via sinusoidal embedding) and the text instruction (via CLIP). MSE between predicted and actual noise is the standard DDPM training objective.",
+              "concept_tag": "loss"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "putting-it-together",
+      "title": "Putting It All Together: Perceive, Imagine, Act",
+      "narrative": "3D-VLA composes three separately trained models at inference time: the 3D-grounded T5 LLM, the goal image diffusion model, and the goal point cloud diffusion model.\n\nThe inference pipeline runs in sequence. First, the robot observes the current scene: an RGB-D camera provides an image and a depth map, from which a point cloud is reconstructed. The Q-Former encodes the point cloud into 32 tokens and injects them into the T5 encoder. The LLM can now answer 3D spatial questions, generate grounded descriptions, and predict action token sequences.\n\nFor complex manipulation tasks, the world model runs before action generation. The goal image diffusion model takes the current observation and the task instruction and generates what the goal scene should look like. The goal point cloud diffusion model similarly generates the 3D goal geometry. These imagined future states serve as additional conditioning for action generation — the robot commits to a plan by first articulating the desired end state.\n\nThe three-stage training matches this inference cascade. Stage 1 trains the 3D Q-Former + T5 on large-scale 3D question answering datasets (3D scene understanding, grounding). Stage 2 trains the goal image and point cloud diffusion models on robot trajectory data. Stage 3 fine-tunes the full system end-to-end on action prediction, conditioning on both the 3D observations and the generated goals.\n\nWhat makes 3D-VLA's approach principled: the same Q-Former that grounds spatial reasoning also grounds action generation. The vocabulary trick — encoding actions as special tokens — means the language model's 3D understanding directly informs its action predictions. When the model sees `<scene>` tokens encoding \"cup at (42, 87, 23)\", those spatial tokens flow through the same T5 attention layers that generate `<aloc42>` action tokens. 3D understanding and 3D acting are unified in a single token prediction objective.",
+      "code_blocks": [
+        {
+          "label": "GoalPointDiffusionTransformer forward: text-conditioned 3D denoising",
+          "source": "    def forward(\n        self,\n        x: torch.Tensor,\n        t: torch.Tensor,\n        input_pointcloud: torch.Tensor,\n        images: Optional[Iterable[Optional[ImageType]]] = None,\n        texts: Optional[Iterable[Optional[str]]] = None,\n        embeddings: Optional[Iterable[Optional[torch.Tensor]]] = None,\n    ):\n        \"\"\"\n        :param x: an [N x C x T] tensor.\n        :param t: an [N] tensor.\n        :param images: a batch of images to condition on.\n        :param texts: a batch of texts to condition on.\n        :param embeddings: a batch of CLIP embeddings to condition on.\n        :return: an [N x C' x T] tensor.\n        \"\"\"\n        # assert x.shape[-1] == self.n_ctx\n        t_embed = self.time_embed(timestep_embedding(t, self.backbone.width))\n        clip_out = self.clip(batch_size=len(x), images=images, texts=texts, embeddings=embeddings)\n        assert len(clip_out.shape) == 2 and clip_out.shape[0] == x.shape[0]\n\n        if self.training:\n            mask = torch.rand(size=[len(x)]) >= self.cond_drop_prob\n            clip_out = clip_out * mask[:, None].to(clip_out)\n\n        # Rescale the features to have unit variance\n        clip_out = math.sqrt(clip_out.shape[1]) * clip_out\n\n        clip_embed = self.clip_embed(clip_out)\n\n        input_pointcloud = input_pointcloud.permute(0, 2, 1)\n        cond = [(clip_embed, self.token_cond), (t_embed, self.time_token_cond)]\n        return self._forward_with_cond(x, cond)",
+          "source_start_line": 658,
+          "file_path": "lavis/models/pointe/transformer.py",
+          "annotations": [
+            {
+              "start_line": 676,
+              "end_line": 677,
+              "explanation": "Two conditioning signals are computed: a sinusoidal time embedding (encodes the diffusion timestep — how noisy the input is) and a CLIP embedding of the text instruction (encodes the task goal). Both will be injected into the transformer backbone.",
+              "concept_tag": "embedding"
+            },
+            {
+              "start_line": 680,
+              "end_line": 682,
+              "explanation": "Classifier-free guidance dropout: during training, the CLIP conditioning is randomly zeroed out with probability cond_drop_prob. This forces the model to also learn unconditional generation, enabling guidance scale control at inference time.",
+              "concept_tag": "dropout"
+            },
+            {
+              "start_line": 685,
+              "end_line": 691,
+              "explanation": "CLIP features are rescaled to unit variance (multiplied by sqrt of feature dim), then projected to the transformer width. Both conditioning vectors are passed as (embedding, as_token) tuples: if as_token=True, the embedding is prepended as an extra sequence token; if False, it is added directly to all sequence positions.",
+              "concept_tag": "attention"
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "summary": "3D-VLA extends the vision-language-action model paradigm into 3D space by grounding FlanT5 in point cloud representations via a BLIP-2 Q-Former, and augmenting it with a generative world model. The Q-Former compresses N point cloud tokens into 32 fixed-size queries, which are injected into T5's token stream at <scene> placeholder positions — allowing the LLM to attend to 3D geometry through standard self-attention. Robot actions are represented as discrete special tokens (position bins, rotation bins, gripper state), enabling action generation as ordinary language modeling. Two separate diffusion models — an InstructPix2Pix-style Stable Diffusion for goal images and a Point-E-based transformer for goal point clouds — enable the robot to imagine the desired future state before acting. This 'perceive, imagine, act' pipeline is trained in three stages and evaluated on the RLBench manipulation benchmark, where 3D grounding and world model imagination provide significant gains over 2D-only baselines."
+}

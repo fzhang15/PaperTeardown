@@ -1,0 +1,12 @@
+{
+  "id": "3d-vla",
+  "title": "3D-VLA: A 3D Vision-Language-Action Generative World Model",
+  "authors": ["Haoyu Zhen", "Xiaowen Qiu", "Peihao Chen", "Jincheng Yang", "Xin Yan", "Yilun Du", "Yining Hong", "Chuang Gan"],
+  "arxiv_url": "https://arxiv.org/abs/2403.09631",
+  "repo_url": "https://github.com/UMass-Embodied-AGI/3D-VLA",
+  "abstract": "3D-VLA is a generative world model for embodied AI that grounds language and action generation in 3D scene understanding. It uses a BLIP-2 Q-Former to compress point cloud observations into 32 language-sized tokens, which are spliced into FlanT5's token stream via <scene> placeholder markers. Robot actions are discretized into special vocabulary tokens, enabling action prediction as standard language modeling. A generative world model component imagines goal states before acting: an InstructPix2Pix-style Stable Diffusion model generates goal images, and a Point-E-based transformer generates goal point clouds. This 'perceive, imagine, act' pipeline is evaluated on RLBench manipulation tasks and 3D scene understanding benchmarks.",
+  "introduction_excerpt": "In this work, we introduce 3D-VLA, a 3D vision-language-action generative world model that connects 3D perception, reasoning, and action in a unified framework. Given 3D observations and language instructions, 3D-VLA first imagines the goal state in both image and 3D point cloud forms, then generates robot actions to achieve that goal.",
+  "module_count": 6,
+  "pytorch_file_count": 8,
+  "ingested_at": "2026-04-01T00:00:00Z"
+}
