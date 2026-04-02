@@ -1,0 +1,358 @@
+{
+  "chapters": [
+    {
+      "id": "problem",
+      "title": "What Problem Does This Solve?",
+      "narrative": "Before ViT, computer vision was dominated by convolutional neural networks (CNNs). ResNets, EfficientNets, and their variants were the backbone of nearly every vision system. Meanwhile, Transformers had revolutionized NLP — BERT, GPT, and their descendants showed that self-attention on sequences of tokens could learn incredibly powerful representations.\n\nThe natural question was: can we do the same for images? Previous attempts to apply Transformers to vision either used attention only locally (within small windows) or combined attention with convolutions. These hybrid approaches never fully replaced convolutions — they just augmented them.\n\nViT asks a radical question: what if we throw away convolutions entirely and treat an image as a sequence of patches, exactly like a Transformer treats a sentence as a sequence of words? The answer turns out to be: if you have enough data, a pure Transformer matches or beats the best CNNs. This simple insight — that images are just sequences of patches — became the foundation for virtually all modern vision architectures, from DINOv3 to the vision encoders inside robot foundation models like RT-2 and π0.",
+      "code_blocks": []
+    },
+    {
+      "id": "patch-embedding",
+      "title": "Patch Embedding: An Image Is a Sequence of Patches",
+      "narrative": "The core insight of ViT is deceptively simple: split an image into fixed-size patches (e.g., 16×16 pixels), flatten each patch into a vector, and linearly project it into the Transformer's hidden dimension. This converts a 2D image into a 1D sequence of \"patch tokens\" — exactly the format a Transformer expects.\n\nThe implementation is elegant: a single convolution with kernel size and stride both equal to the patch size. For a 224×224 image with 16×16 patches, this produces a 14×14 grid of embeddings (196 tokens). The convolution simultaneously extracts the patch and projects it to the hidden dimension — splitting and linear projection in one operation.\n\nThe resulting grid is then reshaped into a flat sequence of tokens. No pooling, no multi-scale feature pyramids, no fancy spatial processing — just a direct conversion from pixel grid to token sequence.",
+      "code_blocks": [
+        {
+          "label": "Patch embedding via Conv in VisionTransformer.__call__",
+          "source": "    n, h, w, c = x.shape\n\n    # We can merge s2d+emb into a single conv; it's the same.\n    x = nn.Conv(\n        features=self.hidden_size,\n        kernel_size=self.patches.size,\n        strides=self.patches.size,\n        padding='VALID',\n        name='embedding')(\n            x)\n\n    # Here, x is a grid of embeddings.",
+          "source_start_line": 261,
+          "file_path": "vit_jax/models_vit.py",
+          "annotations": [
+            {
+              "start_line": 264,
+              "end_line": 270,
+              "explanation": "A Conv layer with kernel_size = stride = patch_size (e.g. 16×16). This simultaneously splits the image into non-overlapping patches and linearly projects each patch into the hidden dimension. The comment 's2d+emb' refers to 'space-to-depth + embedding' — the convolution does both in one step.",
+              "concept_tag": "embedding"
+            },
+            {
+              "start_line": 261,
+              "end_line": 261,
+              "explanation": "Input shape is (batch, height, width, channels) — a standard image tensor. After the conv, x becomes (batch, H/patch, W/patch, hidden_size) — a grid of patch embeddings.",
+              "concept_tag": "embedding"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "cls-token-and-position",
+      "title": "CLS Token and Positional Embeddings",
+      "narrative": "Once the image is a sequence of patch tokens, two things are missing: (1) a way to aggregate information across all patches for classification, and (2) spatial position information — since self-attention is permutation-equivariant, the Transformer doesn't inherently know where each patch came from.\n\nViT solves both problems with ideas borrowed directly from BERT. A learnable [CLS] token is prepended to the sequence. After passing through the Transformer, this token's output serves as the image representation for classification. Learned 1D positional embeddings are added to all tokens (CLS + patches) to encode spatial information.\n\nNotably, ViT uses 1D positional embeddings, not 2D — the model learns that token 1 is top-left and token 196 is bottom-right purely from data. The authors found that 2D-aware positional embeddings gave no significant improvement, suggesting the model discovers the 2D structure on its own.",
+      "code_blocks": [
+        {
+          "label": "CLS token prepended to patch sequence",
+          "source": "      n, h, w, c = x.shape\n      x = jnp.reshape(x, [n, h * w, c])\n\n      # If we want to add a class token, add it here.\n      if self.classifier in ['token', 'token_unpooled']:\n        cls = self.param('cls', nn.initializers.zeros, (1, 1, c))\n        cls = jnp.tile(cls, [n, 1, 1])\n        x = jnp.concatenate([cls, x], axis=1)",
+          "source_start_line": 276,
+          "file_path": "vit_jax/models_vit.py",
+          "annotations": [
+            {
+              "start_line": 277,
+              "end_line": 277,
+              "explanation": "Flatten the 2D grid of patch embeddings (H/P × W/P) into a 1D sequence of length H*W/P². For a 224×224 image with 16×16 patches, this is 14*14 = 196 tokens.",
+              "concept_tag": "embedding"
+            },
+            {
+              "start_line": 281,
+              "end_line": 282,
+              "explanation": "The CLS token is a single learnable vector (initialized to zeros) with the same dimension as patch embeddings. It's tiled across the batch dimension so every sample gets its own copy.",
+              "concept_tag": "embedding"
+            },
+            {
+              "start_line": 283,
+              "end_line": 283,
+              "explanation": "The CLS token is prepended to position 0 of the sequence. After the Transformer, x[:, 0] extracts this token as the global image representation. The sequence is now length 197 (1 CLS + 196 patches).",
+              "concept_tag": "embedding"
+            }
+          ]
+        },
+        {
+          "label": "Learned positional embeddings added to token sequence",
+          "source": "class AddPositionEmbs(nn.Module):\n  \"\"\"Adds learned positional embeddings to the inputs.\n\n  Attributes:\n    posemb_init: positional embedding initializer.\n  \"\"\"\n\n  posemb_init: Callable[[PRNGKey, Shape, Dtype], Array]\n  param_dtype: Dtype = jnp.float32\n\n  @nn.compact\n  def __call__(self, inputs):\n    \"\"\"Applies the AddPositionEmbs module.\n\n    Args:\n      inputs: Inputs to the layer.\n\n    Returns:\n      Output tensor with shape `(bs, timesteps, in_dim)`.\n    \"\"\"\n    # inputs.shape is (batch_size, seq_len, emb_dim).\n    assert inputs.ndim == 3, ('Number of dimensions should be 3,'\n                              ' but it is: %d' % inputs.ndim)\n    pos_emb_shape = (1, inputs.shape[1], inputs.shape[2])\n    pe = self.param(\n        'pos_embedding', self.posemb_init, pos_emb_shape, self.param_dtype)\n    return inputs + pe",
+          "source_start_line": 37,
+          "file_path": "vit_jax/models_vit.py",
+          "annotations": [
+            {
+              "start_line": 60,
+              "end_line": 62,
+              "explanation": "The positional embedding is a single learnable parameter of shape (1, seq_len, emb_dim). The leading 1 broadcasts across the batch. For ViT-B/16 on 224×224 images, seq_len = 197 (196 patches + 1 CLS token).",
+              "concept_tag": "embedding"
+            },
+            {
+              "start_line": 63,
+              "end_line": 63,
+              "explanation": "Positional embeddings are simply added to the token embeddings — same as BERT. The model learns that position 0 is the CLS token, position 1 is the top-left patch, position 196 is the bottom-right patch, etc.",
+              "concept_tag": "embedding"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "encoder-block",
+      "title": "The Transformer Encoder Block",
+      "narrative": "Each Transformer encoder block in ViT follows the standard pre-norm architecture: LayerNorm → Multi-Head Self-Attention → residual connection → LayerNorm → MLP → residual connection. This is the Pre-LN variant (as opposed to Post-LN in the original Transformer), which is more stable during training.\n\nThe self-attention mechanism is the workhorse. Each patch token attends to every other patch token (and the CLS token), allowing information to flow across the entire image in a single layer. This is fundamentally different from CNNs, where information propagates locally and needs many layers to cover the full image.\n\nThe block structure is remarkably clean — there are no convolutional layers, no fancy gating mechanisms, no squeeze-and-excitation blocks. Just attention and MLPs, applied identically to every token in the sequence.",
+      "code_blocks": [
+        {
+          "label": "Encoder1DBlock: one Transformer layer",
+          "source": "class Encoder1DBlock(nn.Module):\n  \"\"\"Transformer encoder layer.\n\n  Attributes:\n    inputs: input data.\n    mlp_dim: dimension of the mlp on top of attention block.\n    dtype: the dtype of the computation (default: float32).\n    dropout_rate: dropout rate.\n    attention_dropout_rate: dropout for attention heads.\n    deterministic: bool, deterministic or not (to apply dropout).\n    num_heads: Number of heads in nn.MultiHeadDotProductAttention\n  \"\"\"\n\n  mlp_dim: int\n  num_heads: int\n  dtype: Dtype = jnp.float32\n  dropout_rate: float = 0.1\n  attention_dropout_rate: float = 0.1\n\n  @nn.compact\n  def __call__(self, inputs, *, deterministic):\n    \"\"\"Applies Encoder1DBlock module.\n\n    Args:\n      inputs: Inputs to the layer.\n      deterministic: Dropout will not be applied when set to true.\n\n    Returns:\n      output after transformer encoder block.\n    \"\"\"\n\n    # Attention block.\n    assert inputs.ndim == 3, f'Expected (batch, seq, hidden) got {inputs.shape}'\n    x = nn.LayerNorm(dtype=self.dtype)(inputs)\n    x = nn.MultiHeadDotProductAttention(\n        dtype=self.dtype,\n        kernel_init=nn.initializers.xavier_uniform(),\n        broadcast_dropout=False,\n        deterministic=deterministic,\n        dropout_rate=self.attention_dropout_rate,\n        num_heads=self.num_heads)(\n            x, x)\n    x = nn.Dropout(rate=self.dropout_rate)(x, deterministic=deterministic)\n    x = x + inputs\n\n    # MLP block.\n    y = nn.LayerNorm(dtype=self.dtype)(x)\n    y = MlpBlock(\n        mlp_dim=self.mlp_dim, dtype=self.dtype, dropout_rate=self.dropout_rate)(\n            y, deterministic=deterministic)\n\n    return x + y",
+          "source_start_line": 105,
+          "file_path": "vit_jax/models_vit.py",
+          "annotations": [
+            {
+              "start_line": 138,
+              "end_line": 138,
+              "explanation": "Pre-norm design: LayerNorm is applied BEFORE attention (not after). This is the Pre-LN Transformer variant, which gives more stable gradients during training compared to the original Post-LN Transformer.",
+              "concept_tag": "normalization"
+            },
+            {
+              "start_line": 139,
+              "end_line": 146,
+              "explanation": "Standard multi-head self-attention. The two arguments (x, x) mean this is self-attention: queries, keys, and values all come from the same input. Every patch token attends to every other token — no locality constraint, no windowing.",
+              "concept_tag": "attention"
+            },
+            {
+              "start_line": 148,
+              "end_line": 148,
+              "explanation": "Residual connection: add the attention output back to the original input. This creates a skip path that helps gradients flow through deep networks.",
+              "concept_tag": "residual"
+            },
+            {
+              "start_line": 151,
+              "end_line": 154,
+              "explanation": "Second sub-layer: LayerNorm → MLP. The MLP processes each token independently (no cross-token interaction), while attention handled the cross-token mixing.",
+              "concept_tag": "linear"
+            },
+            {
+              "start_line": 156,
+              "end_line": 156,
+              "explanation": "Second residual connection. The block's output is: input + attention(input) + mlp(input + attention(input)). Both sub-layers have their own skip connections.",
+              "concept_tag": "residual"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "mlp-block",
+      "title": "The MLP Block: Per-Token Feature Mixing",
+      "narrative": "The MLP block inside each Transformer layer is a simple two-layer feed-forward network: project up to a larger dimension (typically 4× the hidden size), apply GELU activation, then project back down. This is applied independently to each token.\n\nWhile attention handles mixing information between tokens (spatial mixing), the MLP handles mixing information within each token's feature dimensions (channel mixing). Together, they form the two fundamental operations of the Transformer: attend across positions, then process each position.\n\nThe expansion ratio is a key design choice. ViT-Base has hidden_size=768 and mlp_dim=3072 (4× expansion). This bottleneck-then-expand pattern gives the network more capacity to transform features without permanently increasing the token dimension.",
+      "code_blocks": [
+        {
+          "label": "MlpBlock: two-layer feed-forward network with GELU",
+          "source": "class MlpBlock(nn.Module):\n  \"\"\"Transformer MLP / feed-forward block.\"\"\"\n\n  mlp_dim: int\n  dtype: Dtype = jnp.float32\n  param_dtype: Dtype = jnp.float32\n  out_dim: Optional[int] = None\n  dropout_rate: float = 0.1\n  kernel_init: Callable[[PRNGKey, Shape, Dtype],\n                        Array] = nn.initializers.xavier_uniform()\n  bias_init: Callable[[PRNGKey, Shape, Dtype],\n                      Array] = nn.initializers.normal(stddev=1e-6)\n\n  @nn.compact\n  def __call__(self, inputs, *, deterministic):\n    \"\"\"Applies Transformer MlpBlock module.\"\"\"\n    actual_out_dim = inputs.shape[-1] if self.out_dim is None else self.out_dim\n    x = nn.Dense(\n        features=self.mlp_dim,\n        dtype=self.dtype,\n        param_dtype=self.param_dtype,\n        kernel_init=self.kernel_init,\n        bias_init=self.bias_init)(  # pytype: disable=wrong-arg-types\n            inputs)\n    x = nn.gelu(x)\n    x = nn.Dropout(rate=self.dropout_rate)(x, deterministic=deterministic)\n    output = nn.Dense(\n        features=actual_out_dim,\n        dtype=self.dtype,\n        param_dtype=self.param_dtype,\n        kernel_init=self.kernel_init,\n        bias_init=self.bias_init)(  # pytype: disable=wrong-arg-types\n            x)\n    output = nn.Dropout(\n        rate=self.dropout_rate)(\n            output, deterministic=deterministic)\n    return output",
+          "source_start_line": 66,
+          "file_path": "vit_jax/models_vit.py",
+          "annotations": [
+            {
+              "start_line": 83,
+              "end_line": 89,
+              "explanation": "First linear layer projects from hidden_size up to mlp_dim (e.g., 768 → 3072). This 4× expansion gives the network a wider feature space to work in before compressing back down.",
+              "concept_tag": "linear"
+            },
+            {
+              "start_line": 90,
+              "end_line": 90,
+              "explanation": "GELU activation — the standard non-linearity in Transformer MLPs. GELU is smoother than ReLU and slightly outperforms it in practice. It was popularized by BERT and adopted by ViT.",
+              "concept_tag": "activation"
+            },
+            {
+              "start_line": 92,
+              "end_line": 98,
+              "explanation": "Second linear layer projects back to the original dimension (3072 → 768). The expand-then-compress pattern gives the network more representational capacity without increasing the residual stream width.",
+              "concept_tag": "linear"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "encoder-stack",
+      "title": "The Full Encoder: Stacking Transformer Blocks",
+      "narrative": "The Encoder module stacks N identical Transformer blocks (Encoder1DBlock) sequentially. ViT-Base uses 12 blocks, ViT-Large uses 24, and ViT-Huge uses 32. The sequence is bookended by positional embedding addition at the start and a final LayerNorm at the end.\n\nThe architecture is remarkably uniform — every layer has the same structure, the same dimensions, the same number of heads. There are no multi-scale stages, no downsampling between layers, no progressively growing channel dimensions. This uniformity is a deliberate choice: it makes the model simple and lets scaling laws guide architecture decisions rather than manual design.",
+      "code_blocks": [
+        {
+          "label": "Encoder: the full Transformer encoder stack",
+          "source": "class Encoder(nn.Module):\n  \"\"\"Transformer Model Encoder for sequence to sequence translation.\n\n  Attributes:\n    num_layers: number of layers\n    mlp_dim: dimension of the mlp on top of attention block\n    num_heads: Number of heads in nn.MultiHeadDotProductAttention\n    dropout_rate: dropout rate.\n    attention_dropout_rate: dropout rate in self attention.\n  \"\"\"\n\n  num_layers: int\n  mlp_dim: int\n  num_heads: int\n  dropout_rate: float = 0.1\n  attention_dropout_rate: float = 0.1\n  add_position_embedding: bool = True\n\n  @nn.compact\n  def __call__(self, x, *, train):\n    \"\"\"Applies Transformer model on the inputs.\n\n    Args:\n      x: Inputs to the layer.\n      train: Set to `True` when training.\n\n    Returns:\n      output of a transformer encoder.\n    \"\"\"\n    assert x.ndim == 3  # (batch, len, emb)\n\n    if self.add_position_embedding:\n      x = AddPositionEmbs(\n          posemb_init=nn.initializers.normal(stddev=0.02),  # from BERT.\n          name='posembed_input')(\n              x)\n      x = nn.Dropout(rate=self.dropout_rate)(x, deterministic=not train)\n\n    # Input Encoder\n    for lyr in range(self.num_layers):\n      x = Encoder1DBlock(\n          mlp_dim=self.mlp_dim,\n          dropout_rate=self.dropout_rate,\n          attention_dropout_rate=self.attention_dropout_rate,\n          name=f'encoderblock_{lyr}',\n          num_heads=self.num_heads)(\n              x, deterministic=not train)\n    encoded = nn.LayerNorm(name='encoder_norm')(x)\n\n    return encoded",
+          "source_start_line": 159,
+          "file_path": "vit_jax/models_vit.py",
+          "annotations": [
+            {
+              "start_line": 191,
+              "end_line": 195,
+              "explanation": "Positional embeddings are added once at the entrance to the Transformer, initialized with small Gaussian noise (σ=0.02, borrowed from BERT). Dropout is applied after position encoding during training.",
+              "concept_tag": "embedding"
+            },
+            {
+              "start_line": 198,
+              "end_line": 205,
+              "explanation": "The core loop: apply num_layers identical Encoder1DBlock layers in sequence. For ViT-B this runs 12 times, for ViT-L 24 times, for ViT-H 32 times. Each block has its own learned parameters but the same architecture.",
+              "concept_tag": "attention"
+            },
+            {
+              "start_line": 206,
+              "end_line": 206,
+              "explanation": "A final LayerNorm after the last Transformer block. This is standard practice in pre-norm Transformers — without it, the output would be un-normalized since the last block's norm is applied before (not after) its sub-layers.",
+              "concept_tag": "normalization"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "vision-transformer",
+      "title": "The Full VisionTransformer: From Pixels to Predictions",
+      "narrative": "The VisionTransformer class ties everything together: patch embedding → CLS token → Transformer encoder → classification head. The forward pass is a clean pipeline with no branches or skip connections at the top level.\n\nAfter the Transformer processes all tokens, the model extracts a single representation for classification. The default mode ('token') takes just the CLS token's output vector. An alternative ('gap') uses global average pooling over all patch tokens, similar to how CNNs typically aggregate spatial features.\n\nThe classification head is either a simple linear layer (when representation_size is None) or a two-layer MLP with tanh activation. The head weights are initialized to zeros so that fine-tuning starts with a clean slate — the pretrained Transformer features are preserved while the new task's classifier is learned from scratch.",
+      "code_blocks": [
+        {
+          "label": "VisionTransformer: classification head and token pooling",
+          "source": "    if self.classifier == 'token':\n      x = x[:, 0]\n    elif self.classifier == 'gap':\n      x = jnp.mean(x, axis=list(range(1, x.ndim - 1)))  # (1,) or (1,2)\n    elif self.classifier in ['unpooled', 'token_unpooled']:\n      pass\n    else:\n      raise ValueError(f'Invalid classifier={self.classifier}')\n\n    if self.representation_size is not None:\n      x = nn.Dense(features=self.representation_size, name='pre_logits')(x)\n      x = nn.tanh(x)\n    else:\n      x = IdentityLayer(name='pre_logits')(x)\n\n    if self.num_classes:\n      x = nn.Dense(\n          features=self.num_classes,\n          name='head',\n          kernel_init=nn.initializers.zeros,\n          bias_init=nn.initializers.constant(self.head_bias_init))(x)\n    return x",
+          "source_start_line": 287,
+          "file_path": "vit_jax/models_vit.py",
+          "annotations": [
+            {
+              "start_line": 288,
+              "end_line": 288,
+              "explanation": "Default classification mode: extract the CLS token (position 0) from the sequence. After 12+ layers of attention, this single vector has aggregated information from all 196 patch tokens.",
+              "concept_tag": "pooling"
+            },
+            {
+              "start_line": 289,
+              "end_line": 290,
+              "explanation": "Alternative: global average pooling over all spatial tokens (like a CNN's global average pool). The authors found this works comparably to the CLS token approach.",
+              "concept_tag": "pooling"
+            },
+            {
+              "start_line": 297,
+              "end_line": 298,
+              "explanation": "Optional representation layer: projects to a fixed size and applies tanh. Used in the original ViT models pretrained on ImageNet-21k. When fine-tuning, this layer can be dropped (representation_size=None).",
+              "concept_tag": "linear"
+            },
+            {
+              "start_line": 302,
+              "end_line": 307,
+              "explanation": "The final classification head. Weights are initialized to ZEROS — this ensures that at the start of fine-tuning, the head outputs uniform predictions and doesn't disrupt the pretrained features with random gradients.",
+              "concept_tag": "linear"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "model-configs",
+      "title": "Model Configurations: The ViT Scaling Family",
+      "narrative": "ViT defines a family of models by varying three dimensions: hidden size, number of layers, and number of attention heads. The naming convention ViT-X/P indicates model size X (Ti/S/B/L/H) and patch size P (8/16/32). Smaller patches mean more tokens and quadratically more computation in attention.\n\nThe configurations follow a consistent pattern borrowed from BERT: hidden_size scales up (192 → 384 → 768 → 1024 → 1280), mlp_dim is always 4× hidden_size, and num_heads grows proportionally. This systematic scaling is what enabled the paper's key finding: larger ViTs consistently outperform smaller ones, following smooth scaling laws reminiscent of GPT.\n\nThe hybrid variants (R50+ViT) replace the patch embedding conv with a ResNet stem, producing a model that combines convolutional feature extraction with Transformer processing. These hybrids were competitive at smaller scales but the pure Transformer caught up and surpassed them with more data.",
+      "code_blocks": [
+        {
+          "label": "ViT-B/16 and ViT-H/14 model configurations",
+          "source": "@_register\ndef get_b16_config():\n  \"\"\"Returns the ViT-B/16 configuration.\"\"\"\n  config = ml_collections.ConfigDict()\n  config.model_name = 'ViT-B_16'\n  config.patches = ml_collections.ConfigDict({'size': (16, 16)})\n  config.hidden_size = 768\n  config.transformer = ml_collections.ConfigDict()\n  config.transformer.mlp_dim = 3072\n  config.transformer.num_heads = 12\n  config.transformer.num_layers = 12\n  config.transformer.attention_dropout_rate = 0.0\n  config.transformer.dropout_rate = 0.0\n  config.classifier = 'token'\n  config.representation_size = None\n  return config\n\n\n@_register\ndef get_l16_config():\n  \"\"\"Returns the ViT-L/16 configuration.\"\"\"\n  config = ml_collections.ConfigDict()\n  config.model_name = 'ViT-L_16'\n  config.patches = ml_collections.ConfigDict({'size': (16, 16)})\n  config.hidden_size = 1024\n  config.transformer = ml_collections.ConfigDict()\n  config.transformer.mlp_dim = 4096\n  config.transformer.num_heads = 16\n  config.transformer.num_layers = 24\n  config.transformer.attention_dropout_rate = 0.0\n  config.transformer.dropout_rate = 0.1\n  config.classifier = 'token'\n  config.representation_size = None\n  return config\n\n\n@_register\ndef get_h14_config():\n  \"\"\"Returns the ViT-H/14 configuration.\"\"\"\n  config = ml_collections.ConfigDict()\n  config.model_name = 'ViT-H_14'\n  config.patches = ml_collections.ConfigDict({'size': (14, 14)})\n  config.hidden_size = 1280\n  config.transformer = ml_collections.ConfigDict()\n  config.transformer.mlp_dim = 5120\n  config.transformer.num_heads = 16\n  config.transformer.num_layers = 32\n  config.transformer.attention_dropout_rate = 0.0\n  config.transformer.dropout_rate = 0.1\n  config.classifier = 'token'\n  config.representation_size = None\n  return config",
+          "source_start_line": 112,
+          "file_path": "vit_jax/configs/models.py",
+          "annotations": [
+            {
+              "start_line": 117,
+              "end_line": 117,
+              "explanation": "16×16 patch size: a 224×224 image becomes 14×14 = 196 tokens. The /16 in 'ViT-B/16' refers to this. Smaller patches (/8) give more tokens but cost O(n²) more in attention.",
+              "concept_tag": "embedding"
+            },
+            {
+              "start_line": 118,
+              "end_line": 122,
+              "explanation": "ViT-Base: 768 hidden, 3072 MLP (4×), 12 heads, 12 layers — ~86M parameters. This mirrors BERT-Base exactly, making it easy to reuse NLP insights about Transformer training.",
+              "concept_tag": "other:config"
+            },
+            {
+              "start_line": 136,
+              "end_line": 140,
+              "explanation": "ViT-Large: 1024 hidden, 4096 MLP, 16 heads, 24 layers — ~307M parameters. Note dropout_rate=0.1 for larger models. The scaling from Base to Large doubles depth and increases width ~1.3×.",
+              "concept_tag": "other:config"
+            },
+            {
+              "start_line": 153,
+              "end_line": 154,
+              "explanation": "ViT-Huge: the largest variant at 1280 hidden, 32 layers, ~632M parameters. Uses 14×14 patches instead of 16×16, producing 16×16 = 256 tokens from 224×224 images — more tokens for the largest model.",
+              "concept_tag": "other:config"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "posemb-interpolation",
+      "title": "Position Embedding Interpolation: Resolution Transfer",
+      "narrative": "ViT is trained at a fixed resolution (e.g., 224×224), but often fine-tuned at a higher resolution (e.g., 384×384) for better performance. The problem: a 384×384 image with 16×16 patches produces 576 tokens, but the pretrained positional embeddings only cover 196 positions.\n\nThe solution is bicubic interpolation of the position embedding grid. The 14×14 grid of learned position vectors is resized to 24×24 using scipy's zoom function. The CLS token's embedding is preserved separately since it has no spatial meaning.\n\nThis technique is critical for ViT's practical success — it enables pretraining at low resolution (cheap) and fine-tuning at high resolution (accurate). Nearly every vision model that uses ViT as a backbone (DINOv3, CLIP, PaLM-E) relies on this interpolation trick when adapting to different input sizes.",
+      "code_blocks": [
+        {
+          "label": "Bicubic interpolation of positional embeddings for resolution transfer",
+          "source": "def interpolate_posembed(posemb, num_tokens: int, has_class_token: bool):\n  \"\"\"Interpolate given positional embedding parameters into a new shape.\n\n  Args:\n    posemb: positional embedding parameters.\n    num_tokens: desired number of tokens.\n    has_class_token: True if the positional embedding parameters contain a\n      class token.\n\n  Returns:\n    Positional embedding parameters interpolated into the new shape.\n  \"\"\"\n  assert posemb.shape[0] == 1\n  if has_class_token:\n    posemb_tok, posemb_grid = posemb[:, :1], posemb[0, 1:]\n    num_tokens -= 1\n  else:\n    posemb_tok, posemb_grid = posemb[:, :0], posemb[0, 0:]\n\n  gs_old = int(np.sqrt(len(posemb_grid)))\n  gs_new = int(np.sqrt(num_tokens))\n  logging.info('interpolate_posembed: grid-size from %s to %s', gs_old, gs_new)\n  assert gs_old ** 2 == len(posemb_grid), f'{gs_old ** 2} != {len(posemb_grid)}'\n  assert gs_new ** 2 == num_tokens, f'{gs_new ** 2} != {num_tokens}'\n  posemb_grid = posemb_grid.reshape(gs_old, gs_old, -1)\n\n  zoom = (gs_new / gs_old, gs_new / gs_old, 1)\n  posemb_grid = scipy.ndimage.zoom(posemb_grid, zoom, order=1)\n  posemb_grid = posemb_grid.reshape(1, gs_new * gs_new, -1)\n  return jnp.array(np.concatenate([posemb_tok, posemb_grid], axis=1))",
+          "source_start_line": 209,
+          "file_path": "vit_jax/checkpoint.py",
+          "annotations": [
+            {
+              "start_line": 222,
+              "end_line": 224,
+              "explanation": "Separate the CLS token's positional embedding from the spatial grid embeddings. The CLS token doesn't represent a spatial position, so it shouldn't be interpolated — it's preserved as-is.",
+              "concept_tag": "embedding"
+            },
+            {
+              "start_line": 228,
+              "end_line": 233,
+              "explanation": "Reshape the 1D sequence of position embeddings back into a 2D grid (e.g., 14×14 for 196 tokens). This recovers the spatial structure that was flattened during patch embedding.",
+              "concept_tag": "embedding"
+            },
+            {
+              "start_line": 235,
+              "end_line": 236,
+              "explanation": "Bilinear interpolation (order=1) resizes the position embedding grid from old_size to new_size. For 224→384 transfer: the 14×14 grid becomes 24×24. The zoom factor is the same in both spatial dimensions, and 1 in the embedding dimension (no interpolation across features).",
+              "concept_tag": "embedding"
+            },
+            {
+              "start_line": 238,
+              "end_line": 238,
+              "explanation": "Flatten back to 1D sequence and re-attach the CLS token embedding at position 0. The result is a position embedding compatible with the new resolution.",
+              "concept_tag": "embedding"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "putting-it-together",
+      "title": "Putting It All Together",
+      "narrative": "ViT's architecture can be summarized in one sentence: split an image into patches, embed them as tokens, prepend a CLS token, add positional embeddings, pass through a stack of standard Transformer blocks, and read out the CLS token for classification.\n\nWhat makes ViT historically important isn't architectural novelty — every component (self-attention, MLP, LayerNorm, positional embeddings, CLS token) existed before. The contribution is showing that this minimal recipe, applied directly to image patches with no vision-specific inductive biases, works at scale. CNNs encode locality and translation equivariance into their architecture; ViT learns these properties from data.\n\nThe practical implications were enormous:\n\n1. **Unified architecture**: The same Transformer backbone works for both vision and language, enabling multimodal models like CLIP, PaLM-E, and the VLA architectures that power modern robot learning.\n\n2. **Scalability**: ViT scales predictably — more data and more compute consistently improve performance. This is harder to achieve with the hand-designed multi-scale architectures of CNNs.\n\n3. **Transfer learning**: Pretrain once on a large dataset, then fine-tune for any downstream task. Position embedding interpolation makes this work across resolutions.\n\n4. **Foundation for self-supervised learning**: DINO, DINOv2, DINOv3, MAE, and other self-supervised methods all build on the ViT architecture, producing general-purpose visual features without labels.\n\nThe key lesson: when you have enough data, architectural simplicity wins. ViT proved that Transformers aren't just for NLP — they're a universal architecture for sequence modeling, and images are just another kind of sequence.",
+      "code_blocks": [
+        {
+          "label": "VisionTransformer: the complete forward pass",
+          "source": "class VisionTransformer(nn.Module):\n  \"\"\"VisionTransformer.\"\"\"\n\n  num_classes: int\n  patches: Any\n  transformer: Any\n  hidden_size: int\n  resnet: Optional[Any] = None\n  representation_size: Optional[int] = None\n  classifier: str = 'token'\n  head_bias_init: float = 0.\n  encoder: Type[nn.Module] = Encoder\n  model_name: Optional[str] = None\n\n  @nn.compact\n  def __call__(self, inputs, *, train):\n\n    x = inputs\n    # (Possibly partial) ResNet root.\n    if self.resnet is not None:\n      width = int(64 * self.resnet.width_factor)\n\n      # Root block.\n      x = models_resnet.StdConv(\n          features=width,\n          kernel_size=(7, 7),\n          strides=(2, 2),\n          use_bias=False,\n          name='conv_root')(\n              x)\n      x = nn.GroupNorm(name='gn_root')(x)\n      x = nn.relu(x)\n      x = nn.max_pool(x, window_shape=(3, 3), strides=(2, 2), padding='SAME')\n\n      # ResNet stages.\n      if self.resnet.num_layers:\n        x = models_resnet.ResNetStage(\n            block_size=self.resnet.num_layers[0],\n            nout=width,\n            first_stride=(1, 1),\n            name='block1')(\n                x)\n        for i, block_size in enumerate(self.resnet.num_layers[1:], 1):\n          x = models_resnet.ResNetStage(\n              block_size=block_size,\n              nout=width * 2**i,\n              first_stride=(2, 2),\n              name=f'block{i + 1}')(\n                  x)\n\n    n, h, w, c = x.shape\n\n    # We can merge s2d+emb into a single conv; it's the same.\n    x = nn.Conv(\n        features=self.hidden_size,\n        kernel_size=self.patches.size,\n        strides=self.patches.size,\n        padding='VALID',\n        name='embedding')(\n            x)\n\n    # Here, x is a grid of embeddings.\n\n    # (Possibly partial) Transformer.\n    if self.transformer is not None:\n      n, h, w, c = x.shape\n      x = jnp.reshape(x, [n, h * w, c])\n\n      # If we want to add a class token, add it here.\n      if self.classifier in ['token', 'token_unpooled']:\n        cls = self.param('cls', nn.initializers.zeros, (1, 1, c))\n        cls = jnp.tile(cls, [n, 1, 1])\n        x = jnp.concatenate([cls, x], axis=1)\n\n      x = self.encoder(name='Transformer', **self.transformer)(x, train=train)\n\n    if self.classifier == 'token':\n      x = x[:, 0]\n    elif self.classifier == 'gap':\n      x = jnp.mean(x, axis=list(range(1, x.ndim - 1)))  # (1,) or (1,2)\n    elif self.classifier in ['unpooled', 'token_unpooled']:\n      pass\n    else:\n      raise ValueError(f'Invalid classifier={self.classifier}')\n\n    if self.representation_size is not None:\n      x = nn.Dense(features=self.representation_size, name='pre_logits')(x)\n      x = nn.tanh(x)\n    else:\n      x = IdentityLayer(name='pre_logits')(x)\n\n    if self.num_classes:\n      x = nn.Dense(\n          features=self.num_classes,\n          name='head',\n          kernel_init=nn.initializers.zeros,\n          bias_init=nn.initializers.constant(self.head_bias_init))(x)\n    return x",
+          "source_start_line": 211,
+          "file_path": "vit_jax/models_vit.py",
+          "annotations": [
+            {
+              "start_line": 229,
+              "end_line": 259,
+              "explanation": "Optional ResNet stem for hybrid models (R50+ViT). When present, the image is first processed by ResNet stages to produce feature maps, which then become the 'patches' for the Transformer. For pure ViT models, this entire block is skipped (self.resnet is None).",
+              "concept_tag": "convolution"
+            },
+            {
+              "start_line": 264,
+              "end_line": 270,
+              "explanation": "Patch embedding: a single Conv with kernel=stride=patch_size converts pixels to patch tokens. For ViT-B/16: (batch, 224, 224, 3) → (batch, 14, 14, 768).",
+              "concept_tag": "embedding"
+            },
+            {
+              "start_line": 277,
+              "end_line": 285,
+              "explanation": "The Transformer pipeline: flatten patch grid to 1D sequence, prepend CLS token, run through the encoder stack. This is where the core computation happens — all the attention and MLP layers.",
+              "concept_tag": "attention"
+            },
+            {
+              "start_line": 287,
+              "end_line": 308,
+              "explanation": "Output head: extract CLS token (or pool), optionally project through a pre-logits layer, then classify. The complete pipeline: image → patches → Transformer → CLS → logits.",
+              "concept_tag": "linear"
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "summary": "Vision Transformer (ViT) proves that a pure Transformer — with no convolutions — can match or exceed CNN performance on image classification when pretrained on large datasets. The key insight is treating an image as a sequence of 16×16 patch tokens, then applying a standard Transformer encoder (self-attention + MLP blocks). With learned positional embeddings and a CLS token for classification, ViT achieves state-of-the-art results and establishes the architecture foundation for all subsequent vision models including DINOv3, CLIP, and the vision encoders in modern VLA robot models."
+}

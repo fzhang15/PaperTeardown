@@ -26,8 +26,9 @@ function cardY(row: number)   { return PAD_Y + HEADER_H + row * (CARD_H + ROW_GA
 interface TrackPos { track: number; row: number }
 
 const PAPER_POSITIONS: Record<string, TrackPos> = {
-  dinov3:             { track: 0, row: 0 },
-  dit:                { track: 0, row: 1 },
+  ViT:                { track: 0, row: 0 },
+  dinov3:             { track: 0, row: 1 },
+  dit:                { track: 0, row: 2 },
   act:                { track: 1, row: 0 },
   'diffusion-policy': { track: 1, row: 1 },
   rt1:                { track: 1, row: 2 },
@@ -60,12 +61,15 @@ interface Edge { from: string; to: string; dashed?: boolean }
 
 const EDGES: Edge[] = [
   // Same-track lineage — solid vertical arrows between adjacent rows
+  { from: 'ViT',  to: 'dinov3' },
   { from: 'rt1',  to: 'rt2' },
   { from: 'rt2',  to: 'pi0' },
   { from: 'pi0',  to: 'groot' },
   // Cross-track architectural borrowing — dashed bus wires through the column gap
-  { from: 'dit',  to: 'pi0',   dashed: true },
-  { from: 'dit',  to: 'groot', dashed: true },
+  { from: 'ViT',  to: 'rt1',             dashed: true },   // RT-1 uses ViT-like vision backbone
+  { from: 'dit',  to: 'diffusion-policy', dashed: true },  // Diffusion Policy uses diffusion for action generation
+  // Same-track lineage — dashed for indirect influence
+  { from: 'diffusion-policy', to: 'pi0', dashed: true },   // π0 builds on diffusion action paradigm
   // Skip-row same-track influence — dashed right-bypass wires (rendered around card stack)
   { from: 'act',  to: 'mobile-aloha', dashed: true },  // Mobile ALOHA = ACT + mobile base
   { from: 'rt2',  to: '3d-vla',       dashed: true },  // 3D-VLA extends the VLA paradigm
