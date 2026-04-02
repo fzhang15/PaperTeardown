@@ -1,0 +1,12 @@
+{
+  "id": "CLIP",
+  "title": "Learning Transferable Visual Models From Natural Language Supervision",
+  "authors": ["Alec Radford", "Jong Wook Kim", "Chris Hallacy", "Aditya Ramesh", "Gabriel Goh", "Sandhini Agarwal", "Girish Sastry", "Amanda Askell", "Pamela Mishkin", "Jack Clark", "Gretchen Krueger", "Ilya Sutskever"],
+  "arxiv_url": "https://arxiv.org/abs/2103.00020",
+  "repo_url": "https://github.com/openai/CLIP",
+  "abstract": "State-of-the-art computer vision systems are trained to predict a fixed set of predetermined object categories. This restricted form of supervision limits their generality and usability since additional labeled data is needed to specify any other visual concept. Learning directly from raw text about images is a promising alternative which leverages a much broader source of supervision. We demonstrate that the simple pre-training task of predicting which caption goes with which image is an efficient and scalable way to learn SOTA image representations from scratch on a dataset of 400 million (image, text) pairs collected from the internet.",
+  "introduction_excerpt": "CLIP (Contrastive Language-Image Pre-training) efficiently learns visual concepts from natural language supervision. Trained on 400 million image-text pairs, CLIP can be applied to any visual classification benchmark by simply providing the names of the visual categories — achieving competitive zero-shot performance without task-specific training data.",
+  "module_count": 8,
+  "pytorch_file_count": 3,
+  "ingested_at": "2026-04-01T00:00:00Z"
+}

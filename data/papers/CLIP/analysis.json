@@ -1,0 +1,383 @@
+{
+  "chapters": [
+    {
+      "id": "problem",
+      "title": "What Problem Does CLIP Solve?",
+      "narrative": "Most vision models learn from fixed label sets — ImageNet's 1,000 classes, COCO's 80 object categories, etc. This creates a bottleneck: every new task requires collecting and annotating a fresh dataset. The model can only recognize what it was explicitly trained on.\n\nCLIP (Contrastive Language-Image Pre-training) breaks this pattern by learning visual representations from natural language supervision. Instead of mapping images to discrete class labels, CLIP learns to match images with their text descriptions — 400 million (image, text) pairs scraped from the internet.\n\nThe key insight: natural language is a much richer supervision signal than class labels. A caption like \"a photo of a dog playing in the snow\" teaches the model about dogs, snow, playing, spatial relationships, and scene composition simultaneously. This eliminates the narrow-task bottleneck and enables zero-shot transfer — the model can perform tasks it was never explicitly trained for, simply by changing the text prompts.\n\nCLIP's architecture is deceptively simple: two separate encoders (one for images, one for text) trained to produce embeddings that are close for matching pairs and far apart for non-matching pairs. This contrastive approach, combined with internet-scale data, produces visual representations that rival or exceed supervised models on many benchmarks — without seeing a single labeled example from those benchmarks.",
+      "code_blocks": []
+    },
+    {
+      "id": "dual-encoder",
+      "title": "The Dual-Encoder Architecture",
+      "narrative": "CLIP's architecture has two parallel branches: a vision encoder and a text encoder. Both map their inputs into a shared embedding space of dimension `embed_dim` (512 or 768 depending on model size). The magic happens because these two encoders are trained jointly — they learn to place matching image-text pairs close together in this shared space.\n\nThe vision encoder comes in two flavors: a Vision Transformer (ViT) for the ViT variants, or a Modified ResNet for the RN50/RN101 variants. The text encoder is always a Transformer with a causal attention mask (GPT-2 style). Notice the `logit_scale` parameter — this is a learned temperature that sharpens or softens the contrastive similarity scores during training.",
+      "code_blocks": [
+        {
+          "label": "CLIP model: wiring vision and text encoders",
+          "source": "class CLIP(nn.Module):\n    def __init__(self,\n                 embed_dim: int,\n                 # vision\n                 image_resolution: int,\n                 vision_layers: Union[Tuple[int, int, int, int], int],\n                 vision_width: int,\n                 vision_patch_size: int,\n                 # text\n                 context_length: int,\n                 vocab_size: int,\n                 transformer_width: int,\n                 transformer_heads: int,\n                 transformer_layers: int\n                 ):\n        super().__init__()\n\n        self.context_length = context_length\n\n        if isinstance(vision_layers, (tuple, list)):\n            vision_heads = vision_width * 32 // 64\n            self.visual = ModifiedResNet(\n                layers=vision_layers,\n                output_dim=embed_dim,\n                heads=vision_heads,\n                input_resolution=image_resolution,\n                width=vision_width\n            )\n        else:\n            vision_heads = vision_width // 64\n            self.visual = VisionTransformer(\n                input_resolution=image_resolution,\n                patch_size=vision_patch_size,\n                width=vision_width,\n                layers=vision_layers,\n                heads=vision_heads,\n                output_dim=embed_dim\n            )\n\n        self.transformer = Transformer(\n            width=transformer_width,\n            layers=transformer_layers,\n            heads=transformer_heads,\n            attn_mask=self.build_attention_mask()\n        )\n\n        self.vocab_size = vocab_size\n        self.token_embedding = nn.Embedding(vocab_size, transformer_width)\n        self.positional_embedding = nn.Parameter(torch.empty(self.context_length, transformer_width))\n        self.ln_final = LayerNorm(transformer_width)\n\n        self.text_projection = nn.Parameter(torch.empty(transformer_width, embed_dim))\n        self.logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))",
+          "source_start_line": 243,
+          "file_path": "clip/model.py",
+          "annotations": [
+            {
+              "start_line": 248,
+              "end_line": 248,
+              "explanation": "embed_dim is the shared embedding space dimension (e.g. 512). Both encoders project into this space so image and text representations are directly comparable.",
+              "concept_tag": "embedding"
+            },
+            {
+              "start_line": 262,
+              "end_line": 270,
+              "explanation": "If vision_layers is a tuple (e.g. (3,4,6,3) for ResNet-50), use ModifiedResNet. If it's an int (e.g. 12 for ViT-B), use VisionTransformer. This single constructor handles both CLIP variants.",
+              "concept_tag": "other:architecture-dispatch"
+            },
+            {
+              "start_line": 282,
+              "end_line": 287,
+              "explanation": "The text encoder is a standard Transformer, but with a causal attention mask — same as GPT-2. Text tokens can only attend to preceding tokens, not future ones.",
+              "concept_tag": "attention"
+            },
+            {
+              "start_line": 290,
+              "end_line": 291,
+              "explanation": "Token and positional embeddings for text — standard transformer setup. context_length is 77 tokens for all CLIP models.",
+              "concept_tag": "embedding"
+            },
+            {
+              "start_line": 294,
+              "end_line": 295,
+              "explanation": "text_projection maps from transformer_width to embed_dim. logit_scale is a learnable temperature initialized to 1/0.07 ≈ 14.3, which sharpens the contrastive similarity distribution.",
+              "concept_tag": "linear"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "vision-transformer",
+      "title": "The Vision Transformer",
+      "narrative": "CLIP's ViT-based image encoder follows the original Vision Transformer design with one important difference: it projects the final [CLS] token through a learned linear projection to match the shared embedding dimension.\n\nThe pipeline is: split image into patches via a strided convolution → prepend a learnable [CLS] token → add positional embeddings → run through transformer layers → take the [CLS] token output → layer norm → linear projection to embed_dim.\n\nNote the dimension gymnastics: PyTorch's `nn.MultiheadAttention` expects sequence-first format (Length, Batch, Dim), so there are permutations before and after the transformer.",
+      "code_blocks": [
+        {
+          "label": "VisionTransformer: patch embedding + transformer + projection",
+          "source": "class VisionTransformer(nn.Module):\n    def __init__(self, input_resolution: int, patch_size: int, width: int, layers: int, heads: int, output_dim: int):\n        super().__init__()\n        self.input_resolution = input_resolution\n        self.output_dim = output_dim\n        self.conv1 = nn.Conv2d(in_channels=3, out_channels=width, kernel_size=patch_size, stride=patch_size, bias=False)\n\n        scale = width ** -0.5\n        self.class_embedding = nn.Parameter(scale * torch.randn(width))\n        self.positional_embedding = nn.Parameter(scale * torch.randn((input_resolution // patch_size) ** 2 + 1, width))\n        self.ln_pre = LayerNorm(width)\n\n        self.transformer = Transformer(width, layers, heads)\n\n        self.ln_post = LayerNorm(width)\n        self.proj = nn.Parameter(scale * torch.randn(width, output_dim))\n\n    def forward(self, x: torch.Tensor):\n        x = self.conv1(x)  # shape = [*, width, grid, grid]\n        x = x.reshape(x.shape[0], x.shape[1], -1)  # shape = [*, width, grid ** 2]\n        x = x.permute(0, 2, 1)  # shape = [*, grid ** 2, width]\n        x = torch.cat([self.class_embedding.to(x.dtype) + torch.zeros(x.shape[0], 1, x.shape[-1], dtype=x.dtype, device=x.device), x], dim=1)  # shape = [*, grid ** 2 + 1, width]\n        x = x + self.positional_embedding.to(x.dtype)\n        x = self.ln_pre(x)\n\n        x = x.permute(1, 0, 2)  # NLD -> LND\n        x = self.transformer(x)\n        x = x.permute(1, 0, 2)  # LND -> NLD\n\n        x = self.ln_post(x[:, 0, :])\n\n        if self.proj is not None:\n            x = x @ self.proj\n\n        return x",
+          "source_start_line": 206,
+          "file_path": "clip/model.py",
+          "annotations": [
+            {
+              "start_line": 211,
+              "end_line": 211,
+              "explanation": "Patch embedding: a Conv2d with kernel_size=stride=patch_size (e.g. 32 or 16). This splits the image into non-overlapping patches and linearly embeds each one — equivalent to the linear projection in the ViT paper but implemented as a convolution.",
+              "concept_tag": "convolution"
+            },
+            {
+              "start_line": 214,
+              "end_line": 214,
+              "explanation": "The learnable [CLS] token — a single vector prepended to the patch sequence. After processing, this token's representation serves as the global image embedding.",
+              "concept_tag": "embedding"
+            },
+            {
+              "start_line": 215,
+              "end_line": 215,
+              "explanation": "Learned positional embeddings for (num_patches + 1) positions. For ViT-B/32 with 224px input: (224/32)² + 1 = 50 positions. For ViT-B/16: (224/16)² + 1 = 197 positions.",
+              "concept_tag": "embedding"
+            },
+            {
+              "start_line": 227,
+              "end_line": 227,
+              "explanation": "Broadcasts the [CLS] token across the batch and prepends it to the patch sequence. The torch.zeros trick efficiently creates a batch-sized placeholder.",
+              "concept_tag": "embedding"
+            },
+            {
+              "start_line": 235,
+              "end_line": 235,
+              "explanation": "Takes only the [CLS] token output (index 0) and applies layer norm. This single vector is the image's representation.",
+              "concept_tag": "normalization"
+            },
+            {
+              "start_line": 237,
+              "end_line": 238,
+              "explanation": "Projects from the transformer's internal width to the shared embed_dim. This is how the vision encoder output matches the text encoder's dimensionality.",
+              "concept_tag": "linear"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "text-encoder",
+      "title": "The Text Encoder",
+      "narrative": "CLIP's text encoder is a GPT-2-style autoregressive transformer. Text is tokenized with BPE, passed through token and positional embeddings, then processed by transformer layers with a causal attention mask.\n\nThe clever part is how the text representation is extracted: instead of using a [CLS] token like BERT, CLIP takes the feature at the position of the end-of-text (EOT) token — the highest token ID in the sequence. Since the causal mask means the EOT token has attended to all preceding tokens, it naturally aggregates the full sequence's meaning. This is then projected through `text_projection` into the shared embedding space.",
+      "code_blocks": [
+        {
+          "label": "Text encoding: causal transformer + EOT extraction",
+          "source": "    def build_attention_mask(self):\n        # lazily create causal attention mask, with full attention between the vision tokens\n        # pytorch uses additive attention mask; fill with -inf\n        mask = torch.empty(self.context_length, self.context_length)\n        mask.fill_(float(\"-inf\"))\n        mask.triu_(1)  # zero out the lower diagonal\n        return mask\n\n    @property\n    def dtype(self):\n        return self.visual.conv1.weight.dtype\n\n    def encode_image(self, image):\n        return self.visual(image.type(self.dtype))\n\n    def encode_text(self, text):\n        x = self.token_embedding(text).type(self.dtype)  # [batch_size, n_ctx, d_model]\n\n        x = x + self.positional_embedding.type(self.dtype)\n        x = x.permute(1, 0, 2)  # NLD -> LND\n        x = self.transformer(x)\n        x = x.permute(1, 0, 2)  # LND -> NLD\n        x = self.ln_final(x).type(self.dtype)\n\n        # x.shape = [batch_size, n_ctx, transformer.width]\n        # take features from the eot embedding (eot_token is the highest number in each sequence)\n        x = x[torch.arange(x.shape[0]), text.argmax(dim=-1)] @ self.text_projection\n\n        return x",
+          "source_start_line": 328,
+          "file_path": "clip/model.py",
+          "annotations": [
+            {
+              "start_line": 331,
+              "end_line": 333,
+              "explanation": "Creates a causal (upper-triangular) attention mask filled with -inf. PyTorch uses additive masks, so -inf entries become zero probability after softmax. This ensures each token only attends to itself and preceding tokens.",
+              "concept_tag": "attention"
+            },
+            {
+              "start_line": 344,
+              "end_line": 344,
+              "explanation": "Token embedding lookup — maps token IDs to dense vectors of dimension transformer_width (e.g. 512 for CLIP-ViT-B/32).",
+              "concept_tag": "embedding"
+            },
+            {
+              "start_line": 346,
+              "end_line": 346,
+              "explanation": "Adds learned positional embeddings. CLIP uses absolute positional embeddings (not rotary or relative), fixed to context_length=77 positions.",
+              "concept_tag": "embedding"
+            },
+            {
+              "start_line": 355,
+              "end_line": 355,
+              "explanation": "The key trick: text.argmax(dim=-1) finds the EOT token position (highest token ID in each sequence). Since the causal mask means this token has seen all previous tokens, its representation captures the entire text. The @ text_projection maps it to the shared embed_dim.",
+              "concept_tag": "linear"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "transformer-block",
+      "title": "The Transformer Building Block",
+      "narrative": "Both the vision and text encoders share the same transformer block: `ResidualAttentionBlock`. It follows the pre-norm convention (LayerNorm before attention and MLP, not after), which is more stable for training deep models.\n\nThe MLP uses a custom `QuickGELU` activation instead of standard GELU. QuickGELU approximates GELU using `x * sigmoid(1.702 * x)`, which avoids the expensive `erf` computation and is faster on GPUs. The expansion ratio is 4x (the MLP hidden dimension is 4× the model width), which is standard for transformers.\n\nA subtle detail: `LayerNorm` is subclassed to handle fp16 — it casts to float32 for the normalization computation, then casts back. This prevents numerical instability in mixed-precision training.",
+      "code_blocks": [
+        {
+          "label": "ResidualAttentionBlock + QuickGELU + fp16-safe LayerNorm",
+          "source": "class LayerNorm(nn.LayerNorm):\n    \"\"\"Subclass torch's LayerNorm to handle fp16.\"\"\"\n\n    def forward(self, x: torch.Tensor):\n        orig_type = x.dtype\n        ret = super().forward(x.type(torch.float32))\n        return ret.type(orig_type)\n\n\nclass QuickGELU(nn.Module):\n    def forward(self, x: torch.Tensor):\n        return x * torch.sigmoid(1.702 * x)\n\n\nclass ResidualAttentionBlock(nn.Module):\n    def __init__(self, d_model: int, n_head: int, attn_mask: torch.Tensor = None):\n        super().__init__()\n\n        self.attn = nn.MultiheadAttention(d_model, n_head)\n        self.ln_1 = LayerNorm(d_model)\n        self.mlp = nn.Sequential(OrderedDict([\n            (\"c_fc\", nn.Linear(d_model, d_model * 4)),\n            (\"gelu\", QuickGELU()),\n            (\"c_proj\", nn.Linear(d_model * 4, d_model))\n        ]))\n        self.ln_2 = LayerNorm(d_model)\n        self.attn_mask = attn_mask\n\n    def attention(self, x: torch.Tensor):\n        self.attn_mask = self.attn_mask.to(dtype=x.dtype, device=x.device) if self.attn_mask is not None else None\n        return self.attn(x, x, x, need_weights=False, attn_mask=self.attn_mask)[0]\n\n    def forward(self, x: torch.Tensor):\n        x = x + self.attention(self.ln_1(x))\n        x = x + self.mlp(self.ln_2(x))\n        return x",
+          "source_start_line": 157,
+          "file_path": "clip/model.py",
+          "annotations": [
+            {
+              "start_line": 161,
+              "end_line": 163,
+              "explanation": "fp16-safe LayerNorm: upcasts to float32 for the normalization math (mean, variance, division), then casts back. This prevents overflow/underflow in half-precision without changing the external dtype.",
+              "concept_tag": "normalization"
+            },
+            {
+              "start_line": 167,
+              "end_line": 168,
+              "explanation": "QuickGELU: approximates GELU(x) ≈ x·σ(1.702x). Standard GELU uses erf which is slower. The constant 1.702 was chosen to closely match the true GELU curve.",
+              "concept_tag": "activation"
+            },
+            {
+              "start_line": 177,
+              "end_line": 181,
+              "explanation": "The MLP expands by 4x then projects back: d_model → 4·d_model → d_model. Named 'c_fc' and 'c_proj' following GPT-2's naming convention (c = 'conv1d' in the original GPT-2 code).",
+              "concept_tag": "linear"
+            },
+            {
+              "start_line": 189,
+              "end_line": 192,
+              "explanation": "Pre-norm residual connections: LayerNorm is applied BEFORE attention and MLP, not after. This is the 'pre-LN' variant from 'On Layer Normalization in the Transformer Architecture' — it's more training-stable for deep models.",
+              "concept_tag": "residual"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "modified-resnet",
+      "title": "Modified ResNet: The CNN Alternative",
+      "narrative": "CLIP also supports a CNN-based vision encoder — a modified ResNet with three key changes from the standard torchvision implementation:\n\n1. **3-conv stem**: Instead of a single 7×7 conv, the stem uses three 3×3 convolutions. This captures finer spatial detail at the same computational cost.\n2. **Anti-aliased striding**: Instead of strided convolutions (which alias high-frequency signals), CLIP uses stride-1 convolutions followed by average pooling. This makes the network more shift-invariant.\n3. **Attention pooling**: Instead of global average pooling at the end, CLIP uses a QKV attention pool that lets the model learn which spatial regions matter most. A learnable query attends over all spatial positions to produce the final representation.\n\nThe attention pooling layer is particularly interesting — it prepends a learned \"mean\" token (the average of all spatial positions), adds positional embeddings, then uses multi-head attention where only the first token (mean) is the query. This is essentially a single cross-attention layer that aggregates spatial information.",
+      "code_blocks": [
+        {
+          "label": "AttentionPool2d: learned spatial aggregation via QKV attention",
+          "source": "class AttentionPool2d(nn.Module):\n    def __init__(self, spacial_dim: int, embed_dim: int, num_heads: int, output_dim: int = None):\n        super().__init__()\n        self.positional_embedding = nn.Parameter(torch.randn(spacial_dim ** 2 + 1, embed_dim) / embed_dim ** 0.5)\n        self.k_proj = nn.Linear(embed_dim, embed_dim)\n        self.q_proj = nn.Linear(embed_dim, embed_dim)\n        self.v_proj = nn.Linear(embed_dim, embed_dim)\n        self.c_proj = nn.Linear(embed_dim, output_dim or embed_dim)\n        self.num_heads = num_heads\n\n    def forward(self, x):\n        x = x.flatten(start_dim=2).permute(2, 0, 1)  # NCHW -> (HW)NC\n        x = torch.cat([x.mean(dim=0, keepdim=True), x], dim=0)  # (HW+1)NC\n        x = x + self.positional_embedding[:, None, :].to(x.dtype)  # (HW+1)NC\n        x, _ = F.multi_head_attention_forward(\n            query=x[:1], key=x, value=x,\n            embed_dim_to_check=x.shape[-1],\n            num_heads=self.num_heads,\n            q_proj_weight=self.q_proj.weight,\n            k_proj_weight=self.k_proj.weight,\n            v_proj_weight=self.v_proj.weight,\n            in_proj_weight=None,\n            in_proj_bias=torch.cat([self.q_proj.bias, self.k_proj.bias, self.v_proj.bias]),\n            bias_k=None,\n            bias_v=None,\n            add_zero_attn=False,\n            dropout_p=0,\n            out_proj_weight=self.c_proj.weight,\n            out_proj_bias=self.c_proj.bias,\n            use_separate_proj_weight=True,\n            training=self.training,\n            need_weights=False\n        )\n        return x.squeeze(0)",
+          "source_start_line": 58,
+          "file_path": "clip/model.py",
+          "annotations": [
+            {
+              "start_line": 61,
+              "end_line": 61,
+              "explanation": "Positional embeddings for spatial_dim² + 1 positions (the +1 is for the prepended mean token). For a 7×7 feature map: 50 positions.",
+              "concept_tag": "embedding"
+            },
+            {
+              "start_line": 69,
+              "end_line": 69,
+              "explanation": "Flatten spatial dims and reorder to sequence-first: (batch, channels, H, W) → (H*W, batch, channels).",
+              "concept_tag": "other:reshape"
+            },
+            {
+              "start_line": 70,
+              "end_line": 70,
+              "explanation": "Prepend the mean of all spatial positions as a special \"summary\" token. This is the query — it will attend to all spatial positions to produce the final pooled output.",
+              "concept_tag": "pooling"
+            },
+            {
+              "start_line": 72,
+              "end_line": 73,
+              "explanation": "Only the first token (the mean/summary) is used as the query, but keys and values come from ALL positions. This is cross-attention: the summary token learns to aggregate spatial information by attending to relevant regions.",
+              "concept_tag": "attention"
+            }
+          ]
+        },
+        {
+          "label": "ModifiedResNet: 3-conv stem + anti-aliased striding",
+          "source": "class ModifiedResNet(nn.Module):\n    \"\"\"\n    A ResNet class that is similar to torchvision's but contains the following changes:\n    - There are now 3 \"stem\" convolutions as opposed to 1, with an average pool instead of a max pool.\n    - Performs anti-aliasing strided convolutions, where an avgpool is prepended to convolutions with stride > 1\n    - The final pooling layer is a QKV attention instead of an average pool\n    \"\"\"\n\n    def __init__(self, layers, output_dim, heads, input_resolution=224, width=64):\n        super().__init__()\n        self.output_dim = output_dim\n        self.input_resolution = input_resolution\n\n        # the 3-layer stem\n        self.conv1 = nn.Conv2d(3, width // 2, kernel_size=3, stride=2, padding=1, bias=False)\n        self.bn1 = nn.BatchNorm2d(width // 2)\n        self.relu1 = nn.ReLU(inplace=True)\n        self.conv2 = nn.Conv2d(width // 2, width // 2, kernel_size=3, padding=1, bias=False)\n        self.bn2 = nn.BatchNorm2d(width // 2)\n        self.relu2 = nn.ReLU(inplace=True)\n        self.conv3 = nn.Conv2d(width // 2, width, kernel_size=3, padding=1, bias=False)\n        self.bn3 = nn.BatchNorm2d(width)\n        self.relu3 = nn.ReLU(inplace=True)\n        self.avgpool = nn.AvgPool2d(2)\n\n        # residual layers\n        self._inplanes = width  # this is a *mutable* variable used during construction\n        self.layer1 = self._make_layer(width, layers[0])\n        self.layer2 = self._make_layer(width * 2, layers[1], stride=2)\n        self.layer3 = self._make_layer(width * 4, layers[2], stride=2)\n        self.layer4 = self._make_layer(width * 8, layers[3], stride=2)\n\n        embed_dim = width * 32  # the ResNet feature dimension\n        self.attnpool = AttentionPool2d(input_resolution // 32, embed_dim, heads, output_dim)",
+          "source_start_line": 94,
+          "file_path": "clip/model.py",
+          "annotations": [
+            {
+              "start_line": 108,
+              "end_line": 117,
+              "explanation": "Three 3×3 convolutions replace the standard single 7×7 conv stem. First conv strides by 2, then avgpool at the end halves again → total 4× downsample, same as standard ResNet stem but with more expressive features.",
+              "concept_tag": "convolution"
+            },
+            {
+              "start_line": 121,
+              "end_line": 125,
+              "explanation": "Standard ResNet layer structure with 4 stages. Each stage doubles width and halves spatial resolution (except layer1). The _inplanes mutable pattern tracks channel dimensions during construction.",
+              "concept_tag": "convolution"
+            },
+            {
+              "start_line": 126,
+              "end_line": 127,
+              "explanation": "AttentionPool2d replaces global average pooling. For 224px input with 32× total downsample, the feature map is 7×7. The attention pool produces a single output_dim vector — the image embedding.",
+              "concept_tag": "pooling"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "contrastive-loss",
+      "title": "Contrastive Learning: The Training Objective",
+      "narrative": "CLIP's training objective is elegantly simple: given a batch of N (image, text) pairs, maximize the cosine similarity of the N correct pairs while minimizing it for the N²−N incorrect pairs. This is a symmetric cross-entropy loss over a similarity matrix.\n\nThe forward pass computes this similarity matrix. Both image and text features are L2-normalized to unit vectors, so their dot product equals cosine similarity. The `logit_scale` (learned temperature) is applied to sharpen the distribution — without it, cosine similarities are in [-1, 1] which is too flat for the softmax in cross-entropy.\n\nThe resulting `logits_per_image` matrix has shape [N, N] where entry [i, j] is the scaled cosine similarity between image i and text j. The diagonal entries are the correct pairs. During training (not shown in this forward pass), cross-entropy loss is applied both row-wise (which text matches each image?) and column-wise (which image matches each text?), and the two losses are averaged.",
+      "code_blocks": [
+        {
+          "label": "CLIP.forward: computing the contrastive similarity matrix",
+          "source": "    def forward(self, image, text):\n        image_features = self.encode_image(image)\n        text_features = self.encode_text(text)\n\n        # normalized features\n        image_features = image_features / image_features.norm(dim=1, keepdim=True)\n        text_features = text_features / text_features.norm(dim=1, keepdim=True)\n\n        # cosine similarity as logits\n        logit_scale = self.logit_scale.exp()\n        logits_per_image = logit_scale * image_features @ text_features.t()\n        logits_per_text = logits_per_image.t()\n\n        # shape = [global_batch_size, global_batch_size]\n        return logits_per_image, logits_per_text",
+          "source_start_line": 358,
+          "file_path": "clip/model.py",
+          "annotations": [
+            {
+              "start_line": 359,
+              "end_line": 360,
+              "explanation": "Each encoder produces a [batch_size, embed_dim] matrix. encode_image runs the ViT or ResNet; encode_text runs the causal transformer.",
+              "concept_tag": "other:forward-pass"
+            },
+            {
+              "start_line": 363,
+              "end_line": 364,
+              "explanation": "L2 normalization maps all embeddings to the unit hypersphere. Now dot product = cosine similarity, bounded in [-1, 1]. This normalization is critical — without it, the model could cheat by increasing embedding magnitudes.",
+              "concept_tag": "normalization"
+            },
+            {
+              "start_line": 367,
+              "end_line": 368,
+              "explanation": "logit_scale is stored in log-space and exponentiated here (starts at ~14.3, learned during training). The matrix multiply image_features @ text_features.t() produces the [N, N] similarity matrix. Diagonal = correct pairs.",
+              "concept_tag": "loss"
+            },
+            {
+              "start_line": 369,
+              "end_line": 369,
+              "explanation": "The loss is symmetric: logits_per_image rows ask 'which text matches this image?', logits_per_text rows ask 'which image matches this text?'. Both use cross-entropy with the diagonal as the target.",
+              "concept_tag": "loss"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "tokenization",
+      "title": "Tokenization and Image Preprocessing",
+      "narrative": "Before images and text can enter the model, they need to be transformed into the right format.\n\nFor images, CLIP uses a standard torchvision preprocessing pipeline: resize → center crop → convert to RGB → normalize with CLIP-specific mean/std values (computed from the WebImageText training set).\n\nFor text, CLIP uses byte-pair encoding (BPE) with a 49,152-token vocabulary. Each text is wrapped with special `<|startoftext|>` and `<|endoftext|>` tokens and padded/truncated to exactly 77 tokens. The tokenizer is case-insensitive and handles Unicode via a byte-level encoding scheme.",
+      "code_blocks": [
+        {
+          "label": "Image preprocessing pipeline",
+          "source": "def _transform(n_px):\n    return Compose([\n        Resize(n_px, interpolation=BICUBIC),\n        CenterCrop(n_px),\n        _convert_image_to_rgb,\n        ToTensor(),\n        Normalize((0.48145466, 0.4578275, 0.40821073), (0.26862954, 0.26130258, 0.27577711)),\n    ])",
+          "source_start_line": 79,
+          "file_path": "clip/clip.py",
+          "annotations": [
+            {
+              "start_line": 81,
+              "end_line": 82,
+              "explanation": "Resize then center crop to n_px × n_px (224 for most models, 336 for ViT-L/14@336px). BICUBIC interpolation preserves detail better than bilinear.",
+              "concept_tag": "other:preprocessing"
+            },
+            {
+              "start_line": 85,
+              "end_line": 85,
+              "explanation": "CLIP-specific normalization values computed from the WebImageText training dataset. These differ from the standard ImageNet values used by most vision models.",
+              "concept_tag": "normalization"
+            }
+          ]
+        },
+        {
+          "label": "Text tokenization with BPE",
+          "source": "def tokenize(texts: Union[str, List[str]], context_length: int = 77, truncate: bool = False) -> Union[torch.IntTensor, torch.LongTensor]:\n    \"\"\"\n    Returns the tokenized representation of given input string(s)\n\n    Parameters\n    ----------\n    texts : Union[str, List[str]]\n        An input string or a list of input strings to tokenize\n\n    context_length : int\n        The context length to use; all CLIP models use 77 as the context length\n\n    truncate: bool\n        Whether to truncate the text in case its encoding is longer than the context length\n\n    Returns\n    -------\n    A two-dimensional tensor containing the resulting tokens, shape = [number of input strings, context_length].\n    We return LongTensor when torch version is <1.8.0, since older index_select requires indices to be long.\n    \"\"\"\n    if isinstance(texts, str):\n        texts = [texts]\n\n    sot_token = _tokenizer.encoder[\"<|startoftext|>\"]\n    eot_token = _tokenizer.encoder[\"<|endoftext|>\"]\n    all_tokens = [[sot_token] + _tokenizer.encode(text) + [eot_token] for text in texts]\n    if version.parse(torch.__version__) < version.parse(\"1.8.0\"):\n        result = torch.zeros(len(all_tokens), context_length, dtype=torch.long)\n    else:\n        result = torch.zeros(len(all_tokens), context_length, dtype=torch.int)\n\n    for i, tokens in enumerate(all_tokens):\n        if len(tokens) > context_length:\n            if truncate:\n                tokens = tokens[:context_length]\n                tokens[-1] = eot_token\n            else:\n                raise RuntimeError(f\"Input {texts[i]} is too long for context length {context_length}\")\n        result[i, :len(tokens)] = torch.tensor(tokens)\n\n    return result",
+          "source_start_line": 205,
+          "file_path": "clip/clip.py",
+          "annotations": [
+            {
+              "start_line": 229,
+              "end_line": 231,
+              "explanation": "Each text gets SOT + BPE tokens + EOT. The BPE tokenizer splits text into subword units from a 49,152-token vocabulary. The special tokens frame the sequence for the causal transformer.",
+              "concept_tag": "embedding"
+            },
+            {
+              "start_line": 237,
+              "end_line": 244,
+              "explanation": "Sequences are padded with zeros to exactly context_length=77 tokens. If truncation is enabled, the sequence is cut and the last token is replaced with EOT to maintain the expected format.",
+              "concept_tag": "other:tokenization"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "putting-together",
+      "title": "Putting It All Together: Zero-Shot Classification",
+      "narrative": "CLIP's most impressive capability is zero-shot image classification — classifying images into categories the model has never been explicitly trained on. Here's how it works:\n\n1. **Encode class names as text**: For each target class (e.g. \"cat\", \"dog\", \"car\"), create a text prompt like \"a photo of a {class}\" and encode it with the text encoder. This produces one embedding per class.\n\n2. **Encode the image**: Run the test image through the vision encoder to get its embedding.\n\n3. **Compute similarities**: Calculate the cosine similarity between the image embedding and every class text embedding. The class with the highest similarity is the prediction.\n\nNo fine-tuning, no labeled examples from the target dataset — just natural language describing the classes. The `load()` function handles all the setup: downloading the checkpoint, building the model, and returning the matching preprocessor.\n\nCLIP ships with 9 model variants spanning both architectures: 5 ResNet models (RN50 through RN50x64) and 4 ViT models (ViT-B/32, ViT-B/16, ViT-L/14, ViT-L/14@336px). Larger models achieve better zero-shot accuracy, and ViT variants generally outperform their similarly-sized ResNet counterparts.",
+      "code_blocks": [
+        {
+          "label": "Available CLIP models and the load entrypoint",
+          "source": "_MODELS = {\n    \"RN50\": \"https://openaipublic.azureedge.net/clip/models/afeb0e10f9e5a86da6080e35cf09123aca3b358a0c3e3b6c78a7b63bc04b6762/RN50.pt\",\n    \"RN101\": \"https://openaipublic.azureedge.net/clip/models/8fa8567bab74a42d41c5915025a8e4538c3bdbe8804a470a72f30b0d94fab599/RN101.pt\",\n    \"RN50x4\": \"https://openaipublic.azureedge.net/clip/models/7e526bd135e493cef0776de27d5f42653e6b4c8bf9e0f653bb11773263205fdd/RN50x4.pt\",\n    \"RN50x16\": \"https://openaipublic.azureedge.net/clip/models/52378b407f34354e150460fe41077663dd5b39c54cd0bfd2b27167a4a06ec9aa/RN50x16.pt\",\n    \"RN50x64\": \"https://openaipublic.azureedge.net/clip/models/be1cfb55d75a9666199fb2206c106743da0f6468c9d327f3e0d0a543a9919d9c/RN50x64.pt\",\n    \"ViT-B/32\": \"https://openaipublic.azureedge.net/clip/models/40d365715913c9da98579312b702a82c18be219cc2a73407c4526f58eba950af/ViT-B-32.pt\",\n    \"ViT-B/16\": \"https://openaipublic.azureedge.net/clip/models/5806e77cd80f8b59890b7e101eabd078d9fb84e6937f9e85e4ecb61988df416f/ViT-B-16.pt\",\n    \"ViT-L/14\": \"https://openaipublic.azureedge.net/clip/models/b8cca3fd41ae0c99ba7e8951adf17d267cdb84cd88be6f7c2e0eca1737a03836/ViT-L-14.pt\",\n    \"ViT-L/14@336px\": \"https://openaipublic.azureedge.net/clip/models/3035c92b350959924f9f00213499208652fc7ea050643e8b385c2dac08641f02/ViT-L-14-336px.pt\",\n}",
+          "source_start_line": 30,
+          "file_path": "clip/clip.py",
+          "annotations": [
+            {
+              "start_line": 30,
+              "end_line": 40,
+              "explanation": "Nine pretrained checkpoints spanning two architecture families. RN50x4/x16/x64 scale the ResNet width by 4×/16×/64×. ViT models use patch sizes of 32, 16, or 14 pixels — smaller patches = more tokens = higher accuracy but more compute.",
+              "concept_tag": "other:model-zoo"
+            }
+          ]
+        },
+        {
+          "label": "build_model: reconstructing architecture from checkpoint",
+          "source": "def build_model(state_dict: dict):\n    vit = \"visual.proj\" in state_dict\n\n    if vit:\n        vision_width = state_dict[\"visual.conv1.weight\"].shape[0]\n        vision_layers = len([k for k in state_dict.keys() if k.startswith(\"visual.\") and k.endswith(\".attn.in_proj_weight\")])\n        vision_patch_size = state_dict[\"visual.conv1.weight\"].shape[-1]\n        grid_size = round((state_dict[\"visual.positional_embedding\"].shape[0] - 1) ** 0.5)\n        image_resolution = vision_patch_size * grid_size\n    else:\n        counts: list = [len(set(k.split(\".\")[2] for k in state_dict if k.startswith(f\"visual.layer{b}\"))) for b in [1, 2, 3, 4]]\n        vision_layers = tuple(counts)\n        vision_width = state_dict[\"visual.layer1.0.conv1.weight\"].shape[0]\n        output_width = round((state_dict[\"visual.attnpool.positional_embedding\"].shape[0] - 1) ** 0.5)\n        vision_patch_size = None\n        assert output_width ** 2 + 1 == state_dict[\"visual.attnpool.positional_embedding\"].shape[0]\n        image_resolution = output_width * 32\n\n    embed_dim = state_dict[\"text_projection\"].shape[1]\n    context_length = state_dict[\"positional_embedding\"].shape[0]\n    vocab_size = state_dict[\"token_embedding.weight\"].shape[0]\n    transformer_width = state_dict[\"ln_final.weight\"].shape[0]\n    transformer_heads = transformer_width // 64\n    transformer_layers = len(set(k.split(\".\")[2] for k in state_dict if k.startswith(\"transformer.resblocks\")))\n\n    model = CLIP(\n        embed_dim,\n        image_resolution, vision_layers, vision_width, vision_patch_size,\n        context_length, vocab_size, transformer_width, transformer_heads, transformer_layers\n    )\n\n    for key in [\"input_resolution\", \"context_length\", \"vocab_size\"]:\n        if key in state_dict:\n            del state_dict[key]\n\n    convert_weights(model)\n    model.load_state_dict(state_dict)\n    return model.eval()",
+          "source_start_line": 399,
+          "file_path": "clip/model.py",
+          "annotations": [
+            {
+              "start_line": 400,
+              "end_line": 400,
+              "explanation": "Clever architecture detection: ViT models have a 'visual.proj' parameter (the final projection matrix), while ResNet models don't (they use AttentionPool2d's c_proj instead).",
+              "concept_tag": "other:architecture-dispatch"
+            },
+            {
+              "start_line": 403,
+              "end_line": 407,
+              "explanation": "For ViT: reconstruct all hyperparameters from tensor shapes alone. Width from conv1 output channels, depth by counting attention blocks, patch size from conv1 kernel size, resolution from positional embedding count.",
+              "concept_tag": "other:model-construction"
+            },
+            {
+              "start_line": 417,
+              "end_line": 422,
+              "explanation": "Text encoder hyperparameters are also inferred from tensor shapes. This means CLIP checkpoints are self-describing — no separate config file needed. transformer_heads = width/64 is a fixed convention.",
+              "concept_tag": "other:model-construction"
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "summary": "CLIP (Contrastive Language-Image Pre-training) learns visual representations from 400 million (image, text) pairs using a dual-encoder architecture. A vision encoder (ViT or Modified ResNet) and a text encoder (causal Transformer) are trained jointly to maximize cosine similarity between matching image-text pairs in a shared embedding space. The contrastive objective, combined with internet-scale natural language supervision, enables zero-shot transfer to downstream vision tasks — classifying images by computing similarity with text prompts describing each class, without any task-specific training."
+}

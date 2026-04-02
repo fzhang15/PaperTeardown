@@ -29,6 +29,7 @@ const PAPER_POSITIONS: Record<string, TrackPos> = {
   ViT:                { track: 0, row: 0 },
   dinov3:             { track: 0, row: 1 },
   dit:                { track: 0, row: 2 },
+  CLIP:               { track: 0, row: 3 },
   act:                { track: 1, row: 0 },
   'diffusion-policy': { track: 1, row: 1 },
   rt1:                { track: 1, row: 2 },
@@ -65,7 +66,9 @@ const EDGES: Edge[] = [
   { from: 'rt1',  to: 'rt2' },
   { from: 'rt2',  to: 'pi0' },
   { from: 'pi0',  to: 'groot' },
+  { from: 'ViT',  to: 'CLIP',            dashed: true },   // CLIP uses ViT as vision encoder
   // Cross-track architectural borrowing — dashed bus wires through the column gap
+  { from: 'CLIP', to: 'rt2',             dashed: true },   // RT-2 builds on CLIP-style VLM approach
   { from: 'ViT',  to: 'rt1',             dashed: true },   // RT-1 uses ViT-like vision backbone
   { from: 'dit',  to: 'diffusion-policy', dashed: true },  // Diffusion Policy uses diffusion for action generation
   // Same-track lineage — dashed for indirect influence
