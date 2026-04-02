@@ -1,0 +1,271 @@
+{
+  "chapters": [
+    {
+      "id": "motor-skills-gap",
+      "title": "The Motor Skills Gap",
+      "narrative": "Humanoid robots can walk — but they walk like robots. Every joint is controlled by a separate PD loop, every motion is hand-tuned, and any behavior not explicitly programmed simply does not exist. If you want the robot to crawl, you write a crawling controller. If you want it to jump, you write a jumping controller. If you want it to stumble and recover naturally, you spend months in simulation.\n\nThis approach does not scale. Human motion is a rich, continuous space spanning thousands of behaviors — and we cannot hand-engineer our way across it. What we need is a way to teach the robot the full space of human motion at once, without specifying what each motion should look like.\n\nSONIC's core insight is deceptively simple: motion capture already contains this knowledge. Thousands of hours of human motion-capture recordings — walking, running, crawling, dancing, boxing, kneeling, getting up — each clip is a ground-truth demonstration of what natural whole-body movement looks like. Instead of designing rewards that nudge the robot toward human-like motion, SONIC uses the motion capture clips themselves as supervision targets. The policy must learn to reproduce whatever motion it is shown.\n\nThis reframing — from reward engineering to motion tracking — transforms the problem into one that scales with data and compute. More clips, more diversity. More compute, more capability. The scaling law for motor skills works the same way it does for language: quality of behavior improves predictably as you scale network parameters (1.2M → 42M), dataset size (100M+ frames, 700 hours), and training compute (9,000 GPU hours).\n\nThe result is SONIC: a single generalist policy that can walk, run, crawl, kneel, jump, and perform bimanual manipulation — all from a unified motion-tracking formulation.",
+      "code_blocks": []
+    },
+    {
+      "id": "smplx-human-representation",
+      "title": "SMPLX: The Language of Human Motion",
+      "narrative": "Before SONIC can train on motion capture data, it needs a way to represent human motion that is both expressive and compatible with a robot's joint space. This is where the SMPLX body model comes in.\n\nSMPLX (Skinned Multi-Person Linear model eXpressive) is a parametric body model developed by the MPI-IS group. It represents the human body as a kinematic tree with 144 degrees of freedom organized into anatomically meaningful groups: 21 body joints, jaw, eyes, left hand (45 DOF via PCA), and right hand (45 DOF via PCA). Every pose is encoded as a 165-dimensional vector of rotation angles in axis-angle format.\n\nSMPLX is the lingua franca of motion capture research. Datasets like AMASS, MotionX, and BEDLAM store motions in SMPLX format, which means SONIC can draw from a vast ecosystem of pre-processed motion data. The `decompose_fullpose` function splits the flat 165-dim vector into semantically named parts — a critical step before retargeting, since each part maps to a different region of the robot's body.\n\nThe key insight is that motion retargeting (converting human motion to robot joint targets) operates part-by-part: the body pose (21 joints × 3 = 63 values) maps to the robot's main limbs, while hand poses map to dexterous hand DOFs. Breaking the full pose into named segments makes the retargeting pipeline modular and auditable.",
+      "code_blocks": [
+        {
+          "label": "SMPLX full-pose decomposition into anatomical segments",
+          "source": "def decompose_fullpose(fullpose, model_type=\"smplx\"):\n    assert model_type == \"smplx\"\n\n    fullpose_dict = {\n        \"global_orient\": fullpose[..., :3],\n        \"body_pose\": fullpose[..., 3:66],\n        \"jaw_pose\": fullpose[..., 66:69],\n        \"leye_pose\": fullpose[..., 69:72],\n        \"reye_pose\": fullpose[..., 72:75],\n        \"left_hand_pose\": fullpose[..., 75:120],\n        \"right_hand_pose\": fullpose[..., 120:165],\n    }\n\n    return fullpose_dict",
+          "source_start_line": 301,
+          "file_path": "gear_sonic/trl/utils/smplx/smplx_utils.py",
+          "annotations": [
+            {
+              "start_line": 301,
+              "end_line": 302,
+              "explanation": "SMPLX represents the full body pose as a flat 165-dim axis-angle vector. This function unpacks it into named anatomical regions, making downstream retargeting code self-documenting.",
+              "concept_tag": "other:body-model"
+            },
+            {
+              "start_line": 305,
+              "end_line": 306,
+              "explanation": "The first 3 values are the global orientation of the root joint (pelvis) in the world frame — this is not a joint angle, but the overall body heading. It maps to the robot's floating base orientation.",
+              "concept_tag": "other:kinematics"
+            },
+            {
+              "start_line": 307,
+              "end_line": 307,
+              "explanation": "body_pose spans joints 1–21 (excluding root): spine, neck, shoulders, elbows, wrists, hips, knees, ankles. These 63 values are the core of the motion tracking target.",
+              "concept_tag": "other:kinematics"
+            },
+            {
+              "start_line": 311,
+              "end_line": 312,
+              "explanation": "Each hand has 45 DOF in the full SMPLX parameterization (15 joints × 3 axis-angle). These map to the robot's dexterous hand DOFs for bimanual manipulation behaviors.",
+              "concept_tag": "other:kinematics"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "forward-kinematics",
+      "title": "Forward Kinematics: Computing Where Every Body Part Is",
+      "narrative": "Motion retargeting requires translating human joint angles into robot joint angles — and to do that correctly, you need to know where every body part is in 3D space. Forward kinematics (FK) is the procedure that answers this question: given the root pose and all joint angles, compute the global position and orientation of every body link.\n\nSONIC implements this in `MuJoCoFKHelper`, a PyTorch `nn.Module` that wraps the robot's kinematic tree. The key data structures are the `_offsets` (bone lengths — the 3D displacement from each joint to its parent in rest pose) and `_local_rotation_mat` (the local frame alignment of each joint relative to its parent).\n\nThe kinematic computation is a depth-first traversal of the joint tree. For each body `i`, the position in the world frame is: parent's position + parent's rotation × bone offset. The rotation is: parent rotation × local alignment × joint rotation. This recursive accumulation propagates the root's world transform down to every finger, toe, and head.\n\nA subtle implementation detail: the G1 robot's 29-DOF joints are ordered differently between IsaacLab (the training simulator) and MuJoCo (the physics evaluator). IsaacLab interleaves left/right joints (L_hip_0, R_hip_0, L_hip_1, ...) while MuJoCo groups by limb (L_hip_0, L_hip_1, L_hip_2, ...). The `ISAACLAB_TO_MUJOCO_DOF` permutation table handles this mapping transparently.",
+      "code_blocks": [
+        {
+          "label": "Recursive forward kinematics: propagating poses down the kinematic tree",
+          "source": "    def _forward_kinematics(self, joint_rotations, root_rotations, root_positions):\n        \"\"\"FK for all bodies including extended.\"\"\"\n        device, dtype = root_rotations.device, root_rotations.dtype\n        B, T = joint_rotations.shape[:2]\n        J = self._offsets.shape[1]\n\n        offsets = self._offsets[:, None].expand(B, T, J, 3).to(device, dtype)\n        local_rot_mat = self._local_rotation_mat.to(device, dtype)\n        eye = torch.eye(3, device=device, dtype=dtype).view(1, 1, 1, 3, 3).expand(B, T, 1, 3, 3)\n\n        positions, rotations = [], []  \n        for i in range(J):\n            if self._parents[i] == -1:\n                positions.append(root_positions)\n                rotations.append(root_rotations)\n            else:\n                parent_rot, parent_pos = rotations[self._parents[i]], positions[self._parents[i]]\n                jpos = (\n                    torch.matmul(parent_rot[:, :, 0], offsets[:, :, i, :, None]).squeeze(-1)\n                    + parent_pos\n                )\n\n                joint_rot = joint_rotations[:, :, i - 1 : i] if i < self.num_bodies else eye\n                rot_mat = torch.matmul(\n                    parent_rot, torch.matmul(local_rot_mat[:, i : i + 1], joint_rot)\n                )\n\n                positions.append(jpos)\n                rotations.append(rot_mat)\n\n        return torch.stack(positions, dim=2), torch.cat(rotations, dim=2)",
+          "source_start_line": 182,
+          "file_path": "gear_sonic/trl/utils/mujoco_fk_utils.py",
+          "annotations": [
+            {
+              "start_line": 192,
+              "end_line": 196,
+              "explanation": "Root joint (parent == -1) directly uses the world-frame root position and rotation from the IMU/odometry. Every other body accumulates transforms relative to this anchor.",
+              "concept_tag": "other:kinematics"
+            },
+            {
+              "start_line": 198,
+              "end_line": 202,
+              "explanation": "Each joint position = parent position + parent rotation × bone offset. The bone offset is a constant anatomical measurement (distance between joints in rest pose), not a learned parameter.",
+              "concept_tag": "other:kinematics"
+            },
+            {
+              "start_line": 204,
+              "end_line": 207,
+              "explanation": "Each rotation = parent rotation × local alignment frame × joint rotation. The local alignment matrix corrects for the coordinate frame difference between how MuJoCo defines joints and the standard body-pose convention.",
+              "concept_tag": "other:kinematics"
+            },
+            {
+              "start_line": 212,
+              "end_line": 212,
+              "explanation": "Returns both positions [B, T, J, 3] and rotations [B, T, J, 3, 3] for all J bodies. This gives the full kinematic state needed to compute retargeting errors between the tracked motion and the robot's current pose.",
+              "concept_tag": "other:kinematics"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "observation-space",
+      "title": "What the Policy Sees: A 148-Dimensional Window into the Robot",
+      "narrative": "The SONIC policy is a function from robot state to joint targets. Understanding what is packed into that state is crucial for understanding what the policy can and cannot perceive.\n\nThe G1 robot's state is assembled in two stages. First, `BodyStateProcessor._prepare_low_state()` reads raw sensor data over DDS (Data Distribution Service) and assembles a 148-dimensional numpy array. The layout is: `q[0:7]` = root position (3) + root quaternion (4); `q[7:36]` = 29 joint angles; `dq[0:6]` = root linear + angular velocity (6); `dq[6:35]` = 29 joint velocities; then estimated torques, accelerations, and a secondary torso IMU (quaternion + angular velocity for separate torso sensing on the G1's split-torso design).\n\nThe comment `# (7 + 29) + (6 + 29) + (6 + 29) + (6 + 29) = 141 dim` in the code slightly understates the total because the secondary IMU quaternion (4) and angular velocity (3) add 7 more, reaching the asserted 148.\n\nSecond, `G1Body.observe()` slices this flat array into semantically meaningful fields, extracting only the body joints (legs + waist + arms = 12 + 3 + 7 + 7 = 29 DOF) and discarding hand DOFs which are managed by a separate `G1Hand` environment. This separation reflects the decoupled control strategy: the main WBC policy handles the body; a separate IK solver handles the wrists.",
+      "code_blocks": [
+        {
+          "label": "Assembling the 148-dim state vector from raw sensors",
+          "source": "    def _prepare_low_state(self) -> np.ndarray:\n        self.robot_low_state = self.robot_lowstate_subscriber.Read()\n        self.secondary_imu_state = self.secondary_imu_subscriber.Read()\n\n        if not self.robot_low_state:\n            print(\"No low state received\")\n            return\n        imu_state = self.robot_low_state.imu_state\n\n        # Use odo_state for position and velocity if available, otherwise set to zero\n        if self.config[\"ENV_TYPE\"] == \"sim\":\n            self.odo_state = self.odo_state_subscriber.Read()\n            self.q[0:3] = self.odo_state.position\n            self.dq[0:3] = self.odo_state.linear_velocity\n        else:\n            self.q[0:3] = [0.0, 0.0, 0.0]\n            self.dq[0:3] = [0.0, 0.0, 0.0]\n\n        self.q[3:7] = imu_state.quaternion  # w, x, y, z\n        self.dq[3:6] = imu_state.gyroscope\n        self.ddq[0:3] = imu_state.accelerometer\n        unitree_joint_state = self.robot_low_state.motor_state\n        self.torso_quat = self.secondary_imu_state.quaternion\n        self.torso_ang_vel = self.secondary_imu_state.gyroscope\n\n        for i in range(self.num_dof):\n            self.q[7 + i] = unitree_joint_state[self.config[\"JOINT2MOTOR\"][i]].q\n            self.dq[6 + i] = unitree_joint_state[self.config[\"JOINT2MOTOR\"][i]].dq\n            self.tau_est[6 + i] = unitree_joint_state[self.config[\"JOINT2MOTOR\"][i]].tau_est\n\n        robot_state_data = np.concatenate(\n            [self.q, self.dq, self.tau_est, self.ddq, self.torso_quat, self.torso_ang_vel], axis=0\n        ).reshape(1, -1)\n        # (7 + 29) + (6 + 29) + (6 + 29) + (6 + 29) = 141 dim\n\n        return robot_state_data",
+          "source_start_line": 72,
+          "file_path": "decoupled_wbc/control/envs/g1/utils/state_processor.py",
+          "annotations": [
+            {
+              "start_line": 82,
+              "end_line": 88,
+              "explanation": "In simulation, ground-truth position and velocity are available from the odometry topic. On real hardware they are zeroed — the policy must infer base motion from IMU and joint data alone. This sim-to-real gap is a deliberate design choice.",
+              "concept_tag": "other:sim-to-real"
+            },
+            {
+              "start_line": 90,
+              "end_line": 90,
+              "explanation": "The pelvis IMU quaternion gives the orientation of the robot's root link in the world frame. This is the primary source of gravity direction information — the policy uses it to distinguish \"standing upright\" from \"falling\".",
+              "concept_tag": "other:sensors"
+            },
+            {
+              "start_line": 97,
+              "end_line": 100,
+              "explanation": "JOINT2MOTOR is a config-specified permutation table that maps the policy's joint ordering to the motor bus indices on the actual hardware. The G1 has 29 body DOFs, but the motor IDs don't follow a simple sequential pattern.",
+              "concept_tag": "other:hardware"
+            },
+            {
+              "start_line": 102,
+              "end_line": 104,
+              "explanation": "Final concatenation assembles q, dq, tau_est, ddq, torso IMU into a single flat array. This is the raw observation tensor that the policy network consumes each timestep.",
+              "concept_tag": "other:observation"
+            }
+          ]
+        },
+        {
+          "label": "Slicing the flat state vector into named observation fields",
+          "source": "    def observe(self) -> dict[str, any]:\n        body_state = self.body_state_processor._prepare_low_state()  # (1, 148)\n        assert body_state.shape == (1, 148)\n        body_q = body_state[\n            0, 7 : 7 + 12 + 3 + 7 + 7\n        ]  # leg (12) + waist (3) + left arm (7) + right arm (7)\n        body_dq = body_state[0, 42 : 42 + 12 + 3 + 7 + 7]\n        body_ddq = body_state[0, 112 : 112 + 12 + 3 + 7 + 7]\n        body_tau_est = body_state[0, 77 : 77 + 12 + 3 + 7 + 7]\n        floating_base_pose = body_state[0, 0:7]\n        floating_base_vel = body_state[0, 36:42]\n        floating_base_acc = body_state[0, 106:112]\n        torso_quat = body_state[0, 141:145]\n        torso_ang_vel = body_state[0, 145:148]\n\n        return {\n            \"body_q\": body_q,\n            \"body_dq\": body_dq,\n            \"body_ddq\": body_ddq,\n            \"body_tau_est\": body_tau_est,\n            \"floating_base_pose\": floating_base_pose,\n            \"floating_base_vel\": floating_base_vel,\n            \"floating_base_acc\": floating_base_acc,\n            \"torso_quat\": torso_quat,\n            \"torso_ang_vel\": torso_ang_vel,\n        }",
+          "source_start_line": 17,
+          "file_path": "decoupled_wbc/control/envs/g1/g1_body.py",
+          "annotations": [
+            {
+              "start_line": 18,
+              "end_line": 19,
+              "explanation": "The hard-coded shape assertion (1, 148) acts as a contract between the sensor stack and the policy network. If sensor wiring changes, this fails loudly rather than silently corrupting policy inputs.",
+              "concept_tag": "other:observation"
+            },
+            {
+              "start_line": 20,
+              "end_line": 22,
+              "explanation": "The G1's 29 body DOFs are: 12 leg joints (6 per leg), 3 waist joints, 7 left arm joints, 7 right arm joints. The slice starts at index 7 (after root position + quaternion). The 29-DOF layout matches the motion capture retargeting target.",
+              "concept_tag": "other:observation"
+            },
+            {
+              "start_line": 29,
+              "end_line": 30,
+              "explanation": "The G1 has a secondary IMU on the torso (above the waist joint), distinct from the pelvis IMU. This gives the policy independent orientation information for the upper and lower body — especially useful for motions where the waist bends.",
+              "concept_tag": "other:sensors"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "episode-attention-mask",
+      "title": "Episode-Aware Attention: Keeping the Policy From Peering Across Episode Boundaries",
+      "narrative": "SONIC uses a Transformer-based policy architecture. At each timestep, the policy attends over a history window of past observations to produce the next action. This is powerful — the policy can adapt its behavior based on recent dynamics — but it creates a subtle training problem.\n\nDuring parallel RL training, many independent simulation environments run simultaneously. Each environment resets periodically when the robot falls or a motion clip ends. The policy's history window spans these resets, which means without intervention the policy would see observations from the end of one episode followed by observations from the start of a completely different episode. Attending across this boundary is meaningless and harmful: the state before a reset has no causal relationship to the state after.\n\n`compute_episode_attnmask` solves this by constructing a causal mask that prevents the Transformer from attending to any observation that belongs to a different episode than the current query. The algorithm uses the `dones` signal (1.0 when an episode ends) to assign a monotonically increasing episode ID to each timestep, then masks out all pairs (i, j) where the episode IDs differ.\n\nThis is analogous to document-boundary masking in language model training: when training on many concatenated documents, you prevent attention from flowing between documents. SONIC applies the same principle to trajectories.",
+      "code_blocks": [
+        {
+          "label": "Computing episode-boundary attention masks for multi-env RL training",
+          "source": "def compute_episode_attnmask(dones):\n    \"\"\"\n    Compute an attention mask that prevents the model from attending to observations from different episodes.\n\n    Args:\n        dones (torch.Tensor): A tensor of shape (num_envs, num_steps) indicating when each environment episode ends.\n                                A value of 1.0 indicates the end of an episode.\n\n    Returns:\n        torch.Tensor: An attention mask of shape (num_envs, num_steps, num_steps) where True values indicate\n                        positions that should be masked (i.e., the model should not attend to these positions).\n    \"\"\"\n    # Create cumulative sum of dones to identify different episodes\n    episode_starts = torch.roll(dones, 1, dims=1)\n    episode_starts[:, 0] = True  # First step is always start of an episode\n    episode_ids = torch.cumsum(episode_starts, dim=1)  # (num_envs, num_steps)\n\n    # Expand episode_ids for broadcasting\n    episode_ids_i = episode_ids.unsqueeze(2)  # (num_envs, num_steps, 1)\n    episode_ids_j = episode_ids.unsqueeze(1)  # (num_envs, 1, num_steps)\n\n    # Create mask where True indicates positions from different episodes\n    attnmask = episode_ids_i != episode_ids_j\n    return attnmask",
+          "source_start_line": 6,
+          "file_path": "gear_sonic/trl/utils/rl.py",
+          "annotations": [
+            {
+              "start_line": 19,
+              "end_line": 21,
+              "explanation": "torch.roll shifts the dones tensor by 1, converting episode-end signals into episode-start signals. cumsum then assigns a unique integer ID to each episode — 0 for the first, 1 for the second, etc.",
+              "concept_tag": "attention"
+            },
+            {
+              "start_line": 23,
+              "end_line": 25,
+              "explanation": "Broadcasting trick: episode_ids_i has shape (envs, steps, 1) and episode_ids_j has shape (envs, 1, steps). Comparing them produces a (envs, steps, steps) boolean mask — the attention weight matrix shape.",
+              "concept_tag": "attention"
+            },
+            {
+              "start_line": 27,
+              "end_line": 28,
+              "explanation": "True means \"block attention here\". When episode IDs differ (step i and step j belong to different episodes), the mask blocks that attention entry. This is the same semantic as the causal mask in decoder transformers.",
+              "concept_tag": "attention"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "quaternion-interpolation",
+      "title": "Smooth Motions: Quaternion Interpolation for Frame Rate Conversion",
+      "narrative": "Motion capture datasets come at varying frame rates (typically 30, 60, or 120 fps). The robot control loop runs at 50 Hz. Before a motion clip can be used as a tracking target, it must be resampled to match the control frequency. This sounds simple — just interpolate between frames — but for rotations, naive linear interpolation produces wrong results.\n\nConsider two quaternions representing joint orientations 0.1 seconds apart. Linear interpolation (LERP) between them would move through non-unit quaternions and produce distorted orientations at intermediate frames. The correct approach is Spherical Linear Interpolation (SLERP), which interpolates along the shortest arc on the 4D unit sphere.\n\nSONIC's `slerp` function implements the standard SLERP formula with two important numerical safety checks. First, when two quaternions point in opposite hemispheres (negative dot product), it negates one before interpolating — this is necessary because q and -q represent the same rotation, but SLERP between them would take the long way around the sphere. Second, when the quaternions are nearly identical (cos_half_theta ≈ 1), it falls back to plain linear interpolation to avoid dividing by sin(≈0).\n\nAt the higher level, `interpolate_pose` orchestrates resampling for an entire body pose: it applies SLERP joint-by-joint across all 21 SMPLX body joints, converting motion capture clips from source_fps to the robot's target_fps.",
+      "code_blocks": [
+        {
+          "label": "Spherical linear interpolation (SLERP) for quaternion rotation sequences",
+          "source": "def slerp(q0, q1, t):\n    # type: (torch.Tensor, torch.Tensor, torch.Tensor) -> torch.Tensor\n\n    cos_half_theta = torch.sum(q0 * q1, dim=-1)\n\n    neg_mask = cos_half_theta < 0\n    q1 = q1.clone()\n\n    # Replace: q1[neg_mask] = -q1[neg_mask]\n    # With: torch.where for safer broadcasting\n    neg_mask_expanded = neg_mask.unsqueeze(-1).expand_as(q1)\n    q1 = torch.where(neg_mask_expanded, -q1, q1)\n\n    cos_half_theta = torch.abs(cos_half_theta)\n    cos_half_theta = torch.unsqueeze(cos_half_theta, dim=-1)\n\n    half_theta = torch.acos(cos_half_theta)\n    sin_half_theta = torch.sqrt(1.0 - cos_half_theta * cos_half_theta)\n\n    ratioA = torch.sin((1 - t[:, None]) * half_theta) / sin_half_theta\n    ratioB = torch.sin(t[:, None] * half_theta) / sin_half_theta\n\n    new_q = ratioA * q0 + ratioB * q1\n\n    new_q = torch.where(torch.abs(sin_half_theta) < 0.001, 0.5 * q0 + 0.5 * q1, new_q)\n    new_q = torch.where(torch.abs(cos_half_theta) >= 1, q0, new_q)\n\n    return new_q",
+          "source_start_line": 29,
+          "file_path": "gear_sonic/trl/utils/math.py",
+          "annotations": [
+            {
+              "start_line": 32,
+              "end_line": 32,
+              "explanation": "The dot product of two unit quaternions equals cos(half the angle between the rotations they represent). Values near 1 mean the rotations are close; values near -1 mean they're nearly opposite in quaternion space (but identical as rotations).",
+              "concept_tag": "other:math"
+            },
+            {
+              "start_line": 34,
+              "end_line": 41,
+              "explanation": "The double-cover fix: q and -q represent the same 3D rotation, but SLERP between them would travel the long way around the 4D sphere. Negating q1 when the dot product is negative ensures we always take the shorter arc.",
+              "concept_tag": "other:math"
+            },
+            {
+              "start_line": 48,
+              "end_line": 51,
+              "explanation": "The SLERP formula: weight each endpoint by sin((1-t)*θ)/sin(θ) and sin(t*θ)/sin(θ). For t=0 we get q0; for t=1 we get q1; for t=0.5 we get the midpoint rotation.",
+              "concept_tag": "other:math"
+            },
+            {
+              "start_line": 53,
+              "end_line": 54,
+              "explanation": "Two numerical fallbacks: when sin_half_theta ≈ 0 (quaternions nearly identical), plain average avoids division by zero. When cos_half_theta ≈ 1 (same rotation), return q0 directly.",
+              "concept_tag": "other:math"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "lr-scheduler",
+      "title": "Training Stability: Warmup-Cosine Learning Rate Scheduling",
+      "narrative": "Training a 42M-parameter Transformer policy from scratch on 100M+ motion frames is numerically challenging. Large random initial weights produce large gradient updates at the start of training, which can destabilize the network before it has learned any useful representations. SONIC uses a warmup-cosine learning rate schedule to handle this.\n\nThe schedule has two phases. During warmup (first `num_warmup_steps` steps), the learning rate rises linearly from zero to the base LR. This prevents the catastrophic gradient updates that occur when a randomly initialized network starts training at full learning rate. After warmup, the LR decays following a cosine curve from the base rate down to `final_lr`. Cosine decay is smoother than step decay — the LR changes quickly at the start of the decay phase and slowly near the end, which tends to produce better final convergence.\n\nThis schedule is essentially standard practice for large-scale Transformer training (it matches the schedule used in BERT, GPT, and most modern VLMs). What is notable here is that SONIC applies it to the RL training loop — not just supervised pre-training. The motion tracking loss provides a dense, stable training signal that makes LR scheduling effective even in the RL setting.",
+      "code_blocks": [
+        {
+          "label": "Warmup-cosine LR scheduler for stable Transformer policy training",
+          "source": "class WarmupCosineScheduler(_LRScheduler):\n    def __init__(\n        self,\n        optimizer: Optimizer,\n        num_warmup_steps: int,\n        num_training_steps: int,\n        final_lr: float = 0.0,\n        last_epoch: int = -1,\n    ):\n        self.num_warmup_steps = num_warmup_steps\n        self.num_training_steps = num_training_steps\n        self.final_lr = final_lr\n        super(WarmupCosineScheduler, self).__init__(optimizer, last_epoch)\n\n    def get_lr(self):\n        current_step = self.last_epoch\n        if current_step < self.num_warmup_steps:\n            return [\n                base_lr * float(current_step) / float(max(1, self.num_warmup_steps))\n                for base_lr in self.base_lrs\n            ]\n        else:\n            progress = float(current_step - self.num_warmup_steps) / float(\n                max(1, self.num_training_steps - self.num_warmup_steps)\n            )\n            cosine_decay = 0.5 * (1.0 + math.cos(math.pi * min(progress, 1.0)))\n            return [\n                self.final_lr + (base_lr - self.final_lr) * cosine_decay\n                for base_lr in self.base_lrs\n            ]",
+          "source_start_line": 356,
+          "file_path": "gear_sonic/trl/utils/scheduler.py",
+          "annotations": [
+            {
+              "start_line": 372,
+              "end_line": 376,
+              "explanation": "Linear warmup: LR = base_lr × (step / warmup_steps). At step 0 the LR is 0; at step num_warmup_steps it reaches base_lr. The max(1, ...) prevents division by zero when warmup_steps=0.",
+              "concept_tag": "other:training"
+            },
+            {
+              "start_line": 377,
+              "end_line": 381,
+              "explanation": "Cosine decay: progress goes from 0 to 1 across the training duration. cos(π × progress) goes from 1 to -1, so (1 + cos(π × progress)) / 2 goes from 1 to 0 — a smooth decay curve.",
+              "concept_tag": "other:training"
+            },
+            {
+              "start_line": 382,
+              "end_line": 385,
+              "explanation": "final_lr allows setting a non-zero floor, so the policy continues to update (just more slowly) in the final training phase. Setting final_lr > 0 can prevent the optimizer from stagnating.",
+              "concept_tag": "other:training"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "kinematic-planner",
+      "title": "The Kinematic Planner: From High-Level Commands to Motion Targets",
+      "narrative": "SONIC is trained to track motion capture clips. At inference time, someone still needs to decide which motion to play — this is the kinematic planner's job.\n\nThe planner is a real-time system that generates motion reference trajectories on-the-fly from high-level commands. Instead of replaying pre-recorded clips, it synthesizes motion sequences in response to steering inputs: walk forward at 0.8 m/s; change direction left; kneel; jump. The planner maintains a motion style (e.g., \"normal walk\", \"stealth\", \"injured\") and a set of locomotion parameters (velocity, height, cadence) that it continuously updates from the command interface.\n\nFrom an architecture standpoint, the planner bridges the gap between task-level commands and the motion-tracking policy. The system supports three command modalities: (1) keyboard/gamepad for human operators, (2) VR headset (PICO) for whole-body teleoperation, and (3) VLA systems (like GR00T N1) that generate commands programmatically. All three modalities funnel commands into a unified `wbc_goal` dictionary that the policy consumes.\n\nThe control loop runs at 50 Hz. Each iteration: read robot state, get new command (if any), call policy to get target joints, send targets to hardware. The telemetry system measures how long each phase takes and warns when the loop misses its timing budget — a real-time constraint critical for stable whole-body control.",
+      "code_blocks": []
+    },
+    {
+      "id": "putting-it-all-together",
+      "title": "Putting It All Together: From Motion Data to a Generalist Motor Cortex",
+      "narrative": "SONIC's architecture can be summarized as a data pipeline that runs from motion capture datasets to a deployed policy on a physical humanoid robot.\n\n**Data pipeline**: Motion capture clips (AMASS, MotionX, BONES-SEED, and others) are stored in SMPLX format. The retargeting pipeline reads each clip, uses `decompose_fullpose` to break the 165-dim SMPLX pose vector into body segments, then runs inverse kinematics to compute the corresponding G1 joint angles. The `MuJoCoFKHelper` is used to verify retargeting accuracy by comparing the robot's forward-kinematic body positions to the motion capture's body positions. All clips are resampled to 50 Hz using quaternion SLERP.\n\n**Training**: A Transformer policy is trained in Isaac Lab simulation on thousands of parallel environments. Each environment samples a motion clip, randomizes the start frame, and tasks the policy with tracking it as closely as possible. The loss is a tracking error in joint space — the L2 distance between the policy's joint targets and the reference motion's joint angles. The episode attention mask prevents cross-episode attention leakage. A warmup-cosine LR schedule ensures stable training from random initialization.\n\n**Deployment**: The trained policy is exported to ONNX and deployed via a C++ inference stack at 50 Hz on the G1 hardware. The kinematic planner generates reference motion targets in real time. The `BodyStateProcessor` reads sensor data over the Unitree DDS protocol. The `G1Body` environment slices the state vector and feeds it to the policy. Actions are joint position targets sent as low-level motor commands.\n\n**Scaling**: Three axes of scaling were systematically ablated. Model size (1.2M → 42M parameters): larger Transformers track more diverse motions and generalize better. Dataset size (increasing clip diversity): more motion types directly improve the set of behaviors the policy can execute. Training compute (longer training, more GPU hours): policies continue to improve up to 9,000 GPU hours on the NVIDIA GPU cluster.\n\nThe result is a policy that walks naturally, runs, crawls, kneels, jumps, and performs bimanual manipulation — all from a single set of weights, without a single hand-crafted reward term.",
+      "code_blocks": []
+    }
+  ],
+  "summary": "SONIC reframes humanoid whole-body control as a motion-tracking problem: instead of hand-engineering reward functions for each behavior, train a Transformer policy to reproduce motion capture clips, then scale up the dataset, model size, and compute. The technical stack involves SMPLX body model retargeting to convert human motion-capture data to G1 robot joint trajectories (using forward kinematics with MuJoCoFKHelper), quaternion SLERP for frame-rate resampling, episode-boundary attention masking for multi-environment RL training, and a real-time kinematic planner that bridges high-level commands (VR, keyboard, VLA systems) to motion tracking targets. The result is a 42M-parameter generalist policy trained on 700 hours of motion data that produces natural whole-body movement across walking, running, crawling, kneeling, jumping, and bimanual manipulation."
+}

@@ -110,6 +110,16 @@
     "ingested_at": "2026-04-01T00:00:00Z"
   },
   {
+    "id": "sonic",
+    "title": "SONIC: Supersizing Motion Tracking for Natural Humanoid Whole-Body Control",
+    "authors": ["Zhengyi Luo", "Ye Yuan", "Tingwu Wang", "Linxi Fan", "Yuke Zhu", "et al."],
+    "arxiv_url": "https://arxiv.org/abs/2511.07820",
+    "repo_url": "https://github.com/NVlabs/GR00T-WholeBodyControl",
+    "abstract": "SONIC demonstrates that scaling motion tracking — using motion-capture data as direct policy supervision — produces a generalist humanoid controller with natural, dependable full-body movement. The approach scales along three axes: network parameters (1.2M to 42M), dataset scope (100M+ frames, 700 hours of human motion), and training compute (9k GPU hours). A real-time universal kinematic planner bridges motion tracking to downstream tasks, supporting VR teleoperation, video retargeting, and VLA control within a single unified policy.",
+    "chapter_count": 9,
+    "ingested_at": "2026-04-02T00:00:00Z"
+  },
+  {
     "id": "pi0",
     "title": "pi0: A Vision-Language-Action Flow Model for General Robot Control",
     "authors": ["Kevin Black", "Noah Brown", "Danny Driess", "Chelsea Finn", "Karol Hausman", "Sergey Levine", "et al."],

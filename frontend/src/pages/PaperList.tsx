@@ -38,6 +38,7 @@ const PAPER_POSITIONS: Record<string, TrackPos> = {
   groot:              { track: 1, row: 5 },
   'mobile-aloha':     { track: 1, row: 6 },
   '3d-vla':           { track: 1, row: 7 },
+  sonic:              { track: 1, row: 8 },
 }
 
 // ---------------------------------------------------------------------------
@@ -76,6 +77,7 @@ const EDGES: Edge[] = [
   // Skip-row same-track influence — dashed right-bypass wires (rendered around card stack)
   { from: 'act',  to: 'mobile-aloha', dashed: true },  // Mobile ALOHA = ACT + mobile base
   { from: 'rt2',  to: '3d-vla',       dashed: true },  // 3D-VLA extends the VLA paradigm
+  { from: 'groot', to: 'sonic' },                       // SONIC is NVIDIA's next-gen humanoid controller after GR00T
 ]
 
 // ---------------------------------------------------------------------------
