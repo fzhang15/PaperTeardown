@@ -1,0 +1,12 @@
+{
+  "id": "sam3",
+  "title": "SAM 3: Segment Anything with Concepts",
+  "authors": ["Nicolas Carion", "Laura Gustafson", "Yuan-Ting Hu", "Shoubhik Debnath", "Ronghang Hu", "Didac Suris", "Chaitanya Ryali", "Kalyan Vasudev Alwala", "Haitham Khedr", "Piotr Dollar", "Nikhila Ravi", "Kate Saenko", "Pengchuan Zhang", "Christoph Feichtenhofer"],
+  "arxiv_url": "https://arxiv.org/abs/2511.16719",
+  "repo_url": "https://github.com/facebookresearch/sam3",
+  "abstract": "SAM 3 is a unified foundation model for promptable segmentation in images and videos. It can detect, segment, and track objects using text or visual prompts such as points, boxes, and masks. Compared to its predecessor SAM 2, SAM 3 introduces the ability to exhaustively segment all instances of an open-vocabulary concept specified by a short text phrase or exemplars. Unlike prior work, SAM 3 can handle a vastly larger set of open-vocabulary prompts. It achieves 75-80% of human performance on a new SA-CO benchmark which contains 270K unique concepts, over 50 times more than existing benchmarks.",
+  "introduction_excerpt": "SAM 3 extends the Segment Anything line (SAM → SAM 2 → SAM 3) to open-vocabulary concept-based segmentation. Key innovations include a presence token for concept disambiguation, Decoupled Anchor Queries for improved training, a multiplex mask decoder for multi-object efficiency, and a decoupled detector-tracker architecture.",
+  "module_count": 15,
+  "pytorch_file_count": 30,
+  "ingested_at": "2026-04-02T00:00:00Z"
+}

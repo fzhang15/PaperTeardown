@@ -39,6 +39,7 @@ const PAPER_POSITIONS: Record<string, TrackPos> = {
   'mobile-aloha':     { track: 1, row: 6 },
   '3d-vla':           { track: 1, row: 7 },
   sonic:              { track: 1, row: 8 },
+  sam3:               { track: 2, row: 0 },
 }
 
 // ---------------------------------------------------------------------------
@@ -54,6 +55,7 @@ interface TrackConfig {
 const TRACKS: TrackConfig[] = [
   { id: 'foundations',    label: 'Vision & Generative Foundations', color: '#eff6ff', borderColor: '#bfdbfe' },
   { id: 'robot-learning', label: 'Robot Foundation Models',          color: '#f0fdf4', borderColor: '#bbf7d0' },
+  { id: 'segmentation',   label: 'Segmentation & Detection',        color: '#fdf2f8', borderColor: '#fbcfe8' },
 ]
 
 // ---------------------------------------------------------------------------
@@ -78,6 +80,9 @@ const EDGES: Edge[] = [
   { from: 'act',  to: 'mobile-aloha', dashed: true },  // Mobile ALOHA = ACT + mobile base
   { from: 'rt2',  to: '3d-vla',       dashed: true },  // 3D-VLA extends the VLA paradigm
   { from: 'groot', to: 'sonic' },                       // SONIC is NVIDIA's next-gen humanoid controller after GR00T
+  // Cross-track into segmentation
+  { from: 'ViT',  to: 'sam3',  dashed: true },         // SAM 3 uses ViT backbone
+  { from: 'CLIP', to: 'sam3',  dashed: true },         // SAM 3 uses CLIP-style text encoder
 ]
 
 // ---------------------------------------------------------------------------

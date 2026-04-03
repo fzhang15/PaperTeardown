@@ -1,0 +1,374 @@
+{
+  "chapters": [
+    {
+      "id": "overview",
+      "title": "What is SAM 3?",
+      "narrative": "SAM 3 (Segment Anything with Concepts) is the third generation of Meta's Segment Anything series. While SAM could segment anything given a point/box/mask prompt, and SAM 2 extended this to video, SAM 3 adds open-vocabulary concept understanding — you can now say \"segment all players in white\" and it finds every instance.\n\nThe key innovations over SAM 2:\n\n• A text encoder (CLIP-style) that enables open-vocabulary prompting with 270K+ unique concepts\n• A presence token that helps discriminate between closely related text prompts (e.g. \"player in white\" vs \"player in red\")\n• Decoupled Anchor Queries (DAC) that separate one-to-one and one-to-many matching in the decoder for better training\n• A multiplex mask decoder that processes multiple objects simultaneously in a single forward pass\n• A decoupled detector–tracker design that handles detection and temporal tracking with separate heads but a shared backbone\n\nThe architecture follows a DETR-like detect-then-segment pipeline: ViT backbone → FPN neck → transformer encoder-decoder → mask decoder, with a memory bank for video tracking. The codebase lives in `sam3/` with models in `sam3/model/` and training code in `sam3/train/`.",
+      "code_blocks": []
+    },
+    {
+      "id": "vit-backbone",
+      "title": "Step 1: ViT Backbone — Image to Feature Tokens",
+      "narrative": "SAM 3 uses a ViT-Large backbone adapted from ViTDet for object detection. The key configuration: 1008×1008 input images, 14×14 patches (yielding a 72×72 feature grid), 32 transformer layers, 16 attention heads, and 1024-dim embeddings.\n\nA crucial design choice: most layers use windowed attention (window_size=24) for efficiency, while only 4 layers (7, 15, 23, 31 — the \"global attention blocks\") attend to the full feature map. This hybrid gives both local detail and global context without the O(N²) cost of full attention everywhere.\n\nThe backbone also uses 2D Rotary Position Embeddings (RoPE) instead of learned absolute positions, enabling the model to handle different input resolutions at inference time.",
+      "code_blocks": [
+        {
+          "label": "ViT.__init__ — backbone configuration",
+          "source": "class ViT(nn.Module):\n    \"\"\"\n    This module implements Vision Transformer (ViT) backbone in :paper:`vitdet`.\n    \"Exploring Plain Vision Transformer Backbones for Object Detection\",\n    https://arxiv.org/abs/2203.16527\n    \"\"\"\n\n    def __init__(\n        self,\n        img_size: int = 1024,\n        patch_size: int = 16,\n        in_chans: int = 3,\n        embed_dim: int = 768,\n        depth: int = 12,\n        num_heads: int = 12,\n        mlp_ratio: float = 4.0,\n        qkv_bias: bool = True,\n        drop_path_rate: float = 0.0,\n        norm_layer: Union[Callable[..., nn.Module], str] = \"LayerNorm\",\n        act_layer: Callable[..., nn.Module] = nn.GELU,\n        use_abs_pos: bool = True,\n        tile_abs_pos: bool = True,\n        rel_pos_blocks: Union[Tuple[int, ...], bool] = (2, 5, 8, 11),\n        rel_pos_zero_init: bool = True,\n        window_size: int = 14,\n        global_att_blocks: Tuple[int, ...] = (2, 5, 8, 11),\n        use_rope: bool = False,\n        use_tiled_rope: bool = False,\n        rope_pt_size: Optional[int] = None,\n        use_interp_rope: bool = False,\n        use_ve_rope: bool = False,\n        use_act_checkpoint: bool = True,\n        pretrain_img_size: int = 224,\n        pretrain_use_cls_token: bool = True,\n        retain_cls_token: bool = True,\n        dropout: float = 0.0,\n        return_interm_layers: bool = False,\n        init_values: Optional[float] = None,  # for layerscale\n        attn_type: AttentionType = AttentionType.Vanilla,\n        ln_pre: bool = False,\n        ln_post: bool = False,\n        bias_patch_embed: bool = True,\n        compile_mode: Optional[str] = None,\n        use_fa3: bool = False,\n        use_rope_real: bool = False,\n    ):",
+          "source_start_line": 743,
+          "file_path": "sam3/model/vitdet.py",
+          "annotations": [
+            {
+              "start_line": 769,
+              "end_line": 770,
+              "explanation": "window_size controls local attention windows. global_att_blocks specifies which layers use full-image attention. In SAM 3's config: window_size=24, global_att_blocks=(7,15,23,31) — so 28 layers use 24×24 windowed attention, and 4 layers see the full 72×72 grid.",
+              "concept_tag": "attention"
+            },
+            {
+              "start_line": 771,
+              "end_line": 771,
+              "explanation": "2D RoPE replaces fixed positional embeddings. This is critical for resolution flexibility — the model can handle different image sizes at inference without retraining.",
+              "concept_tag": "embedding"
+            }
+          ]
+        },
+        {
+          "label": "Block.forward — windowed vs global attention",
+          "source": "    def forward(self, x: Tensor) -> Tensor:\n        shortcut = x\n        x = self.norm1(x)\n        # Window partition\n        if self.window_size > 0:\n            H, W = x.shape[1], x.shape[2]\n            x, pad_hw = window_partition(x, self.window_size)\n\n        x = self.ls1(self.attn(x))\n        # Reverse window partition\n        if self.window_size > 0:\n            x = window_unpartition(x, self.window_size, pad_hw, (H, W))\n\n        x = shortcut + self.dropout(self.drop_path(x))\n        x = x + self.dropout(self.drop_path(self.ls2(self.mlp(self.norm2(x)))))\n\n        return x",
+          "source_start_line": 724,
+          "file_path": "sam3/model/vitdet.py",
+          "annotations": [
+            {
+              "start_line": 728,
+              "end_line": 731,
+              "explanation": "Window partition: if window_size > 0, the (B, H, W, C) features are split into non-overlapping windows of size (window_size × window_size). Attention is computed within each window independently, reducing the cost from O(HW)² to O(window²) × num_windows.",
+              "concept_tag": "attention"
+            },
+            {
+              "start_line": 734,
+              "end_line": 735,
+              "explanation": "After attention, windows are stitched back into the full spatial grid. Global attention blocks skip windowing entirely (window_size=0), allowing information to flow across the entire image.",
+              "concept_tag": "attention"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "dual-neck",
+      "title": "Step 2: Dual FPN Neck — Multi-Scale Features",
+      "narrative": "The ViT backbone outputs a single-resolution feature map. But segmentation and tracking need different feature scales. SAM 3 uses a \"dual neck\" design from ViTDet: two independent SimpleFPN (Feature Pyramid Network) necks that share the same ViT backbone but have separate learned weights.\n\nThe first neck produces multi-scale features for SAM 3's detection/segmentation head. The second neck (optional, enabled for interactive tracking) produces features for the SAM 2-style tracking head. Each neck creates 4 scale levels using deconvolutions (4× and 2× upsampling) and max-pooling (0.5× downsampling), all projected to 256 channels.\n\nThis dual-neck design is key to the decoupled detector-tracker architecture: detection and tracking share the expensive ViT backbone computation but get their own tailored feature representations.",
+      "code_blocks": [
+        {
+          "label": "Sam3DualViTDetNeck — dual FPN neck",
+          "source": "class Sam3DualViTDetNeck(nn.Module):\n    def __init__(\n        self,\n        trunk: nn.Module,\n        position_encoding: nn.Module,\n        d_model: int,\n        scale_factors=(4.0, 2.0, 1.0, 0.5),\n        add_sam2_neck: bool = False,\n    ):\n        \"\"\"\n        SimpleFPN neck a la ViTDet\n        (From detectron2, very lightly adapted)\n        It supports a \"dual neck\" setting, where we have two identical necks (for SAM3 and SAM2), with different weights\n\n        :param trunk: the backbone\n        :param position_encoding: the positional encoding to use\n        :param d_model: the dimension of the model\n        \"\"\"\n        super().__init__()\n        self.trunk = trunk\n        self.position_encoding = position_encoding\n        self.convs = nn.ModuleList()\n\n        self.scale_factors = scale_factors\n        use_bias = True\n        dim: int = self.trunk.channel_list[-1]",
+          "source_start_line": 15,
+          "file_path": "sam3/model/necks.py",
+          "annotations": [
+            {
+              "start_line": 22,
+              "end_line": 22,
+              "explanation": "Four scale factors produce a feature pyramid: 4× up (1/4 res), 2× up (1/2 res), 1× (native), 0.5× down (2× downsampled). This multi-scale representation is essential for detecting objects of varying sizes.",
+              "concept_tag": "convolution"
+            },
+            {
+              "start_line": 23,
+              "end_line": 23,
+              "explanation": "When add_sam2_neck=True, a second independent FPN is created with cloned (but separately-trained) weights. The detector uses one neck, the tracker uses the other — this is the \"decoupled\" part of SAM 3's detector-tracker design.",
+              "concept_tag": "other:architecture"
+            }
+          ]
+        },
+        {
+          "label": "Sam3DualViTDetNeck.forward — shared backbone, separate necks",
+          "source": "    def forward(\n        self, tensor_list: List[torch.Tensor]\n    ) -> Tuple[\n        List[torch.Tensor],\n        List[torch.Tensor],\n        Optional[List[torch.Tensor]],\n        Optional[List[torch.Tensor]],\n    ]:\n        xs = self.trunk(tensor_list)\n        sam3_out, sam3_pos = [], []\n        sam2_out, sam2_pos = None, None\n        if self.sam2_convs is not None:\n            sam2_out, sam2_pos = [], []\n        x = xs[-1]  # simpleFPN\n        for i in range(len(self.convs)):\n            sam3_x_out = self.convs[i](x)\n            sam3_pos_out = self.position_encoding(sam3_x_out).to(sam3_x_out.dtype)\n            sam3_out.append(sam3_x_out)\n            sam3_pos.append(sam3_pos_out)\n\n            if self.sam2_convs is not None:\n                sam2_x_out = self.sam2_convs[i](x)\n                sam2_pos_out = self.position_encoding(sam2_x_out).to(sam2_x_out.dtype)\n                sam2_out.append(sam2_x_out)\n                sam2_pos.append(sam2_pos_out)\n        return sam3_out, sam3_pos, sam2_out, sam2_pos",
+          "source_start_line": 102,
+          "file_path": "sam3/model/necks.py",
+          "annotations": [
+            {
+              "start_line": 110,
+              "end_line": 115,
+              "explanation": "The ViT backbone runs once (self.trunk). Then the SAME feature map `xs[-1]` is fed through two separate convolution pipelines (self.convs for SAM 3 detection, self.sam2_convs for tracking), each producing their own multi-scale outputs with positional encodings.",
+              "concept_tag": "convolution"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "text-encoder",
+      "title": "Step 3: Text Encoder — Understanding Concepts",
+      "narrative": "SAM 3's breakthrough is open-vocabulary segmentation: instead of predefined categories, you describe what to segment in natural language. This requires a text encoder that maps concept phrases (\"a player in white\", \"the large brown dog\") into the same embedding space as the visual features.\n\nSAM 3 uses a CLIP-style TextTransformer — a causal transformer that processes tokenized text into embeddings. The architecture is standard: token embedding → positional embedding → transformer layers → final LayerNorm → linear projection. The key detail is the output: the model produces per-token features (not just a pooled vector), which allows the decoder to attend to fine-grained language structure.\n\nThe VL (Vision-Language) backbone combiner wraps both the ViT visual backbone and the TextTransformer, forwarding images and text in parallel and returning their features for the downstream encoder-decoder.",
+      "code_blocks": [
+        {
+          "label": "TextTransformer — CLIP-style text encoder",
+          "source": "class TextTransformer(nn.Module):\n    def __init__(\n        self,\n        context_length: int = 77,\n        vocab_size: int = 49408,\n        width: int = 512,\n        heads: int = 8,\n        layers: int = 12,\n        mlp_ratio: float = 4.0,\n        ls_init_value: Optional[float] = None,\n        output_dim: int = 512,\n        no_causal_mask: bool = False,\n        pool_type: str = \"none\",  # no pooling\n        proj_bias: bool = False,\n        act_layer: Callable = nn.GELU,\n        norm_layer: Callable = nn.LayerNorm,\n        output_tokens: bool = False,\n        use_ln_post: bool = True,\n        compile_mode: Optional[str] = None,\n        use_act_checkpoint: bool = False,\n    ):\n        super().__init__()\n        assert pool_type in (\"first\", \"last\", \"argmax\", \"none\")\n        self.output_tokens = output_tokens\n        self.num_pos = self.context_length = context_length\n        self.vocab_size = vocab_size\n        self.width = width\n        self.output_dim = output_dim\n        self.heads = heads\n        self.pool_type = pool_type\n\n        self.token_embedding = nn.Embedding(self.vocab_size, width)\n        self.positional_embedding = nn.Parameter(torch.empty(self.num_pos, width))\n        self.transformer = Transformer(\n            width=width,\n            layers=layers,\n            heads=heads,\n            mlp_ratio=mlp_ratio,\n            ls_init_value=ls_init_value,\n            act_layer=act_layer,\n            norm_layer=norm_layer,\n            compile_mode=compile_mode,\n            use_act_checkpoint=use_act_checkpoint,\n        )\n        self.ln_final = norm_layer(width) if use_ln_post else nn.Identity()",
+          "source_start_line": 166,
+          "file_path": "sam3/model/text_encoder_ve.py",
+          "annotations": [
+            {
+              "start_line": 168,
+              "end_line": 170,
+              "explanation": "Context length of 77 tokens and vocab size of 49,408 — these match CLIP's original tokenizer. The 512-wide transformer processes concept phrases like \"a red car\" or \"the player in white jersey\".",
+              "concept_tag": "embedding"
+            },
+            {
+              "start_line": 178,
+              "end_line": 178,
+              "explanation": "pool_type=\"none\" means the encoder outputs ALL token embeddings (not just a single pooled vector). This is important because SAM 3's decoder cross-attends to individual text tokens, enabling fine-grained language grounding.",
+              "concept_tag": "other:text-encoding"
+            }
+          ]
+        },
+        {
+          "label": "TextTransformer.forward — text to embeddings",
+          "source": "    def forward(\n        self, text: torch.Tensor\n    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:\n        seq_len = text.shape[1]\n        x = self.token_embedding(text)  # [batch_size, n_ctx, d_model]\n\n        attn_mask = self.attn_mask\n        if attn_mask is not None:\n            attn_mask = attn_mask[:seq_len, :seq_len]\n\n        x = x + self.positional_embedding[:seq_len]\n        x = self.transformer(x, attn_mask=attn_mask)\n\n        x = self.ln_final(x)\n        pooled, tokens = text_global_pool(x, text, pool_type=self.pool_type)\n        if self.text_projection is not None:\n            if isinstance(self.text_projection, nn.Linear):\n                pooled = self.text_projection(pooled)\n            else:\n                pooled = pooled @ self.text_projection\n        if self.output_tokens:\n            return pooled, tokens\n        return pooled",
+          "source_start_line": 230,
+          "file_path": "sam3/model/text_encoder_ve.py",
+          "annotations": [
+            {
+              "start_line": 234,
+              "end_line": 234,
+              "explanation": "Standard text encoding: token IDs → embeddings via a learned embedding table.",
+              "concept_tag": "embedding"
+            },
+            {
+              "start_line": 240,
+              "end_line": 241,
+              "explanation": "Add learned positional embeddings and run through the transformer stack. The causal attention mask ensures each token can only attend to previous tokens (left-to-right), matching CLIP's training recipe.",
+              "concept_tag": "attention"
+            },
+            {
+              "start_line": 244,
+              "end_line": 244,
+              "explanation": "text_global_pool extracts the pooled representation (used for classification scoring) and the full token sequence (used for cross-attention in the decoder). The pool type \"argmax\" takes the EOT token feature, following CLIP convention.",
+              "concept_tag": "pooling"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "encoder-decoder",
+      "title": "Step 4: Transformer Encoder-Decoder with Presence Token",
+      "narrative": "The heart of SAM 3's detection pipeline is a DETR-style transformer encoder-decoder. The encoder fuses visual and text features via cross-attention. The decoder then uses learned object queries to detect and localize objects.\n\nSAM 3 introduces two key innovations in the decoder:\n\n1. **Presence Token**: A single learnable token that participates in self-attention and cross-attention alongside the object queries, but is specifically trained to predict whether the queried concept exists in the image at all. This helps the model distinguish between \"no instances found\" and \"low-confidence detections\", which is critical when handling 270K+ concepts where most won't appear in any given image.\n\n2. **Decoupled Anchor Queries (DAC)**: During training, the decoder duplicates its queries into one-to-one (o2o) and one-to-many (o2m) groups. The o2o queries participate in Hungarian matching (standard DETR), while the o2m queries allow multiple queries to match the same target. Critically, only o2o queries do self-attention — the o2m queries skip it, preventing them from suppressing each other. At inference, only o2o queries are used.",
+      "code_blocks": [
+        {
+          "label": "TransformerDecoder.__init__ — presence token and DAC setup",
+          "source": "        self.presence_token = None\n        self.clamp_presence_logits = clamp_presence_logits\n        self.clamp_presence_logit_max_val = clamp_presence_logit_max_val\n        if presence_token:\n            self.presence_token = nn.Embedding(1, d_model)\n            self.presence_token_head = MLP(d_model, d_model, 1, 3)\n            self.presence_token_out_norm = nn.LayerNorm(d_model)",
+          "source_start_line": 297,
+          "file_path": "sam3/model/decoder.py",
+          "annotations": [
+            {
+              "start_line": 300,
+              "end_line": 303,
+              "explanation": "The presence token is a single learnable embedding (1 × d_model). A 3-layer MLP head maps it to a scalar logit predicting \"does this concept exist in the image?\". This token flows through every decoder layer alongside the object queries, accumulating evidence from both visual features and text prompts.",
+              "concept_tag": "embedding"
+            }
+          ]
+        },
+        {
+          "label": "TransformerDecoderLayer.forward — DAC + presence token in attention",
+          "source": "        # self attention\n        if self.self_attn is not None:\n            if dac:\n                # we only apply self attention to the first half of the queries\n                assert tgt.shape[0] % 2 == 0\n                num_o2o_queries = tgt.shape[0] // 2\n                tgt_o2o = tgt[:num_o2o_queries]\n                tgt_query_pos_o2o = tgt_query_pos[:num_o2o_queries]\n                tgt_o2m = tgt[num_o2o_queries:]\n            else:\n                tgt_o2o = tgt\n                tgt_query_pos_o2o = tgt_query_pos\n\n            if presence_token is not None:\n                tgt_o2o = torch.cat([presence_token, tgt_o2o], dim=0)\n                tgt_query_pos_o2o = torch.cat(\n                    [torch.zeros_like(presence_token), tgt_query_pos_o2o], dim=0\n                )\n                tgt_query_pos = torch.cat(\n                    [torch.zeros_like(presence_token), tgt_query_pos], dim=0\n                )\n\n            q = k = self.with_pos_embed(tgt_o2o, tgt_query_pos_o2o)\n            tgt2 = self.self_attn(q, k, tgt_o2o, attn_mask=self_attn_mask)[0]\n            tgt_o2o = tgt_o2o + self.dropout2(tgt2)\n            if dac:\n                if not dac_use_selfatt_ln:\n                    tgt_o2o = self.norm2(tgt_o2o)\n                tgt = torch.cat((tgt_o2o, tgt_o2m), dim=0)  # Recombine\n                if dac_use_selfatt_ln:\n                    tgt = self.norm2(tgt)\n            else:\n                tgt = tgt_o2o\n                tgt = self.norm2(tgt)",
+          "source_start_line": 115,
+          "file_path": "sam3/model/decoder.py",
+          "annotations": [
+            {
+              "start_line": 117,
+              "end_line": 123,
+              "explanation": "DAC in action: the queries are split into two halves — o2o (one-to-one) and o2m (one-to-many). Only o2o queries participate in self-attention. This prevents o2m queries from competing with each other, allowing multiple queries to confidently detect the same object during training.",
+              "concept_tag": "attention"
+            },
+            {
+              "start_line": 128,
+              "end_line": 132,
+              "explanation": "The presence token is prepended to the o2o queries before self-attention. It has zero positional encoding (it's position-agnostic) and attends to all object queries, aggregating a global summary of \"what concepts are present\". After attention, it's separated back out.",
+              "concept_tag": "attention"
+            },
+            {
+              "start_line": 143,
+              "end_line": 145,
+              "explanation": "After self-attention on o2o only, the o2o and o2m halves are recombined for the subsequent cross-attention and FFN — both groups attend to image features. The LayerNorm is applied after recombination so both groups are normalized together.",
+              "concept_tag": "normalization"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "scoring",
+      "title": "Step 5: Dot-Product Scoring — Matching Detections to Text",
+      "narrative": "After the decoder produces object query embeddings, SAM 3 needs to score how well each detection matches the text prompt. Unlike DETR which uses a classification head with fixed categories, SAM 3 uses dot-product scoring — projecting both the query embeddings and the text embeddings into a shared space and computing their similarity.\n\nThis is what makes SAM 3 truly open-vocabulary: any text concept can be matched against any detection, without needing a category-specific output head. The text features are first mean-pooled across tokens, then passed through an MLP. Both text and detection embeddings are projected to a shared dimension, and their dot product (scaled by 1/√d) gives the match score.\n\nThe presence token's prediction is combined with these detection scores to produce a final \"joint score\" that accounts for both the quality of individual detections AND whether the concept exists in the image at all.",
+      "code_blocks": [
+        {
+          "label": "DotProductScoring — open-vocabulary classification",
+          "source": "class DotProductScoring(torch.nn.Module):\n    def __init__(\n        self,\n        d_model,\n        d_proj,\n        prompt_mlp=None,\n        clamp_logits=True,\n        clamp_max_val=12.0,\n    ):\n        super().__init__()\n        self.d_proj = d_proj\n        assert isinstance(prompt_mlp, torch.nn.Module) or prompt_mlp is None\n        self.prompt_mlp = prompt_mlp  # an optional MLP projection for prompt\n        self.prompt_proj = torch.nn.Linear(d_model, d_proj)\n        self.hs_proj = torch.nn.Linear(d_model, d_proj)\n        self.scale = float(1.0 / np.sqrt(d_proj))\n        self.clamp_logits = clamp_logits\n        if self.clamp_logits:\n            self.clamp_max_val = clamp_max_val\n\n    def mean_pool_text(self, prompt, prompt_mask):\n        # is_valid has shape (seq, bs, 1), where 1 is valid and 0 is padding\n        is_valid = (~prompt_mask).float().permute(1, 0)[..., None]\n        # num_valid has shape (bs, 1)\n        num_valid = torch.clamp(torch.sum(is_valid, dim=0), min=1.0)\n        # mean pool over all the valid tokens -- pooled_prompt has shape (bs, proj_dim)\n        pooled_prompt = (prompt * is_valid).sum(dim=0) / num_valid\n        return pooled_prompt\n\n    def forward(self, hs, prompt, prompt_mask):\n        # hs has shape (num_layer, bs, num_query, d_model)\n        # prompt has shape (seq, bs, d_model)\n        # prompt_mask has shape (bs, seq), where 1 is valid and 0 is padding\n        assert hs.dim() == 4 and prompt.dim() == 3 and prompt_mask.dim() == 2\n\n        # apply MLP on prompt if specified\n        if self.prompt_mlp is not None:\n            prompt = self.prompt_mlp(prompt)\n\n        # first, get the mean-pooled version of the prompt\n        pooled_prompt = self.mean_pool_text(prompt, prompt_mask)\n\n        # then, project pooled_prompt and hs to d_proj dimensions\n        proj_pooled_prompt = self.prompt_proj(pooled_prompt)  # (bs, d_proj)\n        proj_hs = self.hs_proj(hs)  # (num_layer, bs, num_query, d_proj)\n\n        # finally, get dot-product scores of shape (num_layer, bs, num_query, 1)\n        scores = torch.matmul(proj_hs, proj_pooled_prompt.unsqueeze(-1))\n        scores *= self.scale\n\n        # clamp scores to a max value to avoid numerical issues in loss or matcher\n        if self.clamp_logits:\n            scores.clamp_(min=-self.clamp_max_val, max=self.clamp_max_val)\n\n        return scores",
+          "source_start_line": 714,
+          "file_path": "sam3/model/model_misc.py",
+          "annotations": [
+            {
+              "start_line": 727,
+              "end_line": 729,
+              "explanation": "Two separate linear projections: one for text (prompt_proj) and one for detections (hs_proj). The scale factor 1/√d prevents dot products from growing too large — the same trick used in attention mechanisms and CLIP's temperature scaling.",
+              "concept_tag": "linear"
+            },
+            {
+              "start_line": 734,
+              "end_line": 741,
+              "explanation": "Mean pooling over valid text tokens (excluding padding) produces a single text vector per prompt. The optional MLP adds a nonlinear transform before pooling, helping the text representation adapt from CLIP's pretraining to SAM 3's detection task.",
+              "concept_tag": "pooling"
+            },
+            {
+              "start_line": 757,
+              "end_line": 760,
+              "explanation": "The core scoring: each query embedding is projected, then dot-producted with the projected text. This produces a per-query, per-layer score — at each decoder layer, the model refines how well each detection matches the text prompt. Clamping to ±12 prevents gradient explosions during training.",
+              "concept_tag": "linear"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "multiplex-decoder",
+      "title": "Step 6: Multiplex Mask Decoder — Multiple Objects in One Pass",
+      "narrative": "SAM 3 introduces a multiplex mask decoder that can segment multiple objects simultaneously in a single forward pass. This is a major efficiency improvement over SAM 2's per-object approach.\n\nThe key idea: instead of running the mask decoder once per object, SAM 3 packs multiple objects into \"buckets\". Each bucket contains `multiplex_count` objects (e.g., 4), and the decoder predicts masks for all objects in the bucket at once. The mask tokens are organized as (multiplex_count × num_mask_outputs_per_object), and each object gets its own IoU prediction and object score.\n\nThe MultiplexState class manages the conversion between \"data space\" (one tensor per object) and \"multiplex space\" (packed buckets), handling padding for partially-filled buckets and object addition/removal during video tracking.",
+      "code_blocks": [
+        {
+          "label": "MultiplexMaskDecoder.__init__ — multi-object token setup",
+          "source": "class MultiplexMaskDecoder(nn.Module):\n    def __init__(\n        self,\n        *,\n        transformer_dim: int,\n        transformer: nn.Module,\n        multiplex_count: int,\n        num_multimask_outputs: int = 3,\n        activation: Type[nn.Module] = nn.GELU,\n        iou_head_depth: int = 3,\n        iou_head_hidden_dim: int = 256,\n        use_high_res_features: bool = False,\n        iou_prediction_use_sigmoid: bool = False,\n        dynamic_multimask_via_stability=False,\n        dynamic_multimask_stability_delta=0.05,\n        dynamic_multimask_stability_thresh=0.98,\n        pred_obj_scores: bool = False,\n        pred_obj_scores_mlp: bool = False,\n        use_multimask_token_for_obj_ptr: bool = False,\n        decode_mask_with_shared_tokens: bool = False,\n        decode_mask_attribute_with_shared_tokens: bool = False,\n        multimask_outputs_only: bool = False,\n    ) -> None:",
+          "source_start_line": 16,
+          "file_path": "sam3/model/multiplex_mask_decoder.py",
+          "annotations": [
+            {
+              "start_line": 22,
+              "end_line": 22,
+              "explanation": "multiplex_count is the key parameter: how many objects are packed into each bucket. With multiplex_count=4, the decoder handles 4 objects simultaneously — each getting its own mask tokens, IoU predictions, and object scores.",
+              "concept_tag": "other:architecture"
+            },
+            {
+              "start_line": 35,
+              "end_line": 36,
+              "explanation": "decode_mask_with_shared_tokens is a SAM 3.1 optimization: instead of separate mask tokens per object × per mask output, use shared tokens and differentiate via separate projection layers. This reduces token count while maintaining quality.",
+              "concept_tag": "other:architecture"
+            }
+          ]
+        },
+        {
+          "label": "MultiplexMaskDecoder.predict_masks — packing objects into buckets",
+          "source": "    def predict_masks(\n        self,\n        image_embeddings: torch.Tensor,\n        image_pe: torch.Tensor,\n        high_res_features: Optional[List[torch.Tensor]] = None,\n        extra_per_object_embeddings: Optional[\n            torch.Tensor\n        ] = None,  # num_buckets, multiplex_count, C\n    ) -> dict[str, torch.Tensor]:\n        \"\"\"Predicts masks. See 'forward' for more details.\"\"\"\n        # Concatenate output tokens\n        B = image_embeddings.shape[0]\n        token_list = []\n        if self.pred_obj_scores and not self.decode_mask_attribute_with_shared_tokens:\n            token_list.append(self.obj_score_token.weight)\n        if not self.decode_mask_attribute_with_shared_tokens:\n            token_list.append(self.iou_token.weight)\n\n        tokens = torch.cat(token_list, dim=0)\n        tokens = tokens.unsqueeze(0).expand(B, -1, -1)\n\n        if extra_per_object_embeddings is not None:\n            mask_tokens = self.mask_tokens.weight.view(\n                1, self.multiplex_count, self.num_mask_output_per_object, -1\n            ).expand(B, -1, -1, -1)\n\n            mask_tokens = mask_tokens + extra_per_object_embeddings.unsqueeze(2)\n            mask_tokens = mask_tokens.flatten(1, 2)\n        else:\n            mask_tokens = self.mask_tokens.weight.unsqueeze(0).expand(B, -1, -1)\n\n        tokens = torch.cat([tokens, mask_tokens], dim=1)\n\n        src = image_embeddings\n\n        assert image_pe.size(0) == 1, (\n            \"image_pe should have size 1 in batch dim (from `get_dense_pe()`)\"\n        )\n        pos_src = torch.repeat_interleave(image_pe, tokens.shape[0], dim=0)\n        b, c, h, w = src.shape\n\n        # Run the transformer\n        hs, src = self.transformer(src, pos_src, tokens)",
+          "source_start_line": 246,
+          "file_path": "sam3/model/multiplex_mask_decoder.py",
+          "annotations": [
+            {
+              "start_line": 268,
+              "end_line": 273,
+              "explanation": "Mask tokens are reshaped to (B, multiplex_count, num_outputs, C) and each object's tokens receive an additive per-object embedding. This conditions the shared mask tokens on object-specific information from the tracking memory or detection queries, allowing each slot in the bucket to specialize.",
+              "concept_tag": "embedding"
+            },
+            {
+              "start_line": 288,
+              "end_line": 288,
+              "explanation": "The transformer processes ALL tokens (IoU + obj_score + mask tokens for all objects) against the image features in a single pass. The mask tokens for different objects interact through self-attention, enabling the model to produce non-overlapping masks.",
+              "concept_tag": "attention"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "memory-tracking",
+      "title": "Step 7: Memory Bank — Tracking Objects Through Video",
+      "narrative": "For video segmentation, SAM 3 needs to track detected objects across frames. It inherits SAM 2's memory-based approach: past frames' mask predictions are encoded into a memory bank, and future frames cross-attend to this memory to propagate segmentation.\n\nThe memory encoder takes a predicted mask and the corresponding image features, fuses them through ConvNeXt blocks, and stores a compact representation. When processing a new frame, the tracker's transformer cross-attends to memories from the most recent frames plus any conditioning frames (frames with user-provided prompts).\n\nThe VideoTrackingMultiplex module extends this to multi-object tracking with the multiplex system. Objects are assigned to buckets, and the memory bank stores per-bucket mask memories. Object pointers (compact embeddings derived from the mask decoder's output tokens) provide a lightweight way to represent \"what each object looks like\" in the memory.",
+      "code_blocks": [
+        {
+          "label": "SimpleMaskDownSampler — encoding masks for memory",
+          "source": "class SimpleMaskDownSampler(nn.Module):\n    \"\"\"\n    Progressively downsample a mask by total_stride, each time by stride.\n    Note that LayerNorm is applied per *token*, like in ViT.\n\n    With each downsample (by a factor stride**2), channel capacity increases by the same factor.\n    In the end, we linearly project to embed_dim channels.\n    \"\"\"\n\n    def __init__(\n        self,\n        embed_dim=256,\n        kernel_size=4,\n        stride=4,\n        padding=0,\n        total_stride=16,\n        activation=nn.GELU,\n        # Option to interpolate the input mask first before downsampling using convs. In that case, the total_stride is assumed to be after interpolation.\n        # If set to input resolution or None, we don't interpolate. We default to None to be safe (for older configs or if not explicitly set)\n        interpol_size=None,\n        # options for incorporating multiplex memory encoding\n        multiplex_count: int = 1,\n        starting_out_chan: int = 1,\n        input_channel_multiplier: int = 1,\n    ):\n        super().__init__()\n        num_layers = int(math.log2(total_stride) // math.log2(stride))\n        multiplex_count = multiplex_count * input_channel_multiplier\n        assert stride**num_layers == total_stride\n        self.encoder = nn.Sequential()\n        mask_in_chans, mask_out_chans = multiplex_count, starting_out_chan\n        for _ in range(num_layers):\n            mask_out_chans = mask_out_chans * (stride**2)\n            self.encoder.append(\n                nn.Conv2d(\n                    mask_in_chans,\n                    mask_out_chans,\n                    kernel_size=kernel_size,\n                    stride=stride,\n                    padding=padding,\n                )\n            )\n            self.encoder.append(LayerNorm2d(mask_out_chans))\n            self.encoder.append(activation())\n            mask_in_chans = mask_out_chans\n\n        self.encoder.append(nn.Conv2d(mask_out_chans, embed_dim, kernel_size=1))",
+          "source_start_line": 21,
+          "file_path": "sam3/model/memory.py",
+          "annotations": [
+            {
+              "start_line": 43,
+              "end_line": 44,
+              "explanation": "multiplex_count as input channels: when tracking multiple objects per bucket, the mask downsampler takes multiplex_count mask channels (one per object in the bucket) as input. This lets the memory encode spatial relationships between objects within a bucket.",
+              "concept_tag": "convolution"
+            },
+            {
+              "start_line": 51,
+              "end_line": 60,
+              "explanation": "Progressive downsampling: each Conv2d layer reduces spatial resolution by stride (typically 4×) while expanding channels by stride². For total_stride=16 with stride=4, this gives 2 downsampling layers, going from mask resolution to a compact 256-dim feature map that matches the backbone feature size.",
+              "concept_tag": "convolution"
+            }
+          ]
+        },
+        {
+          "label": "CXBlock — ConvNeXt block for memory fusion",
+          "source": "class CXBlock(nn.Module):\n    r\"\"\"ConvNeXt Block. There are two equivalent implementations:\n    (1) DwConv -> LayerNorm (channels_first) -> 1x1 Conv -> GELU -> 1x1 Conv; all in (N, C, H, W)\n    (2) DwConv -> Permute to (N, H, W, C); LayerNorm (channels_last) -> Linear -> GELU -> Linear; Permute back\n    We use (2) as we find it slightly faster in PyTorch\n\n    Args:\n        dim (int): Number of input channels.\n        drop_path (float): Stochastic depth rate. Default: 0.0\n        layer_scale_init_value (float): Init value for Layer Scale. Default: 1e-6.\n    \"\"\"",
+          "source_start_line": 90,
+          "file_path": "sam3/model/memory.py",
+          "annotations": [
+            {
+              "start_line": 90,
+              "end_line": 100,
+              "explanation": "ConvNeXt blocks fuse the downsampled mask encoding with the image features from the backbone. The depthwise convolution (7×7 kernel) captures local spatial context, while the inverted bottleneck (expand→GELU→contract) adds non-linearity. This produces the final memory representation stored in the memory bank.",
+              "concept_tag": "convolution"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "multiplex-state",
+      "title": "Step 8: Multiplex State — Managing Object Assignments",
+      "narrative": "Tracking many objects efficiently requires careful bookkeeping. The MultiplexState class manages the assignment of objects to buckets, handling the conversion between \"data space\" (one entry per tracked object) and \"multiplex space\" (packed into fixed-size buckets).\n\nThe mux operation packs variable numbers of objects into fixed-size buckets, padding empty slots with zeros. The demux operation extracts only the valid entries back out. When new objects are detected, they're added to existing buckets with free slots (or new buckets are created). When objects disappear, their slots are marked as removed (distinct from empty/padding).\n\nThis bucket-based system is what makes SAM 3's multi-object tracking practical: instead of running the mask decoder N times for N objects, you run it ceil(N/multiplex_count) times — a 4× speedup with multiplex_count=4.",
+      "code_blocks": [
+        {
+          "label": "MultiplexState — bucket assignment management",
+          "source": "class MultiplexState:\n    \"\"\"\n    MultiplexState records the state of multiplexing, for one or more buckets.\n\n    At a high level, we deal with the conversion of tensors between the data space (batch_size, num_channels, ...)\n    and the multiplex space (num_buckets, multiplex_count, num_channels, ...).\n\n    The multiplex state stores the assignments of each batch element to a slot in a bucket.\n    Each bucket has a fixed number of slots (multiplex_count), and not all slots need to be filled.\n    The batch size should equate to total_valid_entries, which is the sum of the number of valid entries in each bucket.\n\n    There are two main operations that this class supports:\n        mux: convert tensors in the data space to the multiplex space.\n        The mental model is that we start from a tensor of zeros that has the shape of the output,\n        then we go through the valid entries and place them into the corresponding slots, indicated by the assignments.\n\n        demux: convert tensors in the multiplex space to the data space.\n        This is the reverse operation of mux. Note that zeros were used in mux for the padding slots,\n        and that those slots are ignored in demux.\n\n    There are also two utility functions for object mangement:\n        add_objects: add new objects to the state by filling in empty slots\n        remove_objects: remove objects from the state by marking them as removed (not the same as empty!)\n    \"\"\"\n\n    def __init__(\n        self,\n        assignments: list[list[int]],\n        device: torch.device,\n        dtype: torch.dtype,\n        allowed_bucket_capacity: int,\n        *,\n        object_ids: Optional[list[int]] = None,\n    ):",
+          "source_start_line": 20,
+          "file_path": "sam3/model/multiplex_utils.py",
+          "annotations": [
+            {
+              "start_line": 20,
+              "end_line": 44,
+              "explanation": "The MultiplexState docstring explains the core abstraction: data space has one entry per object, multiplex space packs objects into fixed-size buckets. The mux/demux operations are the bridge. Assignments is a list of lists — each inner list is one bucket, containing object indices (or special negative values for padding/removed slots).",
+              "concept_tag": "other:architecture"
+            },
+            {
+              "start_line": 45,
+              "end_line": 53,
+              "explanation": "The constructor takes assignments (which objects go in which bucket), device/dtype for tensor creation, and allowed_bucket_capacity (how many objects per bucket). object_ids optionally maps internal indices to external IDs for inference output.",
+              "concept_tag": "other:architecture"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "putting-together",
+      "title": "Putting It All Together",
+      "narrative": "The full SAM 3 pipeline ties all these components together in a coherent architecture. Here's how a text-prompted segmentation works end-to-end:\n\n1. **Image encoding**: The input image (1008×1008) goes through the ViT backbone (32 layers of windowed + global attention) to produce a 72×72 feature grid at 1024 dimensions.\n\n2. **Feature pyramid**: The dual FPN neck produces multi-scale features at 256 dimensions for both the detector and tracker heads.\n\n3. **Text encoding**: The concept prompt (\"a red car\") is tokenized and encoded by the TextTransformer into token-level and pooled text embeddings.\n\n4. **Encoder fusion**: The transformer encoder fuses visual features with text features via cross-attention, producing text-conditioned image features.\n\n5. **Decoder with presence token**: 200 learned object queries, plus the presence token, attend to the fused features through 6 decoder layers. Box coordinates are iteratively refined. DAC provides both o2o (for inference) and o2m (for training) matching.\n\n6. **Scoring**: Dot-product scoring matches each query's embedding against the pooled text embedding to produce open-vocabulary classification logits.\n\n7. **Mask prediction**: The segmentation head upsamples features and produces per-query masks via dot-product between query embeddings and pixel features.\n\n8. **Video tracking** (optional): Detected objects are assigned to multiplex buckets. The memory bank encodes masks from past frames. Future frames use the tracker's cross-attention to propagate segmentation, with the multiplex system processing multiple objects per forward pass.\n\nThe model builder in `model_builder.py` assembles all these pieces:",
+      "code_blocks": [
+        {
+          "label": "model_builder — assembling the full SAM 3 pipeline",
+          "source": "def _create_sam3_model(\n    backbone,\n    transformer,\n    input_geometry_encoder,\n    segmentation_head,\n    dot_prod_scoring,\n    inst_interactive_predictor,\n    eval_mode,\n):\n    \"\"\"Create the SAM3 image model.\"\"\"\n    common_params = {\n        \"backbone\": backbone,\n        \"transformer\": transformer,\n        \"input_geometry_encoder\": input_geometry_encoder,\n        \"segmentation_head\": segmentation_head,\n        \"num_feature_levels\": 1,\n        \"o2m_mask_predict\": True,\n        \"dot_prod_scoring\": dot_prod_scoring,\n        \"use_instance_query\": False,\n        \"multimask_output\": True,\n        \"inst_interactive_predictor\": inst_interactive_predictor,\n    }\n\n    matcher = None\n    if not eval_mode:\n        from sam3.train.matcher import BinaryHungarianMatcherV2\n\n        matcher = BinaryHungarianMatcherV2(\n            focal=True,\n            cost_class=2.0,\n            cost_bbox=5.0,\n            cost_giou=2.0,\n            alpha=0.25,\n            gamma=2,\n            stable=False,\n        )\n    common_params[\"matcher\"] = matcher\n    model = Sam3Image(**common_params)\n\n    return model",
+          "source_start_line": 302,
+          "file_path": "sam3/model_builder.py",
+          "annotations": [
+            {
+              "start_line": 312,
+              "end_line": 323,
+              "explanation": "The Sam3Image model combines: VL backbone (ViT + text encoder + dual neck), transformer encoder-decoder (with presence token and DAC), geometry encoder (for point/box/mask prompts), segmentation head (pixel decoder + mask predictor), and dot-product scoring (open-vocab classification). This is the full detection pipeline for a single image.",
+              "concept_tag": "other:architecture"
+            },
+            {
+              "start_line": 326,
+              "end_line": 336,
+              "explanation": "During training, a Hungarian matcher assigns predictions to ground-truth objects. The cost function combines classification (focal loss), bbox L1, and GIoU — standard DETR-style bipartite matching. At inference time (eval_mode=True), no matcher is needed since we just threshold the predictions.",
+              "concept_tag": "loss"
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "summary": "SAM 3 extends the Segment Anything family to open-vocabulary, multi-object segmentation across images and video. Its architecture combines a ViT backbone with windowed/global attention, a CLIP-style text encoder for concept understanding, and a DETR-style encoder-decoder augmented with a presence token (for concept existence prediction) and Decoupled Anchor Queries (for improved training). A multiplex mask decoder processes multiple objects simultaneously in bucketed batches, while a memory bank enables temporal tracking. The result is a unified model that can detect, segment, and track any of 270K+ concepts described in natural language."
+}
