@@ -133,8 +133,13 @@ The gallery uses a **horizontal timeline DAG** layout: X-axis is chronological (
   - `sub` = stack position within a cell (when multiple papers share the same lane+year)
 - `YEAR_COLS` — array of years displayed as columns left-to-right
 - `LANES` — one entry per horizontal swim lane with `id`, `label`, `color`, `borderColor`
-- `EDGES` — directed dependency arrows. Solid for direct lineage; dashed (`{dashed: true}`) for architectural borrowing. Edges route left→right with right-angle bends.
+- `EDGES` — directed dependency arrows with two visual tiers:
+  - **Solid** (no `dashed` flag): direct lineage, rendered as gray `#94a3b8` 1.5px lines, always prominent
+  - **Dashed** (`{dashed: true}`): architectural borrowing, rendered as subtle `#d4d4d8` 1px dashed lines at 40% opacity by default
+  - **Hover interaction**: when a card is hovered, its dashed edges turn purple `#a78bfa` at 90% opacity, connected cards get a purple border glow, unrelated cards dim to 35%. Solid edges fade to 20% during hover. Fan-out/fan-in port spreading prevents overlapping when multiple edges leave/enter the same card.
+  - Same-column edges route vertically (bottom→top); cross-column edges route horizontally with right-angle bends.
 - `DISPLAY_NAMES` / `PAPER_YEAR` — short display names and publication years per paper
+- `HOVER_CONNECTIONS` — auto-computed from dashed edges; maps each paper to the set of papers it's connected to via architectural borrowing
 
 For each new paper:
 1. Add entries to `DISPLAY_NAMES` and `PAPER_YEAR`
