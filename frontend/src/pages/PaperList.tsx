@@ -28,8 +28,10 @@ interface TrackPos { track: number; row: number }
 const PAPER_POSITIONS: Record<string, TrackPos> = {
   ViT:                { track: 0, row: 0 },
   dinov3:             { track: 0, row: 1 },
-  dit:                { track: 0, row: 2 },
-  CLIP:               { track: 0, row: 3 },
+  unet:               { track: 0, row: 2 },
+  dit:                { track: 0, row: 3 },
+  CLIP:               { track: 0, row: 4 },
+  sam3:               { track: 0, row: 5 },
   act:                { track: 1, row: 0 },
   'diffusion-policy': { track: 1, row: 1 },
   rt1:                { track: 1, row: 2 },
@@ -39,8 +41,6 @@ const PAPER_POSITIONS: Record<string, TrackPos> = {
   'mobile-aloha':     { track: 1, row: 6 },
   '3d-vla':           { track: 1, row: 7 },
   sonic:              { track: 1, row: 8 },
-  unet:               { track: 2, row: 0 },
-  sam3:               { track: 0, row: 4 },
 }
 
 // ---------------------------------------------------------------------------
@@ -56,7 +56,6 @@ interface TrackConfig {
 const TRACKS: TrackConfig[] = [
   { id: 'foundations',    label: 'Vision & Generative Foundations', color: '#eff6ff', borderColor: '#bfdbfe' },
   { id: 'robot-learning', label: 'Robot Foundation Models',          color: '#f0fdf4', borderColor: '#bbf7d0' },
-  { id: 'segmentation',   label: 'Segmentation & Detection',        color: '#fdf2f8', borderColor: '#fbcfe8' },
 ]
 
 // ---------------------------------------------------------------------------
@@ -82,7 +81,7 @@ const EDGES: Edge[] = [
   { from: 'rt2',  to: '3d-vla',       dashed: true },  // 3D-VLA extends the VLA paradigm
   { from: 'groot', to: 'sonic' },                       // SONIC is NVIDIA's next-gen humanoid controller after GR00T
   // SAM 3 — vision foundation model in Track 0
-  { from: 'unet', to: 'sam3',  dashed: true },         // SAM 3 mask decoder inherits U-Net encoder-decoder pattern (cross-track)
+  { from: 'unet', to: 'sam3',  dashed: true },         // SAM 3 mask decoder inherits U-Net encoder-decoder pattern (same-track skip-row)
   { from: 'ViT',  to: 'sam3',  dashed: true },         // SAM 3 uses ViT backbone (same-track skip-row)
   { from: 'CLIP', to: 'sam3',  dashed: true },         // SAM 3 uses CLIP-style text encoder (same-track adjacent)
 ]
