@@ -311,6 +311,22 @@ function Wiring() {
     const color = edge.dashed ? DASHED_COLOR : SOLID_COLOR
     const dash  = edge.dashed ? '4,3' : undefined
 
+    // Same-column edge: vertical arrow (bottom-center → top-center)
+    if (fp.col === tp.col) {
+      const cx = cardX(fp.col) + CARD_W / 2
+      const y1 = cardY(fp.lane, fp.sub) + CARD_H
+      const y2 = cardY(tp.lane, tp.sub)
+      const arrow = `${cx - AH / 2},${y2 - AH} ${cx},${y2} ${cx + AH / 2},${y2 - AH}`
+      return (
+        <g key={`${edge.from}→${edge.to}`}>
+          <line x1={cx} y1={y1} x2={cx} y2={y2 - AH}
+            stroke={color} strokeWidth={1.2} strokeDasharray={dash} />
+          <polygon points={arrow} fill={color} />
+        </g>
+      )
+    }
+
+    // Cross-column edge: horizontal routing
     // Source: right-center of card
     const x1 = cardX(fp.col) + CARD_W
     const y1 = cardY(fp.lane, fp.sub) + CARD_H / 2
@@ -319,8 +335,6 @@ function Wiring() {
     const x2 = cardX(tp.col)
     const y2 = cardY(tp.lane, tp.sub) + CARD_H / 2
 
-    // Route: horizontal out, bend, horizontal in
-    // For same-lane same-col or backwards edges, add offset
     const midX = (x1 + x2) / 2
 
     // Simple right-angle routing
