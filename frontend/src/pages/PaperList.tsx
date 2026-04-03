@@ -124,9 +124,9 @@ const EDGES: Edge[] = [
   { from: 'act',  to: 'mobile-aloha',     dashed: true },
 ]
 
-// Pre-compute which papers are connected by dashed edges to each paper
+// Pre-compute which papers are connected by ANY edge to each paper
 const HOVER_CONNECTIONS = new Map<string, Set<string>>()
-EDGES.filter(e => e.dashed).forEach(e => {
+EDGES.forEach(e => {
   if (!HOVER_CONNECTIONS.has(e.from)) HOVER_CONNECTIONS.set(e.from, new Set())
   if (!HOVER_CONNECTIONS.has(e.to))   HOVER_CONNECTIONS.set(e.to, new Set())
   HOVER_CONNECTIONS.get(e.from)!.add(e.to)
@@ -280,11 +280,11 @@ function Wiring({ hoveredPaper }: { hoveredPaper: string | null }) {
     >{year}</text>
   ))
 
-  // Determine which dashed edges are highlighted (connected to hovered paper)
+  // Determine which edges are highlighted (connected to hovered paper)
   const highlightedEdges = new Set<Edge>()
   if (hoveredPaper) {
     EDGES.forEach(e => {
-      if (e.dashed && (e.from === hoveredPaper || e.to === hoveredPaper)) {
+      if (e.from === hoveredPaper || e.to === hoveredPaper) {
         highlightedEdges.add(e)
       }
     })
@@ -356,8 +356,12 @@ function Wiring({ hoveredPaper }: { hoveredPaper: string | null }) {
         color = '#d4d4d8'; dash = '4,3'; opacity = 0.4; strokeW = 1
       }
     } else {
-      color = SOLID_COLOR; dash = undefined; strokeW = 1.5
-      opacity = 1
+      dash = undefined
+      if (isHighlighted) {
+        color = '#475569'; strokeW = 2.5; opacity = 1   // dark slate, bold
+      } else {
+        color = SOLID_COLOR; strokeW = 1.5; opacity = 1
+      }
     }
 
     // Same-column: vertical
