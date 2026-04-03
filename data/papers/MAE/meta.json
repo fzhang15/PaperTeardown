@@ -1,0 +1,12 @@
+{
+  "id": "MAE",
+  "title": "Masked Autoencoders Are Scalable Vision Learners",
+  "authors": ["Kaiming He", "Xinlei Chen", "Saining Xie", "Yanghao Li", "Piotr Dollár", "Ross Girshick"],
+  "arxiv_url": "https://arxiv.org/abs/2111.06377",
+  "repo_url": "https://github.com/facebookresearch/mae",
+  "abstract": "This paper shows that masked autoencoders (MAE) are scalable self-supervised learners for computer vision. MAE masks a high proportion (75%) of random patches of the input image and reconstructs the missing pixels. It is based on an asymmetric encoder-decoder architecture: a ViT encoder operates on only the visible patches, while a lightweight decoder reconstructs the original image from the latent representation and mask tokens. After pre-training, the decoder is discarded and the encoder is used for recognition tasks. MAE pre-training scales better than supervised pre-training and achieves state-of-the-art results on ImageNet and downstream tasks.",
+  "introduction_excerpt": "What makes masked autoencoders (MAE) different from BERT? We find that this question is less straightforward than it may seem. We argue that this difference is mainly caused by the following two: (1) A large portion of the input signal is removed. While BERT-style masked language modeling masks only 15% of tokens, we find it beneficial to mask a much higher portion, e.g., 75%, of patches. (2) The pixel reconstruction target is a low-level signal. We show that this is not a problem, and in fact it works well.",
+  "module_count": 3,
+  "pytorch_file_count": 2,
+  "ingested_at": "2026-04-03T00:00:00Z"
+}

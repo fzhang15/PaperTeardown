@@ -148,5 +148,15 @@
     "abstract": "We present pi0, a novel flow matching-based vision-language-action (VLA) model designed for general robot control. pi0 combines a pre-trained vision-language model (PaliGemma) with a purpose-built action expert transformer that runs in parallel, sharing attention layers to give the action expert direct access to visual and language representations at every depth.",
     "chapter_count": 10,
     "ingested_at": "2026-03-30T00:00:00Z"
+  },
+  {
+    "id": "MAE",
+    "title": "Masked Autoencoders Are Scalable Vision Learners",
+    "authors": ["Kaiming He", "Xinlei Chen", "Saining Xie", "Yanghao Li", "Piotr Dollár", "Ross Girshick"],
+    "arxiv_url": "https://arxiv.org/abs/2111.06377",
+    "repo_url": "https://github.com/facebookresearch/mae",
+    "abstract": "This paper shows that masked autoencoders (MAE) are scalable self-supervised learners for computer vision. MAE masks a high proportion (75%) of random patches of the input image and reconstructs the missing pixels. It is based on an asymmetric encoder-decoder architecture: a ViT encoder operates on only the visible patches, while a lightweight decoder reconstructs the original image from the latent representation and mask tokens. After pre-training, the decoder is discarded and the encoder is used for recognition tasks.",
+    "chapter_count": 8,
+    "ingested_at": "2026-04-03T00:00:00Z"
   }
 ]

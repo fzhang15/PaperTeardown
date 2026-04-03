@@ -1,0 +1,323 @@
+{
+  "chapters": [
+    {
+      "id": "the-problem",
+      "title": "The Self-Supervised Vision Gap",
+      "narrative": "In NLP, masking tokens and predicting their values — BERT-style — proved to be an incredibly powerful pretext task for self-supervised pre-training. It was cheap, scalable, and produced representations that transferred broadly. Vision had no equivalent.\n\nContrastive methods like CLIP and MoCo learned good features but required careful negative mining, augmentation choices, or large batch sizes. BEiT tried masked prediction for images, but it needed a discrete tokenizer trained separately — adding complexity and domain-specific assumptions.\n\nMAE (Masked Autoencoders Are Scalable Vision Learners, He et al. 2021) asks a deceptively simple question: what if we just masked most of the image and tried to reconstruct the raw pixels? No discrete tokens, no contrastive pairs, no auxiliary objectives. Just mask, predict, and compute MSE loss.\n\nThe key insight driving MAE is that images are highly redundant — adjacent patches are strongly correlated. To make reconstruction a genuinely hard problem that forces the model to learn semantic structure rather than just interpolating nearby pixels, MAE uses a dramatically high masking ratio: 75%. Remove three out of every four patches, and suddenly the model cannot rely on local texture interpolation. It must develop a global understanding of objects and scene geometry to fill in the blanks.\n\nThe second insight is architectural: an asymmetric encoder-decoder design makes this efficient. The heavy ViT encoder processes only the 25% of visible patches. The lightweight decoder — which is thrown away after pre-training — reconstructs all patches. This means 75% of the compute cost is cut from the encoder, where it matters most for downstream use.",
+      "code_blocks": []
+    },
+    {
+      "id": "patchify",
+      "title": "Patchify: Images as Token Sequences",
+      "narrative": "Before any masking or encoding happens, the image must be converted into a sequence of flat patch vectors. This is the same patchification that ViT introduced: carve a 224×224 image into non-overlapping 16×16 blocks, flatten each block into a 768-element vector (16 × 16 × 3 channels), and treat the result as a sequence of 196 tokens (14 rows × 14 columns).\n\nMAE uses `PatchEmbed` from the `timm` library for the embedding projection, but exposes its own `patchify()` method for the loss calculation. This method returns the raw pixel values of each patch — what the decoder must predict — without passing through any learned projection. The loss is computed against these raw values, not learned features.\n\n`patchify()` uses `reshape` and `einsum` to perform a pure tensor rearrangement. The `einsum` notation `'nchpwq->nhwpqc'` swaps the pixel axes so that patch spatial position becomes the leading dimension, and then a second reshape flattens each patch's pixels into a single vector. No learned parameters, no gradient, just index manipulation.",
+      "code_blocks": [
+        {
+          "label": "patchify: reshape image into patch token sequence",
+          "source": "    def patchify(self, imgs):\n        \"\"\"\n        imgs: (N, 3, H, W)\n        x: (N, L, patch_size**2 *3)\n        \"\"\"\n        p = self.patch_embed.patch_size[0]\n        assert imgs.shape[2] == imgs.shape[3] and imgs.shape[2] % p == 0\n\n        h = w = imgs.shape[2] // p\n        x = imgs.reshape(shape=(imgs.shape[0], 3, h, p, w, p))\n        x = torch.einsum('nchpwq->nhwpqc', x)\n        x = x.reshape(shape=(imgs.shape[0], h * w, p**2 * 3))\n        return x",
+          "source_start_line": 95,
+          "file_path": "models_mae.py",
+          "annotations": [
+            {
+              "start_line": 100,
+              "end_line": 101,
+              "explanation": "Patch size from PatchEmbed (16 for ViT-Base). Assert the image is square and divisible — 224/16 = 14, so h=w=14, giving 196 patches.",
+              "concept_tag": "embedding"
+            },
+            {
+              "start_line": 103,
+              "end_line": 105,
+              "explanation": "The reshape splits H and W into (h, p) and (w, p), creating 6 dims: [N, C, h, p, w, q]. The einsum reorders to [N, h, w, p, q, C], placing patch position first and pixel values last.",
+              "concept_tag": "embedding"
+            },
+            {
+              "start_line": 106,
+              "end_line": 107,
+              "explanation": "Final reshape collapses [h, w] into patch index L=196, and [p, q, C] into flat pixel vector of size p²×3=768. Output is (N, 196, 768) — raw pixel values, used as reconstruction targets.",
+              "concept_tag": "embedding"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "random-masking",
+      "title": "Random Masking: 75% Dropout on Patches",
+      "narrative": "The core pretext task of MAE is determined by which patches get masked. The masking must be random and independent per sample — the model should never see a predictable pattern it can exploit. MAE's approach is elegant: assign each patch a uniform random noise value, argsort to get a random permutation, then take the first 25% as 'keep' indices and discard the rest.\n\nThis per-sample shuffling trick has an important side benefit: it returns not just the masked sequence but also `ids_restore` — the inverse permutation. The decoder later uses `ids_restore` to unshuffle the mixed sequence of encoded visible patches and mask tokens back into the original spatial order before decoding.\n\nThe returned `mask` tensor is a binary indicator: 0 for kept patches, 1 for removed patches. This is exactly what the loss function uses — only masked patches contribute to the MSE. The model cannot 'cheat' by predicting visible patches it already saw.\n\nNote that positional embeddings are added to patches *before* random masking in `forward_encoder`. This means the encoder always knows where in the image each visible patch came from, even though the sequence is shorter than the full 196 patches.",
+      "code_blocks": [
+        {
+          "label": "random_masking: per-sample shuffle to select 25% visible patches",
+          "source": "    def random_masking(self, x, mask_ratio):\n        \"\"\"\n        Perform per-sample random masking by per-sample shuffling.\n        Per-sample shuffling is done by argsort random noise.\n        x: [N, L, D], sequence\n        \"\"\"\n        N, L, D = x.shape  # batch, length, dim\n        len_keep = int(L * (1 - mask_ratio))\n        \n        noise = torch.rand(N, L, device=x.device)  # noise in [0, 1]\n        \n        # sort noise for each sample\n        ids_shuffle = torch.argsort(noise, dim=1)  # ascend: small is keep, large is remove\n        ids_restore = torch.argsort(ids_shuffle, dim=1)\n\n        # keep the first subset\n        ids_keep = ids_shuffle[:, :len_keep]\n        x_masked = torch.gather(x, dim=1, index=ids_keep.unsqueeze(-1).repeat(1, 1, D))\n\n        # generate the binary mask: 0 is keep, 1 is remove\n        mask = torch.ones([N, L], device=x.device)\n        mask[:, :len_keep] = 0\n        # unshuffle to get the binary mask\n        mask = torch.gather(mask, dim=1, index=ids_restore)\n\n        return x_masked, mask, ids_restore",
+          "source_start_line": 123,
+          "file_path": "models_mae.py",
+          "annotations": [
+            {
+              "start_line": 130,
+              "end_line": 131,
+              "explanation": "len_keep = 196 × 0.25 = 49 patches kept. Uniform noise independently shuffles patches for each sample — no shared masking pattern across the batch.",
+              "concept_tag": "other:masking"
+            },
+            {
+              "start_line": 133,
+              "end_line": 136,
+              "explanation": "ids_shuffle is the random permutation (sort order of noise). ids_restore is its inverse — argsort of argsort — which can undo the shuffle later.",
+              "concept_tag": "other:masking"
+            },
+            {
+              "start_line": 138,
+              "end_line": 140,
+              "explanation": "Take only the first len_keep=49 indices (lowest noise = 'keep'). torch.gather with unsqueeze+repeat selects those 49 patch embeddings from the full sequence of 196.",
+              "concept_tag": "other:masking"
+            },
+            {
+              "start_line": 142,
+              "end_line": 146,
+              "explanation": "Build binary mask in shuffled order (first 49 = 0, rest = 1), then unshuffle with ids_restore so mask[i]=1 iff patch i was removed. The decoder loss uses this to ignore visible patches.",
+              "concept_tag": "other:masking"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "asymmetric-architecture",
+      "title": "The Asymmetric Design: Why It Works",
+      "narrative": "The most important engineering decision in MAE is what the decoder looks like. The paper uses an asymmetric encoder-decoder where the encoder is a full-size ViT (e.g., ViT-Large: 1024-dim, 24 blocks, 16 heads) and the decoder is a narrow, shallow transformer (512-dim, 8 blocks) that exists only during pre-training.\n\nWhy asymmetric? Because reconstruction — predicting raw pixels — is a low-level task that doesn't require a powerful model. The encoder, on the other hand, must build rich semantic representations to attend across visible patches and infer what's missing. Keeping the decoder cheap means the encoder's representations are not corrupted by having to serve the decoder's needs at inference time.\n\nAfter pre-training, the decoder is discarded entirely. The encoder alone is fine-tuned or used for linear probing on downstream tasks. This means pre-training compute is dominated by the decoder being applied to only 196 tokens — but since the encoder only processes 49 visible patches, the heavy encoder is also fast.\n\nThe model constructor below shows the asymmetry concretely: `embed_dim=1024, depth=24` for the encoder, `decoder_embed_dim=512, decoder_depth=8` for the decoder. A projection layer `decoder_embed` bridges the two dimensions.",
+      "code_blocks": [
+        {
+          "label": "MaskedAutoencoderViT __init__: asymmetric encoder-decoder",
+          "source": "class MaskedAutoencoderViT(nn.Module):\n    \"\"\" Masked Autoencoder with VisionTransformer backbone\n    \"\"\"\n    def __init__(self, img_size=224, patch_size=16, in_chans=3,\n                 embed_dim=1024, depth=24, num_heads=16,\n                 decoder_embed_dim=512, decoder_depth=8, decoder_num_heads=16,\n                 mlp_ratio=4., norm_layer=nn.LayerNorm, norm_pix_loss=False):\n        super().__init__()\n\n        # --------------------------------------------------------------------------\n        # MAE encoder specifics\n        self.patch_embed = PatchEmbed(img_size, patch_size, in_chans, embed_dim)\n        num_patches = self.patch_embed.num_patches\n\n        self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))\n        self.pos_embed = nn.Parameter(torch.zeros(1, num_patches + 1, embed_dim), requires_grad=False)  # fixed sin-cos embedding\n\n        self.blocks = nn.ModuleList([\n            Block(embed_dim, num_heads, mlp_ratio, qkv_bias=True, qk_scale=None, norm_layer=norm_layer)\n            for i in range(depth)])\n        self.norm = norm_layer(embed_dim)\n        # --------------------------------------------------------------------------\n\n        # --------------------------------------------------------------------------\n        # MAE decoder specifics\n        self.decoder_embed = nn.Linear(embed_dim, decoder_embed_dim, bias=True)\n\n        self.mask_token = nn.Parameter(torch.zeros(1, 1, decoder_embed_dim))\n\n        self.decoder_pos_embed = nn.Parameter(torch.zeros(1, num_patches + 1, decoder_embed_dim), requires_grad=False)  # fixed sin-cos embedding\n\n        self.decoder_blocks = nn.ModuleList([\n            Block(decoder_embed_dim, decoder_num_heads, mlp_ratio, qkv_bias=True, qk_scale=None, norm_layer=norm_layer)\n            for i in range(decoder_depth)])\n\n        self.decoder_norm = norm_layer(decoder_embed_dim)\n        self.decoder_pred = nn.Linear(decoder_embed_dim, patch_size**2 * in_chans, bias=True) # decoder to patch\n        # --------------------------------------------------------------------------",
+          "source_start_line": 22,
+          "file_path": "models_mae.py",
+          "annotations": [
+            {
+              "start_line": 25,
+              "end_line": 28,
+              "explanation": "Encoder defaults (ViT-Large): 1024-dim, 24 depth, 16 heads. Decoder: 512-dim, 8 depth. The encoder is 2× wider and 3× deeper — this asymmetry is intentional.",
+              "concept_tag": "embedding"
+            },
+            {
+              "start_line": 37,
+              "end_line": 37,
+              "explanation": "pos_embed has requires_grad=False — it's fixed 2D sinusoidal, set in initialize_weights. Learned position embeddings would require all 196 positions to be seen during training, but only 49 are.",
+              "concept_tag": "embedding"
+            },
+            {
+              "start_line": 47,
+              "end_line": 47,
+              "explanation": "decoder_embed bridges encoder dimension (1024) to decoder dimension (512). After fine-tuning, this layer — and the entire decoder — is dropped.",
+              "concept_tag": "linear"
+            },
+            {
+              "start_line": 49,
+              "end_line": 49,
+              "explanation": "mask_token is a single learnable vector broadcast to all masked positions in the decoder. It's the decoder's placeholder for 'patch I need to reconstruct'.",
+              "concept_tag": "embedding"
+            },
+            {
+              "start_line": 58,
+              "end_line": 58,
+              "explanation": "decoder_pred maps each patch's decoder representation to p²×3 = 768 raw pixel values. This is the only output used for the loss — not a class label, just pixels.",
+              "concept_tag": "linear"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "forward-encoder",
+      "title": "The Encoder: ViT on Visible Patches Only",
+      "narrative": "The encoder is a standard Vision Transformer, with one critical difference: it only processes the 25% of patches that were not masked. This is the efficiency win. For a 224×224 image with 16×16 patches, the full sequence is 196 patches — the encoder only sees 49.\n\nThe forward pass follows a precise order:\n1. Apply PatchEmbed (learned linear projection) to get patch embeddings\n2. Add fixed sinusoidal positional embeddings (excluding the cls token slot)\n3. Run random_masking to select 49 patches and discard the rest — positions are already encoded before masking\n4. Prepend the cls token\n5. Run through all 24 transformer blocks\n6. Apply layer norm\n\nPositional embedding is critical: it must be added *before* masking so the encoder knows which spatial position each visible patch came from. After masking, the sequence is shorter but fully position-aware.\n\nThe cls token is added *after* masking — it always attends to all 49 visible patches and accumulates a global representation of what was seen. This cls token embedding is the primary representation used for downstream classification.",
+      "code_blocks": [
+        {
+          "label": "forward_encoder: ViT processes only visible (unmasked) patches",
+          "source": "    def forward_encoder(self, x, mask_ratio):\n        # embed patches\n        x = self.patch_embed(x)\n\n        # add pos embed w/o cls token\n        x = x + self.pos_embed[:, 1:, :]\n\n        # masking: length -> length * mask_ratio\n        x, mask, ids_restore = self.random_masking(x, mask_ratio)\n\n        # append cls token\n        cls_token = self.cls_token + self.pos_embed[:, :1, :]\n        cls_tokens = cls_token.expand(x.shape[0], -1, -1)\n        x = torch.cat((cls_tokens, x), dim=1)\n\n        # apply Transformer blocks\n        for blk in self.blocks:\n            x = blk(x)\n        x = self.norm(x)\n\n        return x, mask, ids_restore",
+          "source_start_line": 150,
+          "file_path": "models_mae.py",
+          "annotations": [
+            {
+              "start_line": 155,
+              "end_line": 155,
+              "explanation": "pos_embed[:, 1:, :] skips the cls token slot (index 0). Positional encoding is added before masking so every patch carries its spatial identity even after the sequence is truncated.",
+              "concept_tag": "embedding"
+            },
+            {
+              "start_line": 158,
+              "end_line": 158,
+              "explanation": "After this call, x is (N, 49, 1024) — 75% shorter. mask is (N, 196) binary, ids_restore is the inverse permutation for the decoder to unshuffle later.",
+              "concept_tag": "other:masking"
+            },
+            {
+              "start_line": 161,
+              "end_line": 163,
+              "explanation": "cls token gets position embedding index 0 added, then is prepended to the visible patches. Final encoder input shape: (N, 50, 1024) — 1 cls + 49 visible patches.",
+              "concept_tag": "embedding"
+            },
+            {
+              "start_line": 166,
+              "end_line": 168,
+              "explanation": "24 transformer blocks (for ViT-Large) operate on just 50 tokens, not 197. This is the compute saving: 75% fewer patch tokens means ~4× faster encoder forward pass.",
+              "concept_tag": "attention"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "forward-decoder",
+      "title": "The Decoder: Mask Tokens and Unshuffle",
+      "narrative": "The decoder receives the encoder's output — 50 tokens (1 cls + 49 visible patches) — and must reconstruct all 196 patches. To do this, it needs to expand the sequence back to full length by inserting a learnable `mask_token` vector for every position that was masked out.\n\nThe unshuffling step is the key mechanism: `ids_restore` (saved during random masking) is the inverse permutation that maps the encoder's shuffled order back to the original spatial order. By using `torch.gather` with `ids_restore`, the decoder assembles a full-length sequence of 196 tokens where visible patch encodings and mask tokens are placed at their correct spatial positions.\n\nAfter unshuffling, the cls token is prepended, decoder positional embeddings are added, and 8 lightweight transformer blocks process the full sequence. The final linear projection maps each of the 196 positions to p²×3 = 768 raw pixel values.\n\nCritically, the decoder sees the full 196-token sequence — it must reason about both what was seen and what was not. This is why it needs positional embeddings even for mask tokens: the mask token at position (3, 7) should decode differently than the one at position (0, 0), because the surrounding context is different.",
+      "code_blocks": [
+        {
+          "label": "forward_decoder: insert mask tokens, unshuffle, decode to pixels",
+          "source": "    def forward_decoder(self, x, ids_restore):\n        # embed tokens\n        x = self.decoder_embed(x)\n\n        # append mask tokens to sequence\n        mask_tokens = self.mask_token.repeat(x.shape[0], ids_restore.shape[1] + 1 - x.shape[1], 1)\n        x_ = torch.cat([x[:, 1:, :], mask_tokens], dim=1)  # no cls token\n        x_ = torch.gather(x_, dim=1, index=ids_restore.unsqueeze(-1).repeat(1, 1, x.shape[2]))  # unshuffle\n        x = torch.cat([x[:, :1, :], x_], dim=1)  # append cls token\n\n        # add pos embed\n        x = x + self.decoder_pos_embed\n\n        # apply Transformer blocks\n        for blk in self.decoder_blocks:\n            x = blk(x)\n        x = self.decoder_norm(x)\n\n        # predictor projection\n        x = self.decoder_pred(x)\n\n        # remove cls token\n        x = x[:, 1:, :]\n\n        return x",
+          "source_start_line": 172,
+          "file_path": "models_mae.py",
+          "annotations": [
+            {
+              "start_line": 174,
+              "end_line": 174,
+              "explanation": "decoder_embed projects from encoder dim (1024) to decoder dim (512). The encoder and decoder live in different embedding spaces — this linear layer bridges them.",
+              "concept_tag": "linear"
+            },
+            {
+              "start_line": 177,
+              "end_line": 177,
+              "explanation": "ids_restore.shape[1] = 196, x.shape[1] = 50 (1 cls + 49 visible). So we need 196+1-50 = 147 mask tokens — one per masked patch.",
+              "concept_tag": "other:masking"
+            },
+            {
+              "start_line": 178,
+              "end_line": 179,
+              "explanation": "x[:, 1:, :] strips the cls token from the 49 visible patches, then concatenates 147 mask tokens for a sequence of 196. torch.gather with ids_restore unshuffles this back to original spatial order.",
+              "concept_tag": "other:masking"
+            },
+            {
+              "start_line": 183,
+              "end_line": 183,
+              "explanation": "Decoder positional embeddings are added after unshuffling. Now every token — visible or masked — knows its exact 2D position in the image.",
+              "concept_tag": "embedding"
+            },
+            {
+              "start_line": 191,
+              "end_line": 194,
+              "explanation": "decoder_pred maps 512-dim to 768 (p²×3). The cls token output is discarded — only the 196 patch predictions matter for the loss.",
+              "concept_tag": "linear"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "reconstruction-loss",
+      "title": "The Reconstruction Loss: MSE on Masked Patches",
+      "narrative": "MAE's loss is deceptively simple: mean squared error between predicted pixel values and actual pixel values, computed only over the patches that were masked. Visible patches don't contribute to the loss at all — there would be no learning signal if the model could just copy them.\n\nThere's one important refinement: `norm_pix_loss`. When enabled, the target for each patch is normalized by that patch's own mean and variance. This per-patch normalization acts as a form of local contrast normalization, preventing the model from focusing excessively on background patches with low variance (which are trivially easy to predict with near-zero MSE). The MAE paper reports that `norm_pix_loss=True` consistently improves representation quality.\n\nThe masking-aware loss is implemented by the multiplication `(loss * mask).sum() / mask.sum()`. Because `mask[i]=1` for masked patches and `0` for visible patches, this computes the mean loss exclusively over the 147 masked positions. The denominator `mask.sum()` normalizes by the number of masked patches (not the total patches), so the loss scale stays consistent regardless of masking ratio.",
+      "code_blocks": [
+        {
+          "label": "forward_loss: MSE on masked patches with optional per-patch normalization",
+          "source": "    def forward_loss(self, imgs, pred, mask):\n        \"\"\"\n        imgs: [N, 3, H, W]\n        pred: [N, L, p*p*3]\n        mask: [N, L], 0 is keep, 1 is remove, \n        \"\"\"\n        target = self.patchify(imgs)\n        if self.norm_pix_loss:\n            mean = target.mean(dim=-1, keepdim=True)\n            var = target.var(dim=-1, keepdim=True)\n            target = (target - mean) / (var + 1.e-6)**.5\n\n        loss = (pred - target) ** 2\n        loss = loss.mean(dim=-1)  # [N, L], mean loss per patch\n\n        loss = (loss * mask).sum() / mask.sum()  # mean loss on removed patches\n        return loss",
+          "source_start_line": 198,
+          "file_path": "models_mae.py",
+          "annotations": [
+            {
+              "start_line": 204,
+              "end_line": 204,
+              "explanation": "patchify converts images back to (N, 196, 768) raw pixel values — the reconstruction targets. These are never seen by the encoder.",
+              "concept_tag": "loss"
+            },
+            {
+              "start_line": 205,
+              "end_line": 208,
+              "explanation": "norm_pix_loss: normalize each patch by its own mean and std. This prevents the loss from being dominated by easy low-variance background patches and forces the model to focus on texture and structure.",
+              "concept_tag": "normalization"
+            },
+            {
+              "start_line": 210,
+              "end_line": 211,
+              "explanation": "Elementwise squared error, then mean across the 768 pixel channels, producing (N, 196) scalar loss per patch.",
+              "concept_tag": "loss"
+            },
+            {
+              "start_line": 213,
+              "end_line": 213,
+              "explanation": "mask=1 for removed patches, 0 for visible. Multiply + sum zeroes out visible patches, then divide by count of masked patches (not total). Only the 75% removed patches drive learning.",
+              "concept_tag": "loss"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "sincos-pos-embed",
+      "title": "Fixed 2D Sinusoidal Position Embeddings",
+      "narrative": "MAE uses fixed, non-learned positional embeddings — not the learned position embeddings that standard ViT uses. There's a practical reason: the encoder only sees 49 of 196 patches, so learned embeddings for the remaining 147 positions would never get gradient updates during pre-training. Fixed sinusoidal embeddings are used for both encoder and decoder.\n\nThe 2D sinusoidal embedding encodes both row and column position. The embedding dimension is split in half: the first D/2 dimensions encode the row (height axis) using sinusoidal frequencies, and the last D/2 dimensions encode the column (width axis). Each frequency corresponds to a different 'wavelength' — lower-indexed dimensions oscillate slowly across positions, higher-indexed dimensions oscillate quickly.\n\nThis design has an important property: it generalizes to image resolutions different from training. The sinusoidal functions are defined for any position value, so position embeddings can be interpolated (see `interpolate_pos_embed` in `util/pos_embed.py`) to support larger images at fine-tuning time without requiring the model to have seen those positions during pre-training.",
+      "code_blocks": [
+        {
+          "label": "get_2d_sincos_pos_embed: 2D sinusoidal position encoding",
+          "source": "def get_2d_sincos_pos_embed(embed_dim, grid_size, cls_token=False):\n    \"\"\"\n    grid_size: int of the grid height and width\n    return:\n    pos_embed: [grid_size*grid_size, embed_dim] or [1+grid_size*grid_size, embed_dim] (w/ or w/o cls_token)\n    \"\"\"\n    grid_h = np.arange(grid_size, dtype=np.float32)\n    grid_w = np.arange(grid_size, dtype=np.float32)\n    grid = np.meshgrid(grid_w, grid_h)  # here w goes first\n    grid = np.stack(grid, axis=0)\n\n    grid = grid.reshape([2, 1, grid_size, grid_size])\n    pos_embed = get_2d_sincos_pos_embed_from_grid(embed_dim, grid)\n    if cls_token:\n        pos_embed = np.concatenate([np.zeros([1, embed_dim]), pos_embed], axis=0)\n    return pos_embed",
+          "source_start_line": 20,
+          "file_path": "util/pos_embed.py",
+          "annotations": [
+            {
+              "start_line": 26,
+              "end_line": 29,
+              "explanation": "Create a 14×14 grid of (col, row) coordinate pairs using meshgrid. This gives every patch a 2D spatial coordinate — its column index and row index in the patch grid.",
+              "concept_tag": "embedding"
+            },
+            {
+              "start_line": 32,
+              "end_line": 33,
+              "explanation": "get_2d_sincos_pos_embed_from_grid splits embed_dim in half: D/2 for row embedding, D/2 for column embedding, then concatenates. Each half uses 1D sinusoidal encoding.",
+              "concept_tag": "embedding"
+            },
+            {
+              "start_line": 34,
+              "end_line": 35,
+              "explanation": "If cls_token=True, prepend a zero vector for the cls token position. The cls token has no spatial position, so zeros are used rather than any frequency encoding.",
+              "concept_tag": "embedding"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "putting-it-together",
+      "title": "Putting It All Together",
+      "narrative": "The complete MAE forward pass ties all components into a tight three-step pipeline. Each input image produces a loss, predicted patch values, and a binary mask — everything needed to train or visualize reconstructions.\n\nThe default masking ratio of 0.75 is a deliberate choice validated in the paper: lower ratios (e.g., 0.5) make the task too easy — local interpolation suffices. Higher ratios (e.g., 0.9) make it too hard — not enough context remains for meaningful reconstruction. 0.75 hits the sweet spot where the model must reason globally to fill in gaps.\n\nDuring pre-training the decoder's MSE loss is all that matters. During fine-tuning, the decoder is discarded entirely — only the encoder weights are loaded, and a classification head (or other task-specific head) is attached to the cls token output. The encoder has learned rich visual representations from the masking task: it must understand object shapes, textures, and spatial relationships to predict masked regions, and those understandings transfer directly to downstream recognition tasks.\n\nMAE's simplicity belies its power. No contrastive pairs, no momentum encoders, no discrete tokenizers, no data augmentation tricks. Just mask, predict, and learn.",
+      "code_blocks": [
+        {
+          "label": "forward: three-step MAE pipeline",
+          "source": "    def forward(self, imgs, mask_ratio=0.75):\n        latent, mask, ids_restore = self.forward_encoder(imgs, mask_ratio)\n        pred = self.forward_decoder(latent, ids_restore)  # [N, L, p*p*3]\n        loss = self.forward_loss(imgs, pred, mask)\n        return loss, pred, mask",
+          "source_start_line": 216,
+          "file_path": "models_mae.py",
+          "annotations": [
+            {
+              "start_line": 217,
+              "end_line": 217,
+              "explanation": "forward_encoder: 196 patches → mask 75% → 49 visible tokens through ViT. Returns (N, 50, 1024) latent (1 cls + 49 patches), binary mask, and ids_restore permutation.",
+              "concept_tag": "attention"
+            },
+            {
+              "start_line": 218,
+              "end_line": 218,
+              "explanation": "forward_decoder: expands 49 visible tokens back to 196 by inserting mask_tokens, unshuffles with ids_restore, runs 8 decoder blocks, projects to (N, 196, 768) pixel predictions.",
+              "concept_tag": "linear"
+            },
+            {
+              "start_line": 219,
+              "end_line": 219,
+              "explanation": "forward_loss: patchify original image, optionally normalize per patch, compute MSE only on masked positions. Single scalar for backprop.",
+              "concept_tag": "loss"
+            },
+            {
+              "start_line": 220,
+              "end_line": 220,
+              "explanation": "Returns all three: loss for training, pred for visualization (reconstruct the masked regions), mask to know which patches were held out.",
+              "concept_tag": "other:output"
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "summary": "MAE (Masked Autoencoders Are Scalable Vision Learners) is a self-supervised pre-training method for vision that masks 75% of image patches and trains a model to reconstruct the missing raw pixel values. Its key innovation is an asymmetric encoder-decoder: a heavy ViT encoder processes only the 25% visible patches (making it fast), while a lightweight 8-block decoder reconstructs all 196 patches by inserting learnable mask tokens and unshuffling back to spatial order. The loss is MSE on masked patches only, with optional per-patch pixel normalization. After pre-training, the decoder is discarded and the encoder fine-tuned on downstream tasks, achieving strong results on ImageNet classification and dense prediction benchmarks with far less pre-training compute than contrastive methods."
+}

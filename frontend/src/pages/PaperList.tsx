@@ -22,12 +22,14 @@ const DISPLAY_NAMES: Record<string, string> = {
   'mobile-aloha': 'Mobile ALOHA',
   '3d-vla': '3D-VLA',
   sonic: 'SONIC',
+  MAE: 'MAE',
 }
 
 const PAPER_YEAR: Record<string, number> = {
   unet: 2015,
   ViT: 2020,
   CLIP: 2021,
+  MAE: 2021,
   dit: 2022,
   rt1: 2022,
   act: 2023,
@@ -84,6 +86,7 @@ const PAPER_POSITIONS: Record<string, CellPos> = {
   unet:               { lane: 0, col: 0, sub: 0 },
   ViT:                { lane: 0, col: 1, sub: 0 },
   CLIP:               { lane: 0, col: 2, sub: 0 },
+  MAE:                { lane: 0, col: 2, sub: 1 },
   dit:                { lane: 0, col: 3, sub: 0 },
   dinov3:             { lane: 0, col: 6, sub: 0 },
   sam3:               { lane: 0, col: 6, sub: 1 },
@@ -105,6 +108,7 @@ interface Edge { from: string; to: string; dashed?: boolean }
 
 const EDGES: Edge[] = [
   // Solid — direct lineage (always visible)
+  { from: 'ViT',   to: 'MAE' },
   { from: 'ViT',   to: 'dinov3' },
   { from: 'rt1',   to: 'rt2' },
   { from: 'pi0',   to: 'groot' },
@@ -115,6 +119,8 @@ const EDGES: Edge[] = [
   { from: 'ViT',  to: 'rt1',              dashed: true },
   { from: 'CLIP', to: 'sam3',             dashed: true },
   { from: 'CLIP', to: 'rt2',              dashed: true },
+  { from: 'MAE',  to: 'dinov3',            dashed: true },
+  { from: 'MAE',  to: 'dit',              dashed: true },
   { from: 'unet', to: 'dit',              dashed: true },
   { from: 'unet', to: 'sam3',             dashed: true },
   { from: 'dit',  to: 'diffusion-policy', dashed: true },
