@@ -357,7 +357,7 @@ function Wiring({ hoveredPaper }: { hoveredPaper: string | null }) {
       }
     } else {
       color = SOLID_COLOR; dash = undefined; strokeW = 1.5
-      opacity = hoveredPaper ? 0.2 : 1
+      opacity = 1
     }
 
     // Same-column: vertical
