@@ -125,21 +125,23 @@ Update `data/papers/index.json` to include the new paper entry.
 
 **Also update the 2D lineage grid** in `frontend/src/pages/PaperList.tsx`:
 
-The gallery uses a fixed column/row grid with an SVG wiring layer. Three static objects control the layout:
+The gallery uses a **horizontal timeline DAG** layout: X-axis is chronological (year columns), Y-axis is domain (swim lanes). Five static objects control the layout:
 
-The gallery uses a vertical-track layout: each conceptual group is a vertical lane, and papers flow top-to-bottom within it. Three objects control the layout:
-
-- `PAPER_POSITIONS` — maps each paper ID to `{track, row}`. Current layout:
-  - Track 0 (foundations): `ViT` row 0, `dinov3` row 1, `unet` row 2, `dit` row 3, `CLIP` row 4, `sam3` row 5
-  - Track 1 (robot-learning): `act` row 0, `diffusion-policy` row 1, `rt1` row 2, `rt2` row 3, `pi0` row 4, `groot` row 5, `mobile-aloha` row 6, `3d-vla` row 7, `sonic` row 8
-- `EDGES` — directed dependency arrows. Solid for direct lineage (same track); dashed (`{dashed: true}`) for cross-track architectural borrowing. Multiple edges from the same source are automatically rendered as a forked bus.
-- `TRACKS` — one entry per vertical lane with `id`, `label`, `color`, `borderColor`. SVG dimensions are auto-computed from `PAPER_POSITIONS`.
+- `PAPER_POSITIONS` — maps each paper ID to `{lane, col, sub}`:
+  - `lane` = swim lane index (0 = Vision & Generative, 1 = Robot Learning)
+  - `col` = year column index (maps to `YEAR_COLS`: 0→2015, 1→2020, 2→2021, 3→2022, 4→2023, 5→2024, 6→2025)
+  - `sub` = stack position within a cell (when multiple papers share the same lane+year)
+- `YEAR_COLS` — array of years displayed as columns left-to-right
+- `LANES` — one entry per horizontal swim lane with `id`, `label`, `color`, `borderColor`
+- `EDGES` — directed dependency arrows. Solid for direct lineage; dashed (`{dashed: true}`) for architectural borrowing. Edges route left→right with right-angle bends.
+- `DISPLAY_NAMES` / `PAPER_YEAR` — short display names and publication years per paper
 
 For each new paper:
-1. Add `'<paper-id>': { track: N, row: R }` to `PAPER_POSITIONS` (next available row in the right track)
-2. Add edges to `EDGES` pointing from its predecessors
-3. If it belongs to a new conceptual group, add a new entry to `TRACKS` (use the next track index)
-4. Papers omitted from `PAPER_POSITIONS` automatically appear in the "Other Papers" catch-all below the grid
+1. Add entries to `DISPLAY_NAMES` and `PAPER_YEAR`
+2. Add `'<paper-id>': { lane: N, col: C, sub: S }` to `PAPER_POSITIONS` (pick the right lane + year column, use next `sub` if cell already has papers)
+3. Add edges to `EDGES` pointing from its predecessors
+4. If it belongs to a new domain, add a new entry to `LANES` and possibly new years to `YEAR_COLS`
+5. Papers omitted from `PAPER_POSITIONS` automatically appear in the "Other Papers" catch-all below the timeline
 
 ### Step 5: Start frontend and verify
 ```bash
