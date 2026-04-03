@@ -130,8 +130,9 @@ The gallery uses a fixed column/row grid with an SVG wiring layer. Three static 
 The gallery uses a vertical-track layout: each conceptual group is a vertical lane, and papers flow top-to-bottom within it. Three objects control the layout:
 
 - `PAPER_POSITIONS` — maps each paper ID to `{track, row}`. Current layout:
-  - Track 0 (foundations): `dinov3` row 0, `dit` row 1
-  - Track 1 (robot-learning): `diffusion-policy` row 0, `rt1` row 1, `rt2` row 2, `pi0` row 3, `groot` row 4
+  - Track 0 (foundations): `ViT` row 0, `dinov3` row 1, `dit` row 2, `CLIP` row 3, `sam3` row 4
+  - Track 1 (robot-learning): `act` row 0, `diffusion-policy` row 1, `rt1` row 2, `rt2` row 3, `pi0` row 4, `groot` row 5, `mobile-aloha` row 6, `3d-vla` row 7, `sonic` row 8
+  - Track 2 (segmentation): `unet` row 0
 - `EDGES` — directed dependency arrows. Solid for direct lineage (same track); dashed (`{dashed: true}`) for cross-track architectural borrowing. Multiple edges from the same source are automatically rendered as a forked bus.
 - `TRACKS` — one entry per vertical lane with `id`, `label`, `color`, `borderColor`. SVG dimensions are auto-computed from `PAPER_POSITIONS`.
 
