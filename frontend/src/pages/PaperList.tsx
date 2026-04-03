@@ -302,6 +302,57 @@ function Wiring() {
     />
   ))
 
+  // Pre-compute fan-out (outgoing) and fan-in (incoming) cross-column edges per card
+  // so we can spread exit/entry points vertically to avoid overlap
+  const FAN_SPREAD = 20  // max spread above/below center for fan ports
+  const crossColEdges = EDGES.filter(e => {
+    const f = PAPER_POSITIONS[e.from], t = PAPER_POSITIONS[e.to]
+    return f && t && f.col !== t.col
+  })
+  // Map: paperId → list of cross-col edges going OUT (sorted by target y)
+  const outEdges = new Map<string, Edge[]>()
+  // Map: paperId → list of cross-col edges coming IN (sorted by source y)
+  const inEdges  = new Map<string, Edge[]>()
+  crossColEdges.forEach(e => {
+    if (!outEdges.has(e.from)) outEdges.set(e.from, [])
+    outEdges.get(e.from)!.push(e)
+    if (!inEdges.has(e.to)) inEdges.set(e.to, [])
+    inEdges.get(e.to)!.push(e)
+  })
+  // Sort outgoing by target's y position, incoming by source's y position
+  outEdges.forEach((edges) => edges.sort((a, b) => {
+    const pa = PAPER_POSITIONS[a.to], pb = PAPER_POSITIONS[b.to]
+    return (pa.lane * 100 + pa.sub) - (pb.lane * 100 + pb.sub)
+  }))
+  inEdges.forEach((edges) => edges.sort((a, b) => {
+    const pa = PAPER_POSITIONS[a.from], pb = PAPER_POSITIONS[b.from]
+    return (pa.lane * 100 + pa.sub) - (pb.lane * 100 + pb.sub)
+  }))
+
+  /** Get fan-offset for an outgoing port */
+  function outPortY(edge: Edge): number {
+    const list = outEdges.get(edge.from) ?? [edge]
+    const idx  = list.indexOf(edge)
+    const n    = list.length
+    const fp   = PAPER_POSITIONS[edge.from]
+    const cy   = cardY(fp.lane, fp.sub) + CARD_H / 2
+    if (n <= 1) return cy
+    const spread = Math.min(FAN_SPREAD, (CARD_H - 16) / 2)
+    return cy - spread + (2 * spread * idx) / (n - 1)
+  }
+
+  /** Get fan-offset for an incoming port */
+  function inPortY(edge: Edge): number {
+    const list = inEdges.get(edge.to) ?? [edge]
+    const idx  = list.indexOf(edge)
+    const n    = list.length
+    const tp   = PAPER_POSITIONS[edge.to]
+    const cy   = cardY(tp.lane, tp.sub) + CARD_H / 2
+    if (n <= 1) return cy
+    const spread = Math.min(FAN_SPREAD, (CARD_H - 16) / 2)
+    return cy - spread + (2 * spread * idx) / (n - 1)
+  }
+
   // Edge rendering
   const edgeElements = EDGES.map((edge) => {
     const fp = PAPER_POSITIONS[edge.from]
@@ -326,22 +377,17 @@ function Wiring() {
       )
     }
 
-    // Cross-column edge: horizontal routing
-    // Source: right-center of card
+    // Cross-column edge: horizontal routing with fan-out/fan-in
     const x1 = cardX(fp.col) + CARD_W
-    const y1 = cardY(fp.lane, fp.sub) + CARD_H / 2
+    const y1 = outPortY(edge)
 
-    // Target: left-center of card
     const x2 = cardX(tp.col)
-    const y2 = cardY(tp.lane, tp.sub) + CARD_H / 2
+    const y2 = inPortY(edge)
 
     const midX = (x1 + x2) / 2
 
-    // Simple right-angle routing
     const path = y1 === y2
-      // Straight horizontal
       ? `M${x1},${y1} L${x2 - AH},${y2}`
-      // Right-angle: horizontal to midpoint, vertical, horizontal to target
       : `M${x1},${y1} L${midX},${y1} L${midX},${y2} L${x2 - AH},${y2}`
 
     // Arrowhead pointing right
