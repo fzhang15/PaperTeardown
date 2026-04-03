@@ -280,19 +280,18 @@ function Wiring({ hoveredPaper }: { hoveredPaper: string | null }) {
     >{year}</text>
   ))
 
-  // Determine which dashed edges to show based on hover
-  const visibleDashedEdges = new Set<Edge>()
+  // Determine which dashed edges are highlighted (connected to hovered paper)
+  const highlightedEdges = new Set<Edge>()
   if (hoveredPaper) {
     EDGES.forEach(e => {
       if (e.dashed && (e.from === hoveredPaper || e.to === hoveredPaper)) {
-        visibleDashedEdges.add(e)
+        highlightedEdges.add(e)
       }
     })
   }
 
-  // Pre-compute fan ports for visible cross-col edges only
+  // Pre-compute fan ports for ALL cross-col edges (they're always rendered)
   const visibleCrossCol = EDGES.filter(e => {
-    if (e.dashed && !visibleDashedEdges.has(e)) return false
     const f = PAPER_POSITIONS[e.from], t = PAPER_POSITIONS[e.to]
     return f && t && f.col !== t.col
   })
@@ -343,12 +342,23 @@ function Wiring({ hoveredPaper }: { hoveredPaper: string | null }) {
     const tp = PAPER_POSITIONS[edge.to]
     if (!fp || !tp) return null
 
-    // Skip dashed edges that aren't active
-    if (edge.dashed && !visibleDashedEdges.has(edge)) return null
+    // Dashed edges: subtle by default, highlighted when connected to hovered card
+    const isHighlighted = highlightedEdges.has(edge)
+    let color: string
+    let dash: string | undefined
+    let opacity: number
+    let strokeW: number
 
-    const color = edge.dashed ? DASHED_COLOR : SOLID_COLOR
-    const dash = edge.dashed ? '4,3' : undefined
-    const opacity = edge.dashed ? 0.85 : (hoveredPaper ? 0.25 : 1)
+    if (edge.dashed) {
+      if (isHighlighted) {
+        color = DASHED_COLOR; dash = '4,3'; opacity = 0.9; strokeW = 1.5
+      } else {
+        color = '#d4d4d8'; dash = '4,3'; opacity = 0.4; strokeW = 1
+      }
+    } else {
+      color = SOLID_COLOR; dash = undefined; strokeW = 1.5
+      opacity = hoveredPaper ? 0.2 : 1
+    }
 
     // Same-column: vertical
     if (fp.col === tp.col) {
@@ -358,7 +368,7 @@ function Wiring({ hoveredPaper }: { hoveredPaper: string | null }) {
       return (
         <g key={`${edge.from}→${edge.to}`} style={{ opacity, transition: 'opacity 0.2s' }}>
           <line x1={cx} y1={y1} x2={cx} y2={y2 - AH}
-            stroke={color} strokeWidth={1.2} strokeDasharray={dash} />
+            stroke={color} strokeWidth={strokeW} strokeDasharray={dash} />
           <polygon points={`${cx - AH / 2},${y2 - AH} ${cx},${y2} ${cx + AH / 2},${y2 - AH}`} fill={color} />
         </g>
       )
@@ -377,7 +387,7 @@ function Wiring({ hoveredPaper }: { hoveredPaper: string | null }) {
 
     return (
       <g key={`${edge.from}→${edge.to}`} style={{ opacity, transition: 'opacity 0.2s' }}>
-        <path d={path} fill="none" stroke={color} strokeWidth={1.2} strokeDasharray={dash} />
+        <path d={path} fill="none" stroke={color} strokeWidth={strokeW} strokeDasharray={dash} />
         <polygon points={`${x2 - AH},${y2 - AH / 2} ${x2},${y2} ${x2 - AH},${y2 + AH / 2}`} fill={color} />
       </g>
     )
