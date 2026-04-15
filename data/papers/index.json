@@ -168,5 +168,15 @@
     "abstract": "This paper shows that masked autoencoders (MAE) are scalable self-supervised learners for computer vision. MAE masks a high proportion (75%) of random patches of the input image and reconstructs the missing pixels. It is based on an asymmetric encoder-decoder architecture: a ViT encoder operates on only the visible patches, while a lightweight decoder reconstructs the original image from the latent representation and mask tokens. After pre-training, the decoder is discarded and the encoder is used for recognition tasks.",
     "chapter_count": 8,
     "ingested_at": "2026-04-03T00:00:00Z"
+  },
+  {
+    "id": "OpenVLA",
+    "title": "OpenVLA: An Open-Source Vision-Language-Action Model",
+    "authors": ["Moo Jin Kim", "Karl Pertsch", "Siddharth Karamcheti", "Ted Xiao", "Ashwin Balakrishna", "Suraj Nair", "Rafael Rafailov", "Chelsea Finn"],
+    "arxiv_url": "https://arxiv.org/abs/2406.09246",
+    "repo_url": "https://github.com/openvla/openvla",
+    "abstract": "OpenVLA is a 7B open-source VLA model trained on 970k+ robot trajectories from Open X-Embodiment. It fuses DINOv2 and SigLIP visual encoders via a Prismatic backbone, discretizes continuous robot actions into LLM vocabulary tokens, and outperforms RT-2-X (55B) on BridgeV2 tasks by 16.5% absolute while enabling efficient LoRA fine-tuning on consumer hardware.",
+    "chapter_count": 9,
+    "ingested_at": "2026-04-15T00:00:00Z"
   }
 ]

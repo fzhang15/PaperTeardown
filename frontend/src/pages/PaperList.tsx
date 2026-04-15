@@ -24,6 +24,7 @@ const DISPLAY_NAMES: Record<string, string> = {
   sonic: 'SONIC',
   MAE: 'MAE',
   'stable-diffusion': 'Stable Diff.',
+  OpenVLA: 'OpenVLA',
 }
 
 const PAPER_YEAR: Record<string, number> = {
@@ -40,6 +41,7 @@ const PAPER_YEAR: Record<string, number> = {
   'mobile-aloha': 2024,
   '3d-vla': 2024,
   pi0: 2024,
+  OpenVLA: 2024,
   dinov3: 2025,
   groot: 2025,
   sam3: 2025,
@@ -100,6 +102,7 @@ const PAPER_POSITIONS: Record<string, CellPos> = {
   'mobile-aloha':     { lane: 1, col: 5, sub: 0 },
   '3d-vla':           { lane: 1, col: 5, sub: 1 },
   pi0:                { lane: 1, col: 5, sub: 2 },
+  OpenVLA:            { lane: 1, col: 5, sub: 3 },
   groot:              { lane: 1, col: 6, sub: 0 },
   sonic:              { lane: 1, col: 6, sub: 1 },
 }
@@ -135,6 +138,8 @@ const EDGES: Edge[] = [
   { from: 'rt2',  to: '3d-vla',           dashed: true },
   { from: 'diffusion-policy', to: 'pi0',  dashed: true },
   { from: 'act',  to: 'mobile-aloha' },
+  { from: 'rt2',  to: 'OpenVLA',          dashed: true },
+  { from: 'CLIP', to: 'OpenVLA',          dashed: true },
 ]
 
 // Pre-compute which papers are connected by ANY edge to each paper

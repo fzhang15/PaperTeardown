@@ -1,0 +1,12 @@
+{
+  "id": "OpenVLA",
+  "title": "OpenVLA: An Open-Source Vision-Language-Action Model",
+  "authors": ["Moo Jin Kim", "Karl Pertsch", "Siddharth Karamcheti", "Ted Xiao", "Ashwin Balakrishna", "Suraj Nair", "Rafael Rafailov", "Ethan Paul Foster", "Grace Lim", "Pannag Sanketi", "Quan Vuong", "Thomas Kollar", "Benjamin Burchfiel", "Russ Tedrake", "Dorsa Sadigh", "Sergey Levine", "Percy Liang", "Chelsea Finn"],
+  "arxiv_url": "https://arxiv.org/abs/2406.09246",
+  "repo_url": "https://github.com/openvla/openvla",
+  "abstract": "We introduce OpenVLA, a 7B-parameter open-source vision-language-action model trained on 970k robot manipulation episodes from the Open X-Embodiment dataset. OpenVLA is built on a Prismatic VLM backbone that fuses DINOv2 and SigLIP visual representations, and predicts robot actions as discrete tokens in the language model's vocabulary. OpenVLA outperforms closed-source generalist robot policies such as RT-2-X (55B) in absolute task success rate by 16.5% on challenging BridgeV2 tasks, matches or exceeds performance on Google Robot and WidowX tasks, and enables efficient adaptation to new setups via LoRA fine-tuning with 100-500 demonstrations. We release model weights, training code, and a fine-tuning recipe to make powerful robot policies accessible to the community.",
+  "introduction_excerpt": "Generalist robot policies that can follow natural language instructions and perform diverse manipulation tasks in the real world are a long-standing goal of robotics research. Recent work on vision-language-action (VLA) models has shown that large-scale pretrained vision-language models can be fine-tuned on robot data to achieve impressive generalist capabilities. However, prior state-of-the-art VLA models such as RT-2 rely on proprietary model weights and training infrastructure, making it difficult for the research community to build on these results.",
+  "module_count": 6,
+  "pytorch_file_count": 12,
+  "ingested_at": "2026-04-15T00:00:00Z"
+}

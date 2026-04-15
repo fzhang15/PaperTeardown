@@ -1,0 +1,270 @@
+{
+  "chapters": [
+    {
+      "id": "the-problem",
+      "title": "The Problem: Making Vision-Language-Action Models Accessible",
+      "narrative": "RT-2 proved a remarkable idea: a 55-billion-parameter vision-language model, fine-tuned on robot trajectories and prompted with natural language, could generalize to novel objects and emergent tasks. But RT-2 was a closed system — the weights unavailable, the training pipeline proprietary, the computational cost ($10M+ to train) prohibitive for academic research.\n\nOpenVLA answers this with a 7B-parameter open-source VLA built on exactly the same principles. The model takes a single robot camera image and a natural-language instruction, and outputs a robot action — the 7 dimensions of end-effector pose control — framed as next-token prediction over a discrete vocabulary.\n\nThe key architectural decisions that make this possible:\n\n1. **Dual vision encoding**: Two ViTs process the same image — DINOv2 for spatial/dense features, SigLIP for language-aligned semantic features. Their patch features are concatenated channel-wise, giving the LLM a richer visual representation than either alone.\n\n2. **Action tokenization**: Continuous joint positions and gripper states are discretized into 256 bins each and mapped to the 256 least-used tokens in the LLM vocabulary. Actions are predicted as a short string of tokens, using the same next-token prediction infrastructure as text generation.\n\n3. **Scale**: Trained on 970k+ robot trajectories from the Open X-Embodiment dataset — the largest public robot dataset — spanning 70+ embodiments and 500+ skills. This breadth makes OpenVLA broadly capable without task-specific fine-tuning.\n\nThe result: a model that matches or exceeds RT-2 on standard benchmarks while being fully open-source, fine-tunable on a single A100 in hours, and usable by any lab without a Google-scale budget.",
+      "code_blocks": []
+    },
+    {
+      "id": "dual-vision",
+      "title": "Dual Vision Encoding: DINOv2 + SigLIP Running in Parallel",
+      "narrative": "The most distinctive architectural choice in OpenVLA is running two separate ViT encoders on every image. DINOv2 (ViT-L/14) is trained with self-supervised distillation — it produces dense patch features that preserve spatial layout and object geometry. SigLIP (ViT-SO400M/14) is trained with image-text contrastive learning — it produces semantically rich features aligned to natural language descriptions.\n\nNeither alone is optimal for robot manipulation: DINOv2 lacks language grounding, SigLIP lacks fine-grained spatial detail. Together they give the LLM both modalities simultaneously.\n\nThe implementation is clean: both ViTs operate at the same resolution (224×224 or 384×384), producing the same number of patch tokens (256 + 1 CLS). Their outputs are concatenated along the feature dimension at `dim=2`, giving each patch a combined 2176-dimensional embedding (1024 from DINOv2 + 1152 from SigLIP). The projector then compresses this combined representation down to the LLM's 4096-dimensional embedding space.\n\nOne implementation detail: both featurizers are monkey-patched to return the *second-to-last* layer's patches via `get_intermediate_layers`, rather than the final layer output. This is a common trick — the penultimate layer retains richer spatial detail that the final layer may suppress.",
+      "code_blocks": [
+        {
+          "label": "DinoSigLIPViTBackbone.__init__: two ViTs initialized from TIMM",
+          "source": "class DinoSigLIPViTBackbone(VisionBackbone):\n    def __init__(self, vision_backbone_id: str, image_resize_strategy: str, default_image_size: int = 224) -> None:\n        super().__init__(vision_backbone_id, image_resize_strategy, default_image_size=default_image_size)\n        self.dino_timm_path_or_url = DINOSigLIP_VISION_BACKBONES[vision_backbone_id][\"dino\"]\n        self.siglip_timm_path_or_url = DINOSigLIP_VISION_BACKBONES[vision_backbone_id][\"siglip\"]\n\n        # Initialize both Featurizers (ViTs) by downloading from HF / TIMM Hub if necessary\n        self.dino_featurizer: VisionTransformer = timm.create_model(\n            self.dino_timm_path_or_url, pretrained=True, num_classes=0, img_size=self.default_image_size\n        )\n        self.dino_featurizer.eval()\n\n        self.siglip_featurizer: VisionTransformer = timm.create_model(\n            self.siglip_timm_path_or_url, pretrained=True, num_classes=0, img_size=self.default_image_size\n        )\n        self.siglip_featurizer.eval()\n\n        # Monkey-Patch the `forward()` function of the featurizers to ensure FSDP-compatibility\n        #   => Note: By default set `get_intermediate_layers` to return the *SECOND-TO-LAST* layer patches!\n        #   => TODO (siddk) Remove after resolution of https://github.com/pytorch/pytorch/issues/109385\n        self.dino_featurizer.forward = unpack_tuple(\n            partial(self.dino_featurizer.get_intermediate_layers, n={len(self.dino_featurizer.blocks) - 2})\n        )\n        self.siglip_featurizer.forward = unpack_tuple(\n            partial(self.siglip_featurizer.get_intermediate_layers, n={len(self.siglip_featurizer.blocks) - 2})\n        )",
+          "source_start_line": 43,
+          "file_path": "prismatic/models/backbones/vision/dinosiglip_vit.py",
+          "annotations": [
+            {
+              "start_line": 50,
+              "end_line": 58,
+              "explanation": "Both ViTs are loaded from TIMM with pretrained weights and set to eval mode. num_classes=0 removes the classification head, returning raw patch features instead of class predictions.",
+              "concept_tag": "embedding"
+            },
+            {
+              "start_line": 63,
+              "end_line": 68,
+              "explanation": "The forward methods are monkey-patched to use get_intermediate_layers(n={N-2}) — returning the second-to-last block's activations rather than the final layer. Penultimate layer features preserve more spatial detail that the final attention pooling can suppress. This is wrapped in unpack_tuple for FSDP compatibility.",
+              "concept_tag": "attention"
+            }
+          ]
+        },
+        {
+          "label": "DinoSigLIPViTBackbone.forward: channel-wise concatenation of both backbones",
+          "source": "    def forward(self, pixel_values: Dict[str, torch.Tensor]) -> torch.Tensor:\n        \"\"\"Runs the transformed image/pixel tensors through each vision backbone, returning concatenated patches.\"\"\"\n        dino_patches = self.dino_featurizer(pixel_values[\"dino\"])\n        siglip_patches = self.siglip_featurizer(pixel_values[\"siglip\"])\n\n        return torch.cat([dino_patches, siglip_patches], dim=2)\n\n    @property\n    def default_image_resolution(self) -> Tuple[int, int, int]:\n        return self.dino_data_cfg[\"input_size\"]\n\n    @property\n    def embed_dim(self) -> int:\n        return self.dino_featurizer.embed_dim + self.siglip_featurizer.embed_dim",
+          "source_start_line": 142,
+          "file_path": "prismatic/models/backbones/vision/dinosiglip_vit.py",
+          "annotations": [
+            {
+              "start_line": 144,
+              "end_line": 147,
+              "explanation": "Both featurizers run independently on their respective preprocessed inputs (different normalization statistics). The results are concatenated at dim=2 (the feature axis), not dim=1 (sequence axis). The output shape is [batch, 256, 2176] — same number of tokens as a single ViT, but each token carries features from both encoders.",
+              "concept_tag": "embedding"
+            },
+            {
+              "start_line": 153,
+              "end_line": 155,
+              "explanation": "embed_dim reports the sum of both ViT embedding dimensions. The projector's input dimension is wired to this property, so changing the backbone pair automatically scales the projector's input size.",
+              "concept_tag": "embedding"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "action-tokenization",
+      "title": "Action Tokenization: Robot Joints as LLM Vocabulary Tokens",
+      "narrative": "The defining trick of OpenVLA — inherited from RT-2 — is that robot actions are represented as discrete tokens in the LLM's vocabulary, making robot control indistinguishable from text generation.\n\nHere's how it works: each continuous action dimension (e.g., end-effector x-delta) is first normalized to the range [-1, 1] using per-dataset statistics computed from training data. Then it's discretized into one of 256 uniform bins. The bin index is then mapped to a token ID by counting backward from the end of the LLM vocabulary: bin 1 → `vocab_size - 1`, bin 2 → `vocab_size - 2`, etc.\n\nWhy the *last* tokens in the vocabulary? BPE tokenizers like LLaMA's assign the most common words and subwords to low token IDs. The tail of the vocabulary contains rarely-used tokens — obscure Unicode characters, specialized symbols. These tokens appear almost never in pretraining text, so they carry essentially no prior from language pretraining. OpenVLA can repurpose them as action bins without interfering with the LLM's language understanding.\n\nAt inference time, the process reverses: the generated token IDs are converted back to bin indices, which map to bin center values, which are then unnormalized using the stored dataset statistics to recover physical robot commands.",
+      "code_blocks": [
+        {
+          "label": "ActionTokenizer.__init__ + __call__: binning continuous actions into vocabulary tokens",
+          "source": "class ActionTokenizer:\n    def __init__(\n        self, tokenizer: PreTrainedTokenizerBase, bins: int = 256, min_action: int = -1, max_action: int = 1\n    ) -> None:\n        \"\"\"\n        Discretizes continuous robot actions into N bins per dimension and maps to the least used tokens.\n\n        NOTE =>> by default, assumes a BPE-style tokenizer akin to the LlamaTokenizer, where *the least used tokens*\n                 appear at the end of the vocabulary!\n\n        :param tokenizer: Base LLM/VLM tokenizer to extend.\n        :param bins: Number of bins for each continuous value; we'll adopt a uniform binning strategy.\n        :param min_action: Minimum action value (for clipping, setting lower bound on bin interval).\n        :param max_action: Maximum action value (for clipping, setting upper bound on bin interval).\n        \"\"\"\n        self.tokenizer, self.n_bins, self.min_action, self.max_action = tokenizer, bins, min_action, max_action\n\n        # Create Uniform Bins + Compute Bin Centers\n        self.bins = np.linspace(min_action, max_action, self.n_bins)\n        self.bin_centers = (self.bins[:-1] + self.bins[1:]) / 2.0\n\n        # [Contract] Set \"action_token_begin_idx\" based on `self.tokenizer.vocab_size - (self.n_bins + 1)`\n        #   =>> Assumes we're always overwriting the final `n_bins` tokens of the vocabulary!\n        self.action_token_begin_idx: int = int(self.tokenizer.vocab_size - (self.n_bins + 1))\n\n    def __call__(self, action: np.ndarray) -> Union[str, List[str]]:\n        \"\"\"Clip & bin actions to *the last `n_bins` tokens* of the vocabulary (e.g., tokenizer.vocab[-256:]).\"\"\"\n        action = np.clip(action, a_min=float(self.min_action), a_max=float(self.max_action))\n        discretized_action = np.digitize(action, self.bins)\n\n        # Handle single element vs. batch\n        if len(discretized_action.shape) == 1:\n            return self.tokenizer.decode(list(self.tokenizer.vocab_size - discretized_action))\n        else:\n            return self.tokenizer.batch_decode((self.tokenizer.vocab_size - discretized_action).tolist())",
+          "source_start_line": 13,
+          "file_path": "prismatic/vla/action_tokenizer.py",
+          "annotations": [
+            {
+              "start_line": 31,
+              "end_line": 32,
+              "explanation": "256 uniform bin edges from -1 to 1, and 255 bin centers (midpoints between adjacent edges). The bins array has 256 values, bin_centers has 255 — one fewer because N bins define N-1 intervals. This off-by-one matters at decode time.",
+              "concept_tag": "other:discretization"
+            },
+            {
+              "start_line": 36,
+              "end_line": 36,
+              "explanation": "action_token_begin_idx marks the start of the action region in the vocabulary: the last n_bins+1 token slots. Any generated token with ID >= action_token_begin_idx is an action token, not text. This clean separation prevents confusion during training.",
+              "concept_tag": "other:discretization"
+            },
+            {
+              "start_line": 40,
+              "end_line": 47,
+              "explanation": "np.digitize assigns each action value to a bin index in [1, 256]. The token ID is then vocab_size - bin_index, mapping bin 1 to the last token, bin 256 to the (256th from last) token. decode() converts the integer token IDs to their string representations — which are the 'action tokens' appended to the prompt.",
+              "concept_tag": "other:discretization"
+            }
+          ]
+        },
+        {
+          "label": "ActionTokenizer.decode_token_ids_to_actions: reversing tokenization at inference",
+          "source": "    def decode_token_ids_to_actions(self, action_token_ids: np.ndarray) -> np.ndarray:\n        \"\"\"\n        Returns continuous actions for discrete action token IDs.\n\n        NOTE =>> Because of the way the actions are discretized w.r.t. the bins (and not the bin centers), the\n                 digitization returns bin indices between [1, # bins], inclusive, when there are actually only\n                 (# bins - 1) bin intervals.\n\n                 Therefore, if the digitization returns the last possible index, we map this to the last bin interval.\n\n        EXAMPLE =>> Let's say self._bins has 256 values. Then self._bin_centers has 255 values. Digitization returns\n                    indices between [1, 256]. We subtract 1 from all indices so that they are between [0, 255]. There\n                    is still one index (i==255) that would cause an out-of-bounds error if used to index into\n                    self._bin_centers. Therefore, if i==255, we subtract 1 from it so that it just becomes the index of\n                    the last bin center. We implement this simply via clipping between [0, 255 - 1].\n        \"\"\"\n        discretized_actions = self.tokenizer.vocab_size - action_token_ids\n        discretized_actions = np.clip(discretized_actions - 1, a_min=0, a_max=self.bin_centers.shape[0] - 1)\n\n        return self.bin_centers[discretized_actions]",
+          "source_start_line": 49,
+          "file_path": "prismatic/vla/action_tokenizer.py",
+          "annotations": [
+            {
+              "start_line": 65,
+              "end_line": 66,
+              "explanation": "Reverse the encoding: token_id → bin_index via vocab_size - token_id, then subtract 1 (since digitize returns 1-based indices) and clip to [0, n_bins-2] to handle boundary cases. The clipping maps the out-of-bounds index 255 to 254, selecting the last valid bin center.",
+              "concept_tag": "other:discretization"
+            },
+            {
+              "start_line": 68,
+              "end_line": 68,
+              "explanation": "Return the bin center (midpoint of the bin interval) as the predicted continuous action. Using centers rather than bin edges minimizes expected quantization error — the maximum error is half a bin width, 1/256 ≈ 0.008 for the [-1, 1] range.",
+              "concept_tag": "other:discretization"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "fused-projector",
+      "title": "The Fused MLP Projector: Bridging 2176 Vision Dims to 4096 LLM Dims",
+      "narrative": "The projector is the narrow bridge between vision and language. It must compress each patch's 2176-dimensional dual-encoder representation into the 4096-dimensional space of the LLaMA-2 7B LLM, while preserving both the DINOv2 spatial structure and the SigLIP semantic alignment.\n\nOpenVLA uses a `FusedMLPProjector`: a 3-layer MLP with GELU activations. The architecture is deliberately asymmetric — it first *expands* to an intermediate dimension of `vision_dim * 4` = 8704 before compressing to the LLM's 4096 dims:\n\n```\n2176 → 8704 (expand × 4) → GELU → 4096 → GELU → 4096\n```\n\nThis expansion-then-compression pattern (similar to the feed-forward layers inside a transformer) allows the network to form rich cross-dimensional interactions before projecting. A simple linear projection would force the model to find a direct linear mapping between the vision and language spaces — a much harder constraint.\n\nThe projector is the *only* component trained during the alignment stage. Both vision backbones and the LLM are frozen; only this bridge is optimized to align the concatenated DINOv2+SigLIP features with the LLM's embedding space using image-text pairs.",
+      "code_blocks": [
+        {
+          "label": "FusedMLPProjector: 3-layer MLP with expansion-then-compression",
+          "source": "class FusedMLPProjector(nn.Module):\n    def __init__(self, fused_vision_dim: int, llm_dim: int, mlp_type: str = \"fused-gelu-mlp\") -> None:\n        super().__init__()\n        self.initial_projection_dim = fused_vision_dim * 4\n        if mlp_type == \"fused-gelu-mlp\":\n            self.projector = nn.Sequential(\n                nn.Linear(fused_vision_dim, self.initial_projection_dim, bias=True),\n                nn.GELU(),\n                nn.Linear(self.initial_projection_dim, llm_dim, bias=True),\n                nn.GELU(),\n                nn.Linear(llm_dim, llm_dim, bias=True),\n            )\n        else:\n            raise ValueError(f\"Fused Projector with `{mlp_type = }` is not supported!\")\n\n    def forward(self, fused_img_patches: torch.Tensor) -> torch.Tensor:\n        return self.projector(fused_img_patches)",
+          "source_start_line": 37,
+          "file_path": "prismatic/util/nn_utils.py",
+          "annotations": [
+            {
+              "start_line": 40,
+              "end_line": 40,
+              "explanation": "initial_projection_dim = vision_dim * 4. For the DINOv2+SigLIP backbone, this is 2176 * 4 = 8704. This 4× expansion is a deliberate choice — wider hidden layers give the projector more capacity to reorganize cross-modal features before the final compression to LLM dimension.",
+              "concept_tag": "linear"
+            },
+            {
+              "start_line": 42,
+              "end_line": 48,
+              "explanation": "Three Linear layers with two GELU activations. The pattern is: expand (2176→8704), compress (8704→4096), refine (4096→4096). The final square layer (4096→4096) acts as a learned post-processing step, letting the network adjust the projected embeddings without changing dimension. All layers use bias=True.",
+              "concept_tag": "activation"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "training-curriculum",
+      "title": "Training Curriculum: Align First, Then Fine-Tune Everything",
+      "narrative": "Training OpenVLA follows a two-phase curriculum that originated in LLaVA:\n\n**Phase 1 — Alignment**: The vision backbones and LLM are frozen. Only the projector is trained on image-text pairs (LLaVA-595K + LVIS + other vision-language datasets). This teaches the projector to map visual features into the LLM's token space without disturbing the LLM's language understanding or the pretrained visual representations.\n\n**Phase 2 — VLA Training (\"vla-train\" stage)**: The vision backbone stays frozen, but the LLM and projector are both unfrozen and trained jointly on the Open X-Embodiment robot dataset. This allows the LLM to adapt its attention patterns to the robotics distribution while keeping the visual feature extractor stable.\n\nThe vision backbone is always frozen — never trained on robot data. This is a key efficiency and generalization decision: the DINOv2 and SigLIP weights, pretrained on billions of images, transfer directly. Fine-tuning them would be expensive and risks overfitting to the robot domain.\n\nThe `freeze_backbones` method makes these stages explicit and auditable. Each stage logs exactly which components are frozen (🥶) vs. trainable (🔥), making it easy to verify the training configuration from logs.",
+      "code_blocks": [
+        {
+          "label": "freeze_backbones: align vs. vla-train stage parameter freezing",
+          "source": "    def freeze_backbones(self, stage: str) -> None:\n        \"\"\"\n        This function sets `requires_grad_` on each of the component modules explicitly, depending on stage.\n\n        We support two separate stages --> \"align\" and \"finetune\".\n            => \"align\" --> vision_backbone*, llm_backbone* are frozen; only the `projector` is trained.\n            => \"finetune\" --> vision_backbone* is frozen; both `projector` and `llm_backbone` are trained.\n\n        :param stage: Pretraining stage in < \"align\" | \"finetune\" | \"full-finetune\" | \"vla-train\" | \"vla-full-train\" >\n        \"\"\"\n        if stage == \"align\":\n            self.vision_backbone.requires_grad_(False)\n            self.llm_backbone.requires_grad_(False)\n            self.projector.requires_grad_(True)\n\n            # Add to `self.trainable_module_keys`\n            self.trainable_module_keys = [\"projector\"]\n\n            # Update Trackers\n            self.vision_backbone_requires_grad = False\n\n            # Explicitly Log Frozen / Trainable Components\n            overwatch.info(f\"[Frozen]    🥶 =>> Vision Backbone `{self.vision_backbone.identifier}`\", ctx_level=1)\n            overwatch.info(f\"[Frozen]    🥶 =>> LLM Backbone `{self.llm_backbone.identifier}`\", ctx_level=1)\n            overwatch.info(f\"[TRAINABLE] 🔥 =>> Projector `{self.arch_specifier}`\", ctx_level=1)\n\n        elif stage in {\"finetune\", \"vla-train\"}:\n            self.vision_backbone.requires_grad_(False)\n            self.llm_backbone.requires_grad_(True)\n            self.projector.requires_grad_(True)\n\n            # Add to `self.trainable_module_keys`\n            self.trainable_module_keys = [\"projector\", \"llm_backbone\"]\n\n            # Update Trackers\n            self.vision_backbone_requires_grad = False\n\n            # Explicitly Log Frozen / Unfrozen Components\n            overwatch.info(f\"[Frozen]    🥶 =>> Vision Backbone `{self.vision_backbone.identifier}`\", ctx_level=1)\n            overwatch.info(f\"[TRAINABLE] 🔥 =>> LLM Backbone `{self.llm_backbone.identifier}`\", ctx_level=1)\n            overwatch.info(f\"[TRAINABLE] 🔥 =>> Projector `{self.arch_specifier}`\", ctx_level=1)",
+          "source_start_line": 129,
+          "file_path": "prismatic/models/vlms/prismatic.py",
+          "annotations": [
+            {
+              "start_line": 139,
+              "end_line": 145,
+              "explanation": "Alignment stage: vision backbone and LLM are fully frozen (requires_grad_(False)). Only the projector trains. This is the cheapest stage — gradients only flow through the projector's ~16M parameters, not the 7B LLM.",
+              "concept_tag": "other:training"
+            },
+            {
+              "start_line": 155,
+              "end_line": 161,
+              "explanation": "VLA training stage: vision backbone stays frozen, but both the projector and LLM are unfrozen. This is the expensive stage — 7B parameters are trained. The vision backbone's grad tracker stays False, so the forward pass skips gradient computation for the ViTs entirely.",
+              "concept_tag": "other:training"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "forward-splice",
+      "title": "The Forward Pass: Splicing 257 Vision Tokens into the LLM Sequence",
+      "narrative": "The forward pass of PrismaticVLM is where everything comes together. The image produces 257 patch embeddings (256 spatial patches + 1 CLS token), each projected to 4096 dims. These are inserted into the text token sequence immediately after the `<BOS>` token, turning a text-only sequence into a vision-language sequence that the LLM attends over.\n\nThe sequence that enters the LLM looks like:\n```\n[BOS] [patch_1] [patch_2] ... [patch_257] [text_1] [text_2] ... [action_1] ... [action_7]\n```\n\nAt training time, a label mask forces the cross-entropy loss to only apply to the action tokens at the end. Everything before the action tokens — the `<BOS>`, the 257 image patches (marked as `IGNORE_INDEX = -100`), and the prompt text — contributes to the LLM's context but not to the loss. The model is trained purely to predict the right action token IDs given the visual and textual context.\n\nThe `multimodal_indices` mechanism handles batches that mix image+text samples with text-only samples, padding the text-only sequences to match the expanded sequence length from the image tokens.",
+      "code_blocks": [
+        {
+          "label": "PrismaticVLM.forward: visual feature extraction, projection, and sequence splice",
+          "source": "        # Run Visual Feature Extraction\n        with torch.set_grad_enabled(self.vision_backbone_requires_grad):\n            if isinstance(pixel_values, dict):\n                patch_features = self.vision_backbone({k: pixel_values[k][multimodal_indices] for k in pixel_values})\n            else:\n                patch_features = self.vision_backbone(pixel_values[multimodal_indices])\n\n        # Projection Logic :: [bsz, num_patches, llm_embed_dim] =>> num_patches = (2 *) (256 + 1) for ViT-L + CLS\n        projected_patch_embeddings = self.projector(patch_features)\n        projected_patch_attention_mask = None\n        if attention_mask is not None:\n            projected_patch_attention_mask = torch.full(\n                (projected_patch_embeddings.shape[0], projected_patch_embeddings.shape[1]),\n                True,\n                dtype=attention_mask.dtype,\n                device=attention_mask.device,\n            )\n\n        # Get Input Embeddings from LLM Backbone :: [bsz, input_seq_len, llm_embed_dim]\n        input_embeddings = self.llm_backbone.embed_input_ids(input_ids)\n\n        # Build Multimodal Embeddings (and build resulting attention mask)\n        multimodal_embeddings = torch.cat(\n            [\n                input_embeddings[multimodal_indices, :1, :],\n                projected_patch_embeddings,\n                input_embeddings[multimodal_indices, 1:, :],\n            ],\n            dim=1,\n        )\n        multimodal_attention_mask = None\n        if attention_mask is not None:\n            multimodal_attention_mask = torch.cat(\n                [\n                    attention_mask[multimodal_indices, :1],\n                    projected_patch_attention_mask,\n                    attention_mask[multimodal_indices, 1:],\n                ],\n                dim=1,\n            )\n\n        # [Contract] We assume the first token of `labels` (associated with <BOS>) is already marked as \"IGNORE\"\n        #   => We'll ignore the per-token outputs for each of the patch embeddings as well!\n        multimodal_labels = None\n        if labels is not None:\n            projected_patch_labels = torch.full(\n                (projected_patch_embeddings.shape[0], projected_patch_embeddings.shape[1]),\n                IGNORE_INDEX,\n                dtype=labels.dtype,\n                device=labels.device,\n            )\n            multimodal_labels = torch.cat(\n                [labels[multimodal_indices, :1], projected_patch_labels, labels[multimodal_indices, 1:]], dim=1\n            )",
+          "source_start_line": 367,
+          "file_path": "prismatic/models/vlms/prismatic.py",
+          "annotations": [
+            {
+              "start_line": 368,
+              "end_line": 375,
+              "explanation": "Vision features are extracted inside a set_grad_enabled context that is False when the backbone is frozen (alignment/vla-train stage). The projector then maps the 257×2176 patch tensor to 257×4096 in one call — a single matmul cascade over all patches simultaneously.",
+              "concept_tag": "linear"
+            },
+            {
+              "start_line": 389,
+              "end_line": 396,
+              "explanation": "The multimodal embedding sequence is assembled by concatenating: BOS token (index :1), the 257 projected patch embeddings, and the remaining text tokens (index 1:). This inserts the visual context right after BOS, before the language prompt. The LLM will attend to all 257 patch tokens when generating the action tokens.",
+              "concept_tag": "embedding"
+            },
+            {
+              "start_line": 410,
+              "end_line": 420,
+              "explanation": "Labels for the 257 patch positions are set to IGNORE_INDEX (-100), which PyTorch's cross-entropy loss ignores. Only the positions corresponding to predicted action tokens contribute to the training loss. This is the standard LLaVA-style visual instruction tuning loss masking strategy.",
+              "concept_tag": "loss"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "oxe-data",
+      "title": "Training Data: Open X-Embodiment and the RLDS Pipeline",
+      "narrative": "OpenVLA is trained on the Open X-Embodiment (OXE) dataset — a unified collection of 970k+ robot trajectories from 22 institutions, 70+ robot embodiments, and 500+ tasks, all stored in the RLDS (Robot Learning Dataset) format via TensorFlow Datasets.\n\nThe critical design decision is how training examples are constructed from raw trajectory data. Each training example consists of a single timestep: one image + one language instruction → one action vector (7 dimensions: 6 end-effector pose deltas + 1 gripper state).\n\nThe `RLDSBatchTransform` class handles this conversion. For each timestep, it:\n1. Constructs a chat-format prompt: `HUMAN: What action should the robot take to {instruction}? ASSISTANT: {action_tokens}`\n2. Tokenizes the full conversation\n3. **Masks all labels except the action tokens** — the cross-entropy loss is computed only over the 7 action token positions at the end of the sequence\n\nThis masking is the crucial training signal: the model is penalized only for predicting the wrong action tokens, not for repeating the prompt or describing the image. The natural language instruction is pure context, not a prediction target.\n\nThe OXE \"Magic Soup+\" mixture weights 22+ datasets to balance robot embodiments and task types. Datasets from RT-1 (fractal20220817_data) get weight 0.54, Bridge V2 gets 1.0, smaller datasets get higher weights to prevent the large datasets from dominating.",
+      "code_blocks": [
+        {
+          "label": "RLDSBatchTransform.__call__: from raw trajectory to (input_ids, labels, pixel_values)",
+          "source": "class RLDSBatchTransform:\n    action_tokenizer: ActionTokenizer\n    base_tokenizer: PreTrainedTokenizerBase\n    image_transform: ImageTransform\n    prompt_builder_fn: Type[PromptBuilder]\n    predict_stop_token: bool = True\n\n    def __call__(self, rlds_batch: Dict[str, Any]) -> Dict[str, Any]:\n        \"\"\"Converts a RLDS batch to the format expected by the OpenVLA collator/models.\"\"\"\n        dataset_name, action = rlds_batch[\"dataset_name\"], rlds_batch[\"action\"][0]\n        img = Image.fromarray(rlds_batch[\"observation\"][\"image_primary\"][0])\n        lang = rlds_batch[\"task\"][\"language_instruction\"].decode().lower()\n\n        # Construct Chat-based Prompt =>> Input is default query + language instruction, output are the action tokens\n        prompt_builder = self.prompt_builder_fn(\"openvla\")\n        conversation = [\n            {\"from\": \"human\", \"value\": f\"What action should the robot take to {lang}?\"},\n            {\"from\": \"gpt\", \"value\": self.action_tokenizer(action)},\n        ]\n        for turn in conversation:\n            prompt_builder.add_turn(turn[\"from\"], turn[\"value\"])\n\n        # Tokenize (w/ `base_tokenizer`)\n        input_ids = self.base_tokenizer(prompt_builder.get_prompt(), add_special_tokens=True).input_ids\n        labels = list(input_ids)\n\n        # Tensorize =>> Run Image Transform to get `pixel_values` =>> Return\n        #   =>> IMPORTANT :: IF WE'RE USING HF LLM.forward(..., labels=labels), SHIFTING HAPPENS _INSIDE_ MODEL!\n        input_ids, labels = torch.tensor(input_ids), torch.tensor(labels)\n        pixel_values = self.image_transform(img)\n\n        # [CRITICAL] We do not want to take the loss for anything but the predicted action tokens!\n        labels[: -(len(action) + 1)] = IGNORE_INDEX\n        if not self.predict_stop_token:\n            labels[-1] = IGNORE_INDEX\n\n        return dict(pixel_values=pixel_values, input_ids=input_ids, labels=labels, dataset_name=dataset_name)",
+          "source_start_line": 31,
+          "file_path": "prismatic/vla/datasets/datasets.py",
+          "annotations": [
+            {
+              "start_line": 47,
+              "end_line": 52,
+              "explanation": "The conversation is structured as a two-turn chat: human asks what action to take, the 'assistant' (robot) responds with the discretized action tokens as a string. This framing lets OpenVLA inherit the instruction-following format from LLaVA pretraining — the model already knows how to respond to human questions.",
+              "concept_tag": "other:data"
+            },
+            {
+              "start_line": 63,
+              "end_line": 65,
+              "explanation": "The label mask: all tokens EXCEPT the last len(action)+1 positions are set to IGNORE_INDEX=-100. This means only the 7 action tokens (and the EOS token controlled by predict_stop_token) contribute to the training loss. The model never gets gradient signal for predicting the prompt text or image description.",
+              "concept_tag": "loss"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "inference",
+      "title": "Inference: From Image and Instruction to Robot Action",
+      "narrative": "At inference time, OpenVLA runs as a standard causal language model — the image is encoded, the prompt is tokenized, and the LLM generates 7 new tokens autoregressively, one per action dimension.\n\nThe `predict_action` method handles the full pipeline:\n1. **Prompt construction**: The same chat template used at training time: `\"What action should the robot take to {instruction}?\"`\n2. **LLaMA tokenization quirk**: LLaMA-2 tokenizers insert an empty token (ID 29871) after certain punctuation. The code manually checks and injects this token to match the training distribution exactly.\n3. **Image preprocessing**: Dual transforms (DINO + SigLIP normalization) return a dict of tensors.\n4. **Autoregressive generation**: `super().generate()` runs beam/greedy search for exactly `action_dim` tokens. No extra tokens — the model generates exactly the right number for the action space.\n5. **De-tokenization and un-normalization**: Generated token IDs are converted back to bin centers, then un-normalized from [-1, 1] to physical units using per-dataset quantile statistics (q01/q99 percentiles).\n\nThe un-normalization uses a percentile-based approach: the 1st and 99th percentiles of each action dimension in the training data define the effective range, clipped to avoid outliers. This robust normalization prevents a single extreme trajectory from skewing the action scale.",
+      "code_blocks": [
+        {
+          "label": "OpenVLA.predict_action: full inference pipeline from image to continuous action",
+          "source": "    @torch.inference_mode()\n    def predict_action(\n        self, image: Image, instruction: str, unnorm_key: Optional[str] = None, **kwargs: str\n    ) -> np.ndarray:\n        \"\"\"\n        Core function for VLA inference; maps input image and task instruction to continuous action (de-tokenizes).\n\n        @param image: PIL Image as [height, width, 3]\n        @param instruction: Task instruction string\n        @param unnorm_key: Optional dataset name for retrieving un-normalizing statistics; if None, checks that model\n                           was trained only on a single dataset, and retrieves those statistics.\n\n        @return Unnormalized (continuous) action vector --> end-effector deltas.\n        \"\"\"\n        image_transform, tokenizer = self.vision_backbone.image_transform, self.llm_backbone.tokenizer\n\n        # Build VLA Prompt\n        prompt_builder = self.get_prompt_builder()\n        prompt_builder.add_turn(role=\"human\", message=f\"What action should the robot take to {instruction.lower()}?\")\n        prompt_text = prompt_builder.get_prompt()\n\n        # Prepare Inputs\n        input_ids = tokenizer(prompt_text, truncation=True, return_tensors=\"pt\").input_ids.to(self.device)\n        if isinstance(tokenizer, LlamaTokenizerFast):\n            # If the special empty token ('') does not already appear after the colon (':') token in the prompt\n            # (after \"OUT:\" or \"ASSISTANT:\"), insert it to match the inputs seen at training time\n            if not torch.all(input_ids[:, -1] == 29871):\n                input_ids = torch.cat(\n                    (input_ids, torch.unsqueeze(torch.Tensor([29871]).long(), dim=0).to(input_ids.device)), dim=1\n                )\n        else:\n            raise ValueError(f\"Unsupported `tokenizer` type = {type(tokenizer)}\")\n\n        # Preprocess Image\n        pixel_values = image_transform(image)\n        if isinstance(pixel_values, torch.Tensor):\n            pixel_values = pixel_values[None, ...].to(self.device)\n        elif isinstance(pixel_values, dict):\n            pixel_values = {k: v[None, ...].to(self.device) for k, v in pixel_values.items()}\n        else:\n            raise ValueError(f\"Unsupported `pixel_values` type = {type(pixel_values)}\")\n\n        # Invoke super().generate --> taps into `GenerationMixin` which (redirects) to `forward()`\n        autocast_dtype = self.llm_backbone.half_precision_dtype\n        with torch.autocast(\"cuda\", dtype=autocast_dtype, enabled=self.enable_mixed_precision_training):\n            # fmt: off\n            generated_ids = super(PrismaticVLM, self).generate(\n                input_ids=input_ids,                            # Shape: [1, seq]\n                pixel_values=pixel_values,                      # Shape: [1, 3, res, res] or Dict[str, ...]\n                max_new_tokens=self.get_action_dim(unnorm_key),\n                **kwargs\n            )\n            # fmt: on\n\n        # Extract predicted action tokens and translate into (normalized) continuous actions\n        predicted_action_token_ids = generated_ids[0, -self.get_action_dim(unnorm_key) :]\n        normalized_actions = self.action_tokenizer.decode_token_ids_to_actions(predicted_action_token_ids.cpu().numpy())\n\n        # Un-normalize Actions\n        action_norm_stats = self.get_action_stats(unnorm_key)\n        mask = action_norm_stats.get(\"mask\", np.ones_like(action_norm_stats[\"q01\"], dtype=bool))\n        action_high, action_low = np.array(action_norm_stats[\"q99\"]), np.array(action_norm_stats[\"q01\"])\n        actions = np.where(\n            mask,\n            0.5 * (normalized_actions + 1) * (action_high - action_low) + action_low,\n            normalized_actions,\n        )\n\n        return actions",
+          "source_start_line": 35,
+          "file_path": "prismatic/models/vlas/openvla.py",
+          "annotations": [
+            {
+              "start_line": 53,
+              "end_line": 54,
+              "explanation": "The prompt template exactly matches the training template in RLDSBatchTransform: 'What action should the robot take to {instruction}?' Any deviation would shift the token distribution the LLM sees, degrading action prediction quality.",
+              "concept_tag": "other:inference"
+            },
+            {
+              "start_line": 81,
+              "end_line": 87,
+              "explanation": "super(PrismaticVLM, self).generate() — calling GenerationMixin.generate() which internally calls PrismaticVLM.forward() for each step. max_new_tokens=action_dim (7 for 6-DOF + gripper) ensures exactly the right number of action tokens are generated, no more, no less.",
+              "concept_tag": "other:inference"
+            },
+            {
+              "start_line": 90,
+              "end_line": 91,
+              "explanation": "The last action_dim tokens from generated_ids are the action tokens. decode_token_ids_to_actions maps them back to normalized continuous values in [-1, 1] using bin center lookup.",
+              "concept_tag": "other:inference"
+            },
+            {
+              "start_line": 94,
+              "end_line": 101,
+              "explanation": "Un-normalization using per-dataset q01/q99 statistics: normalized_action is in [-1, 1], so 0.5*(a+1) maps it to [0, 1], then scaling by (q99-q01) + q01 maps to the original physical range. The mask allows some action dimensions (like gripper binary state) to bypass scaling.",
+              "concept_tag": "other:inference"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "putting-together",
+      "title": "Putting It All Together: The Complete Forward Path",
+      "narrative": "Following a single inference call end-to-end:\n\n1. **Image → dual features**: A 224×224 RGB frame is preprocessed with two separate normalization pipelines (DINO mean/std and SigLIP mean/std) and fed through two frozen ViT encoders. Each returns 257 patch vectors (256 spatial + 1 CLS). Channel-wise concat → [257, 2176].\n\n2. **Vision → LLM space**: The FusedMLPProjector compresses [257, 2176] → [257, 4096] through a 3-layer MLP (2176 → 8704 → 4096 → 4096).\n\n3. **Sequence assembly**: The text prompt is tokenized and embedded. The BOS embedding is kept; the 257 projected patch embeddings are inserted; the remaining text token embeddings follow. Final sequence: [BOS, patch×257, prompt_tokens].\n\n4. **Autoregressive decode**: The LLM (LLaMA-2 7B) processes the full sequence and generates 7 new tokens. Each token ID corresponds to one action dimension bin.\n\n5. **Action recovery**: Token IDs → bin indices → bin centers → normalize → un-normalize via q01/q99 → 7-dimensional continuous robot action (end-effector δx, δy, δz, δroll, δpitch, δyaw, gripper).\n\nThe elegance of this design: steps 4 and 5 are completely shared with text generation. The LLM doesn't know it's controlling a robot — it's generating the next token of a conversation, and those tokens happen to be robot commands.\n\nOpenVLA achieves 16.5% absolute improvement over RT-2-X on the BridgeV2 benchmark and can be fine-tuned on a new task with 100-500 demonstrations on a single A100 in under a day — an order of magnitude more accessible than the proprietary models it surpasses.",
+      "code_blocks": []
+    }
+  ],
+  "summary": "OpenVLA is a 7B open-source vision-language-action model that frames robot manipulation as next-token prediction over a discrete action vocabulary. Built on Prismatic-7B — which combines DINOv2 and SigLIP visual encoders with a LLaMA-2 7B LLM — OpenVLA discretizes continuous robot actions into 256 bins mapped to the tail of the LLM's vocabulary. A 3-layer FusedMLPProjector bridges the concatenated 2176-dimensional dual-encoder features to the LLM's 4096-dimensional token space. The model is trained in two phases: alignment (projector only, on vision-language pairs) then VLA training (projector + LLM, on 970k+ Open X-Embodiment trajectories). Training uses standard next-token prediction cross-entropy loss, masked to apply only on the 7 predicted action token positions. At inference, the LLM generates exactly 7 tokens autoregressively from the image + instruction context, which are decoded back to continuous robot commands via bin center lookup and per-dataset un-normalization."
+}
