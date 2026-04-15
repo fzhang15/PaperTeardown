@@ -1,0 +1,324 @@
+{
+  "chapters": [
+    {
+      "id": "the-diffusion-tax",
+      "title": "The Diffusion Tax: Why Pixel Space Is Too Expensive",
+      "narrative": "By 2021, diffusion models had proven they could generate stunning images. The catch: every training step ran the denoising network on full-resolution pixel tensors — for a 256×256 RGB image that's 196,608 values — 1,000 times per sample. The compute cost was staggering.\n\nThe paper's central insight is embarrassingly simple: the interesting structure in an image (objects, scenes, textures) lives in a compressed semantic space, not in the exact value of each pixel. High-frequency details like fine grain and noise are perceptually unimportant for generation quality. So why run diffusion in pixel space at all?\n\nLatent Diffusion Models (LDM) separate the problem into two stages:\n\n1. **Perceptual compression**: a pretrained VAE encoder compresses a 512×512×3 image into a 64×64×4 latent — a 48× reduction in spatial resolution. This is a one-time cost per image.\n\n2. **Semantic diffusion**: the 1,000-step denoising process runs entirely in this tiny latent space. The U-Net processes 64×64×4 tensors instead of 512×512×3, cutting memory and FLOPS by roughly 48× per step.\n\nAt inference time the latent is decoded back to pixels by the frozen VAE decoder. The decoder can reconstruct high-quality images because the VAE was trained with a perceptual + adversarial loss that preserves visual fidelity even from compact latents.\n\nThis is why Stable Diffusion can run on a consumer GPU. DiT (also in this gallery) later replaced the U-Net denoiser with a transformer, but kept the same latent diffusion framing — LDM's two-stage design is the foundation of the entire modern generative vision stack.",
+      "code_blocks": []
+    },
+    {
+      "id": "autoencoder-kl",
+      "title": "The Perceptual Compressor: AutoencoderKL",
+      "narrative": "The VAE is the first stage of LDM. It has two jobs: compress images to latents during training, and decode latents back to pixels at inference. Critically, the VAE is trained first and then frozen — its parameters never change during diffusion training.\n\nLDM uses a KL-regularized VAE (`AutoencoderKL`) rather than a VQ-VAE. The encoder outputs a `DiagonalGaussianDistribution` — parameterized by a mean and log-variance tensor — rather than a discrete codebook index. This gives a continuous latent space, which is smoother to diffuse over.\n\nThe `quant_conv` layer maps the encoder's `z_channels` to `2 * embed_dim` channels — one copy for mean, one for log-variance. The sampled latent z is then passed to the diffusion model. At inference, only the VAE decoder is needed to convert the final denoised latent back to pixels.\n\nThe VAE training uses three losses simultaneously: reconstruction loss (L1/L2 per pixel), a KL penalty that keeps the latent distribution close to a standard normal, and a patch-based adversarial loss (PatchGAN discriminator) that prevents blurry reconstructions. The adversarial component is why a discriminator optimizer exists in `training_step`.",
+      "code_blocks": [
+        {
+          "label": "AutoencoderKL: encode, decode, and forward",
+          "source": "    def encode(self, x):\n        h = self.encoder(x)\n        moments = self.quant_conv(h)\n        posterior = DiagonalGaussianDistribution(moments)\n        return posterior\n\n    def decode(self, z):\n        z = self.post_quant_conv(z)\n        dec = self.decoder(z)\n        return dec\n\n    def forward(self, input, sample_posterior=True):\n        posterior = self.encode(input)\n        if sample_posterior:\n            z = posterior.sample()\n        else:\n            z = posterior.mode()\n        dec = self.decode(z)\n        return dec, posterior",
+          "source_start_line": 324,
+          "file_path": "ldm/models/autoencoder.py",
+          "annotations": [
+            {
+              "start_line": 324,
+              "end_line": 328,
+              "explanation": "The encoder produces feature maps which quant_conv maps to 2*embed_dim channels — the first half is the mean μ and the second half is the log-variance log(σ²) of the diagonal Gaussian posterior. DiagonalGaussianDistribution packages both.",
+              "concept_tag": "embedding"
+            },
+            {
+              "start_line": 335,
+              "end_line": 342,
+              "explanation": "During training, z is sampled from the posterior (reparameterization trick) so gradients flow through. At inference with sample_posterior=False, the mode (mean) is used for deterministic encoding, giving cleaner reconstructions.",
+              "concept_tag": "other:vae"
+            }
+          ]
+        },
+        {
+          "label": "VAE training: GAN + reconstruction dual optimizer",
+          "source": "    def training_step(self, batch, batch_idx, optimizer_idx):\n        inputs = self.get_input(batch, self.image_key)\n        reconstructions, posterior = self(inputs)\n\n        if optimizer_idx == 0:\n            # train encoder+decoder+logvar\n            aeloss, log_dict_ae = self.loss(inputs, reconstructions, posterior, optimizer_idx, self.global_step,\n                                            last_layer=self.get_last_layer(), split=\"train\")\n            self.log(\"aeloss\", aeloss, prog_bar=True, logger=True, on_step=True, on_epoch=True)\n            self.log_dict(log_dict_ae, prog_bar=False, logger=True, on_step=True, on_epoch=False)\n            return aeloss\n\n        if optimizer_idx == 1:\n            # train the discriminator\n            discloss, log_dict_disc = self.loss(inputs, reconstructions, posterior, optimizer_idx, self.global_step,\n                                                last_layer=self.get_last_layer(), split=\"train\")\n\n            self.log(\"discloss\", discloss, prog_bar=True, logger=True, on_step=True, on_epoch=True)\n            self.log_dict(log_dict_disc, prog_bar=False, logger=True, on_step=True, on_epoch=False)\n            return discloss",
+          "source_start_line": 351,
+          "file_path": "ldm/models/autoencoder.py",
+          "annotations": [
+            {
+              "start_line": 355,
+              "end_line": 361,
+              "explanation": "optimizer_idx=0 updates the encoder, decoder, and all convolutions. The loss computes reconstruction error + KL penalty + generator adversarial loss (fooling the discriminator). last_layer returns the final decoder conv weight, used for adaptive GAN loss weighting.",
+              "concept_tag": "loss"
+            },
+            {
+              "start_line": 363,
+              "end_line": 370,
+              "explanation": "optimizer_idx=1 updates only the PatchGAN discriminator. The discriminator loss is separate from the reconstruction loss — two optimizers alternate each step. This is standard GAN training to prevent mode collapse in the decoder.",
+              "concept_tag": "loss"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "noise-schedule",
+      "title": "The Forward Process: How DDPM Destroys an Image",
+      "narrative": "The diffusion process is defined mathematically as a Markov chain that gradually adds Gaussian noise to a sample until it becomes pure noise. The key insight of DDPM is that you can jump directly from x₀ to xₜ at any timestep t — you don't need to simulate all t steps sequentially.\n\nThis is the forward process: q(xₜ | x₀) = N(xₜ; √ᾱₜ x₀, (1−ᾱₜ)I). The coefficients √ᾱₜ and √(1−ᾱₜ) control how much of the original signal and how much noise is in xₜ at timestep t. At t=0 it's the original image; at t=T (1000 by default) it's pure Gaussian noise.\n\nThe β (beta) noise schedule determines how quickly the signal degrades. The default is a linear schedule from β₁=0.0001 to βᴛ=0.02, though cosine schedules often work better for latent diffusion. ᾱₜ = ∏ᵢ₌₁ᵗ (1−βᵢ) is the cumulative product of alphas.\n\n`register_schedule` precomputes all these coefficients once and stores them as non-trainable model buffers. They move to GPU with the model but don't accumulate gradients. `q_sample` is the one-line implementation of the entire forward process — just a weighted sum of signal and noise.",
+      "code_blocks": [
+        {
+          "label": "register_schedule: precomputing the beta/alpha tables",
+          "source": "            betas = given_betas\n        else:\n            betas = make_beta_schedule(beta_schedule, timesteps, linear_start=linear_start, linear_end=linear_end,\n                                       cosine_s=cosine_s)\n        alphas = 1. - betas\n        alphas_cumprod = np.cumprod(alphas, axis=0)\n        alphas_cumprod_prev = np.append(1., alphas_cumprod[:-1])\n\n        timesteps, = betas.shape\n        self.num_timesteps = int(timesteps)\n        self.linear_start = linear_start\n        self.linear_end = linear_end\n        assert alphas_cumprod.shape[0] == self.num_timesteps, 'alphas have to be defined for each timestep'\n\n        to_torch = partial(torch.tensor, dtype=torch.float32)\n\n        self.register_buffer('betas', to_torch(betas))\n        self.register_buffer('alphas_cumprod', to_torch(alphas_cumprod))\n        self.register_buffer('alphas_cumprod_prev', to_torch(alphas_cumprod_prev))\n\n        # calculations for diffusion q(x_t | x_{t-1}) and others\n        self.register_buffer('sqrt_alphas_cumprod', to_torch(np.sqrt(alphas_cumprod)))\n        self.register_buffer('sqrt_one_minus_alphas_cumprod', to_torch(np.sqrt(1. - alphas_cumprod)))\n        self.register_buffer('log_one_minus_alphas_cumprod', to_torch(np.log(1. - alphas_cumprod)))\n        self.register_buffer('sqrt_recip_alphas_cumprod', to_torch(np.sqrt(1. / alphas_cumprod)))\n        self.register_buffer('sqrt_recipm1_alphas_cumprod', to_torch(np.sqrt(1. / alphas_cumprod - 1)))",
+          "source_start_line": 120,
+          "file_path": "ldm/models/diffusion/ddpm.py",
+          "annotations": [
+            {
+              "start_line": 120,
+              "end_line": 127,
+              "explanation": "alphas = 1 - betas, then alphas_cumprod = ∏αᵢ (cumulative product). This is ᾱₜ, the key quantity controlling how much signal remains at timestep t. At t=1000, ᾱₜ ≈ 0 so the signal is gone.",
+              "concept_tag": "other:diffusion"
+            },
+            {
+              "start_line": 136,
+              "end_line": 145,
+              "explanation": "register_buffer saves these as non-trainable model state. They move to GPU when .to(device) is called, are saved in checkpoints, but do NOT accumulate gradients. sqrt_alphas_cumprod and sqrt_one_minus_alphas_cumprod are the two coefficients of q_sample.",
+              "concept_tag": "other:diffusion"
+            }
+          ]
+        },
+        {
+          "label": "q_sample: the entire forward diffusion process in one line",
+          "source": "    def q_sample(self, x_start, t, noise=None):\n        noise = default(noise, lambda: torch.randn_like(x_start))\n        return (extract_into_tensor(self.sqrt_alphas_cumprod, t, x_start.shape) * x_start +\n                extract_into_tensor(self.sqrt_one_minus_alphas_cumprod, t, x_start.shape) * noise)",
+          "source_start_line": 274,
+          "file_path": "ldm/models/diffusion/ddpm.py",
+          "annotations": [
+            {
+              "start_line": 274,
+              "end_line": 277,
+              "explanation": "This implements xₜ = √ᾱₜ · x₀ + √(1−ᾱₜ) · ε in one line. extract_into_tensor indexes the precomputed table at timestep t and broadcasts to the spatial shape of x_start. This closed-form jump lets us skip directly from x₀ to any xₜ during training.",
+              "concept_tag": "other:diffusion"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "unet-denoiser",
+      "title": "The Denoising U-Net: Architecture in Latent Space",
+      "narrative": "The denoising network in LDM is a time-conditioned U-Net — the same architecture originally designed for biomedical segmentation (see U-Net in this gallery), extended with two crucial changes: timestep conditioning and text cross-attention.\n\nThe U-Net operates entirely in latent space. For a 512×512 input image, the VAE compresses it to a 64×64×4 latent; the U-Net denoises at this 64×64 resolution, not at 512×512. The encoder halves spatial resolution at each level (64→32→16→8), the decoder mirror-expands it back, and skip connections paste encoder feature maps into each decoder stage.\n\nTimestep conditioning is the key addition. Each residual block (`ResBlock`) takes both image features and a timestep embedding as inputs. The timestep t is first encoded via sinusoidal positional embedding (the same scheme as the original Transformer), then projected through a small MLP to a vector of `time_embed_dim = model_channels * 4` dimensions. Each ResBlock adds (or FiLM-conditions) this vector into the feature map, so every layer knows where it is in the denoising trajectory.\n\nThe LDM U-Net also injects `SpatialTransformer` blocks at specific resolution levels to handle text conditioning — we'll cover those in the next chapter.",
+      "code_blocks": [
+        {
+          "label": "ResBlock._forward: injecting the timestep embedding",
+          "source": "    def _forward(self, x, emb):\n        if self.updown:\n            in_rest, in_conv = self.in_layers[:-1], self.in_layers[-1]\n            h = in_rest(x)\n            h = self.h_upd(h)\n            x = self.x_upd(x)\n            h = in_conv(h)\n        else:\n            h = self.in_layers(x)\n        emb_out = self.emb_layers(emb).type(h.dtype)\n        while len(emb_out.shape) < len(h.shape):\n            emb_out = emb_out[..., None]\n        if self.use_scale_shift_norm:\n            out_norm, out_rest = self.out_layers[0], self.out_layers[1:]\n            scale, shift = th.chunk(emb_out, 2, dim=1)  \n            h = out_norm(h) * (1 + scale) + shift\n            h = out_rest(h)\n        else:\n            h = h + emb_out\n            h = self.out_layers(h)\n        return self.skip_connection(x) + h",
+          "source_start_line": 255,
+          "file_path": "ldm/modules/diffusionmodules/openaimodel.py",
+          "annotations": [
+            {
+              "start_line": 264,
+              "end_line": 266,
+              "explanation": "emb_layers projects the timestep vector from time_embed_dim to the feature map's channel count. The unsqueeze loop broadcasts it from shape (B, C) to (B, C, 1, 1) so it can be added to the spatial feature map.",
+              "concept_tag": "embedding"
+            },
+            {
+              "start_line": 267,
+              "end_line": 271,
+              "explanation": "FiLM (Feature-wise Linear Modulation) conditioning: chunk the embedding into scale and shift, then apply h = norm(h) * (1 + scale) + shift. This is strictly more expressive than additive injection — the embedding can multiply feature activations, not just shift them.",
+              "concept_tag": "normalization"
+            },
+            {
+              "start_line": 272,
+              "end_line": 275,
+              "explanation": "Default path: additive injection (h + emb) then output layers, plus the standard residual skip connection. The skip_connection is either Identity (same channels) or a 1×1 conv if channel count changes.",
+              "concept_tag": "residual"
+            }
+          ]
+        },
+        {
+          "label": "UNetModel.forward: encoder → bottleneck → decoder with skip connections",
+          "source": "    def forward(self, x, timesteps=None, context=None, y=None,**kwargs):\n        \"\"\"\n        Apply the model to an input batch.\n        :param x: an [N x C x ...] Tensor of inputs.\n        :param timesteps: a 1-D batch of timesteps.\n        :param context: conditioning plugged in via crossattn\n        :param y: an [N] Tensor of labels, if class-conditional.\n        :return: an [N x C x ...] Tensor of outputs.\n        \"\"\"\n        assert (y is not None) == (\n            self.num_classes is not None\n        ), \"must specify y if and only if the model is class-conditional\"\n        hs = []\n        t_emb = timestep_embedding(timesteps, self.model_channels, repeat_only=False)\n        emb = self.time_embed(t_emb)\n\n        if self.num_classes is not None:\n            assert y.shape == (x.shape[0],)\n            emb = emb + self.label_emb(y)\n\n        h = x.type(self.dtype)\n        for module in self.input_blocks:\n            h = module(h, emb, context)\n            hs.append(h)\n        h = self.middle_block(h, emb, context)\n        for module in self.output_blocks:\n            h = th.cat([h, hs.pop()], dim=1)\n            h = module(h, emb, context)\n        h = h.type(x.dtype)\n        if self.predict_codebook_ids:\n            return self.id_predictor(h)\n        else:\n            return self.out(h)",
+          "source_start_line": 710,
+          "file_path": "ldm/modules/diffusionmodules/openaimodel.py",
+          "annotations": [
+            {
+              "start_line": 723,
+              "end_line": 724,
+              "explanation": "Sinusoidal timestep embedding (same as Transformer positional encoding) converts the scalar t into a frequency-rich vector, then a 2-layer MLP (time_embed) projects it to time_embed_dim = 4 * model_channels.",
+              "concept_tag": "embedding"
+            },
+            {
+              "start_line": 731,
+              "end_line": 733,
+              "explanation": "The encoder loop saves every intermediate feature map in hs. Each block receives both the timestep embedding (emb) and the text context — the SpatialTransformer inside the block uses context for cross-attention.",
+              "concept_tag": "residual"
+            },
+            {
+              "start_line": 735,
+              "end_line": 737,
+              "explanation": "The decoder pops saved encoder features and concatenates them with the current feature map along the channel axis. This is the U-Net skip connection — the decoder can see fine spatial detail from the corresponding encoder level.",
+              "concept_tag": "residual"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "cross-attention-text",
+      "title": "Cross-Attention: How Text Gets Inside the U-Net",
+      "narrative": "The most architecturally interesting part of LDM is how text conditioning is injected into every level of the U-Net. The mechanism is `SpatialTransformer` — a lightweight transformer block that wraps the U-Net's spatial feature maps and lets them attend to text tokens via cross-attention.\n\nThe idea is elegant: text is encoded into a sequence of 77 dense vectors by a frozen CLIP text encoder. At each resolution level of the U-Net where conditioning is applied, the spatial feature map is flattened into a sequence of spatial tokens (H×W positions), and then standard multi-head cross-attention is run: spatial positions are the queries, text tokens are the keys and values. Each spatial location can decide which word to attend to.\n\nThis cross-attention has a graceful fallback: if no context is passed (`context=None`), it defaults to self-attention where the spatial tokens attend to each other. This is why the same architecture works for both text-conditional and unconditional generation.\n\nThe `BasicTransformerBlock` stacks these in the standard transformer pattern: self-attention, then cross-attention, then feedforward — each with a residual connection. GEGLU activations (a gated variant of GLU) replace standard GeLU in the feedforward, which empirically produces better gradients.",
+      "code_blocks": [
+        {
+          "label": "CrossAttention.forward: spatial→text attention",
+          "source": "    def forward(self, x, context=None, mask=None):\n        h = self.heads\n\n        q = self.to_q(x)\n        context = default(context, x)\n        k = self.to_k(context)\n        v = self.to_v(context)\n\n        q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> (b h) n d', h=h), (q, k, v))\n\n        sim = einsum('b i d, b j d -> b i j', q, k) * self.scale\n\n        if exists(mask):\n            mask = rearrange(mask, 'b ... -> b (...)')\n            max_neg_value = -torch.finfo(sim.dtype).max\n            mask = repeat(mask, 'b j -> (b h) () j', h=h)\n            sim.masked_fill_(~mask, max_neg_value)\n\n        # attention, what we cannot get enough of\n        attn = sim.softmax(dim=-1)\n\n        out = einsum('b i j, b j d -> b i d', attn, v)\n        out = rearrange(out, '(b h) n d -> b n (h d)', h=h)\n        return self.to_out(out)",
+          "source_start_line": 170,
+          "file_path": "ldm/modules/attention.py",
+          "annotations": [
+            {
+              "start_line": 173,
+              "end_line": 176,
+              "explanation": "q comes from the spatial feature map (image tokens), but k and v come from context (text tokens). context defaults to x when None, making this self-attention — the same class handles both cases. For text-to-image, context is the 77×768 CLIP embedding sequence.",
+              "concept_tag": "attention"
+            },
+            {
+              "start_line": 178,
+              "end_line": 180,
+              "explanation": "Multi-head split: rearrange merges batch and head dims so the einsum computes all heads at once. self.scale = dim_head ** -0.5 is the 1/√d normalization to prevent softmax saturation with large dot products.",
+              "concept_tag": "attention"
+            },
+            {
+              "start_line": 189,
+              "end_line": 193,
+              "explanation": "Standard scaled dot-product attention: softmax over key dimension, then weighted sum of values. The output is rearranged to merge head dimensions back, then projected to query_dim via to_out (Linear + Dropout).",
+              "concept_tag": "attention"
+            }
+          ]
+        },
+        {
+          "label": "BasicTransformerBlock: self-attn → cross-attn → FFN",
+          "source": "    def _forward(self, x, context=None):\n        x = self.attn1(self.norm1(x)) + x\n        x = self.attn2(self.norm2(x), context=context) + x\n        x = self.ff(self.norm3(x)) + x\n        return x",
+          "source_start_line": 211,
+          "file_path": "ldm/modules/attention.py",
+          "annotations": [
+            {
+              "start_line": 212,
+              "end_line": 212,
+              "explanation": "attn1 is initialized with context_dim=None, making it pure self-attention: spatial tokens attend to each other. This lets the denoiser reason about spatial relationships before looking at the text.",
+              "concept_tag": "attention"
+            },
+            {
+              "start_line": 213,
+              "end_line": 213,
+              "explanation": "attn2 receives the text context. Spatial tokens (queries) attend to the 77 CLIP text tokens (keys, values). Each position in the feature map can pull information from whichever word is most relevant.",
+              "concept_tag": "attention"
+            }
+          ]
+        },
+        {
+          "label": "SpatialTransformer: wrapping the 2D feature map for attention",
+          "source": "    def forward(self, x, context=None):\n        # note: if no context is given, cross-attention defaults to self-attention\n        b, c, h, w = x.shape\n        x_in = x\n        x = self.norm(x)\n        x = self.proj_in(x)\n        x = rearrange(x, 'b c h w -> b (h w) c')\n        for block in self.transformer_blocks:\n            x = block(x, context=context)\n        x = rearrange(x, 'b (h w) c -> b c h w', h=h, w=w)\n        x = self.proj_out(x)\n        return x + x_in",
+          "source_start_line": 250,
+          "file_path": "ldm/modules/attention.py",
+          "annotations": [
+            {
+              "start_line": 256,
+              "end_line": 256,
+              "explanation": "The 2D feature map (B, C, H, W) is flattened to (B, H*W, C) — each spatial position becomes one token. At the 8×8 bottleneck this is 64 tokens; at 32×32 it's 1024 tokens.",
+              "concept_tag": "attention"
+            },
+            {
+              "start_line": 257,
+              "end_line": 258,
+              "explanation": "Each BasicTransformerBlock runs self-attention + cross-attention on the flattened spatial tokens. context holds the CLIP text embeddings and is passed through unchanged to each block.",
+              "concept_tag": "attention"
+            },
+            {
+              "start_line": 259,
+              "end_line": 261,
+              "explanation": "Reshape back to 2D spatial layout, then proj_out (a zero-initialized conv) + residual connection. Zero initialization means the SpatialTransformer starts as an identity — early training is stable because the skip connection dominates.",
+              "concept_tag": "residual"
+            }
+          ]
+        },
+        {
+          "label": "FrozenCLIPEmbedder: text → 77 token embeddings",
+          "source": "    def forward(self, text):\n        batch_encoding = self.tokenizer(text, truncation=True, max_length=self.max_length, return_length=True,\n                                        return_overflowing_tokens=False, padding=\"max_length\", return_tensors=\"pt\")\n        tokens = batch_encoding[\"input_ids\"].to(self.device)\n        outputs = self.transformer(input_ids=tokens)\n\n        z = outputs.last_hidden_state\n        return z\n\n    def encode(self, text):\n        return self(text)",
+          "source_start_line": 152,
+          "file_path": "ldm/modules/encoders/modules.py",
+          "annotations": [
+            {
+              "start_line": 152,
+              "end_line": 159,
+              "explanation": "Text is tokenized to exactly 77 tokens (padded or truncated), then encoded by the frozen CLIP text transformer. outputs.last_hidden_state is the full token sequence — shape (B, 77, 768) — not the pooled CLS embedding. This sequence is passed to CrossAttention as the context (keys and values).",
+              "concept_tag": "embedding"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "latent-diffusion-conductor",
+      "title": "The LatentDiffusion Conductor: Wiring It Together",
+      "narrative": "The `LatentDiffusion` class (`ddpm.py`) is the top-level model that orchestrates all three components: the frozen VAE (first_stage_model), the frozen text encoder (cond_stage_model), and the trainable U-Net denoiser (model). Only the U-Net is updated during training.\n\nThe design is explicit about what's frozen: `instantiate_first_stage` sets the VAE to eval mode and overrides its `train` method with a no-op, making it impossible to accidentally put it back in training mode. This is a common pattern when mixing frozen pretrained models with trainable components.\n\n`get_input` runs at the start of every training step: it encodes the input image to a latent z via the frozen VAE and encodes the text to a conditioning vector c via the frozen CLIP encoder. Both operations run under `@torch.no_grad()` — no gradients flow through the frozen encoders.\n\nThe `scale_factor` is a latent normalization constant (typically ~0.18) that rescales the VAE's latent to approximately unit variance. Diffusion training is sensitive to the scale of its inputs; without this normalization the noise schedule calibration would be off.",
+      "code_blocks": [
+        {
+          "label": "instantiate_first_stage: freezing the VAE",
+          "source": "    def instantiate_first_stage(self, config):\n        model = instantiate_from_config(config)\n        self.first_stage_model = model.eval()\n        self.first_stage_model.train = disabled_train\n        for param in self.first_stage_model.parameters():\n            param.requires_grad = False",
+          "source_start_line": 502,
+          "file_path": "ldm/models/diffusion/ddpm.py",
+          "annotations": [
+            {
+              "start_line": 504,
+              "end_line": 507,
+              "explanation": "Three-layer freeze: .eval() disables dropout/BatchNorm; overriding .train with disabled_train prevents any code from accidentally re-enabling training mode; requires_grad=False stops gradient computation and saves memory. All three are needed for a robust freeze.",
+              "concept_tag": "other:training"
+            }
+          ]
+        },
+        {
+          "label": "get_input: encoding image + text at each training step",
+          "source": "    @torch.no_grad()\n    def get_input(self, batch, k, return_first_stage_outputs=False, force_c_encode=False,\n                  cond_key=None, return_original_cond=False, bs=None):\n        x = super().get_input(batch, k)\n        if bs is not None:\n            x = x[:bs]\n        x = x.to(self.device)\n        encoder_posterior = self.encode_first_stage(x)\n        z = self.get_first_stage_encoding(encoder_posterior).detach()\n\n        if self.model.conditioning_key is not None:\n            if cond_key is None:\n                cond_key = self.cond_stage_key\n            if cond_key != self.first_stage_key:\n                if cond_key in ['caption', 'coordinates_bbox']:\n                    xc = batch[cond_key]\n                elif cond_key == 'class_label':\n                    xc = batch\n                else:\n                    xc = super().get_input(batch, cond_key).to(self.device)\n            else:\n                xc = x\n            if not self.cond_stage_trainable or force_c_encode:\n                if isinstance(xc, dict) or isinstance(xc, list):\n                    # import pudb; pudb.set_trace()\n                    c = self.get_learned_conditioning(xc)\n                else:\n                    c = self.get_learned_conditioning(xc.to(self.device))",
+          "source_start_line": 653,
+          "file_path": "ldm/models/diffusion/ddpm.py",
+          "annotations": [
+            {
+              "start_line": 660,
+              "end_line": 661,
+              "explanation": "encode_first_stage runs the frozen VAE encoder; get_first_stage_encoding samples from the posterior and multiplies by scale_factor (~0.18). .detach() ensures no gradients flow back through this path.",
+              "concept_tag": "embedding"
+            },
+            {
+              "start_line": 674,
+              "end_line": 680,
+              "explanation": "For text conditioning, xc is the caption string; get_learned_conditioning calls the frozen CLIP encoder to produce the 77-token context vector c. This same code path handles class labels, other images, or any other condition type.",
+              "concept_tag": "embedding"
+            }
+          ]
+        },
+        {
+          "label": "LatentDiffusion.p_losses: the training objective",
+          "source": "    def p_losses(self, x_start, cond, t, noise=None):\n        noise = default(noise, lambda: torch.randn_like(x_start))\n        x_noisy = self.q_sample(x_start=x_start, t=t, noise=noise)\n        model_output = self.apply_model(x_noisy, t, cond)\n\n        loss_dict = {}\n        prefix = 'train' if self.training else 'val'\n\n        if self.parameterization == \"x0\":\n            target = x_start\n        elif self.parameterization == \"eps\":\n            target = noise\n        else:\n            raise NotImplementedError()\n\n        loss_simple = self.get_loss(model_output, target, mean=False).mean([1, 2, 3])\n        loss_dict.update({f'{prefix}/loss_simple': loss_simple.mean()})\n\n        logvar_t = self.logvar[t].to(self.device)\n        loss = loss_simple / torch.exp(logvar_t) + logvar_t\n        # loss = loss_simple / torch.exp(self.logvar) + self.logvar\n        if self.learn_logvar:\n            loss_dict.update({f'{prefix}/loss_gamma': loss.mean()})\n            loss_dict.update({'logvar': self.logvar.data.mean()})\n\n        loss = self.l_simple_weight * loss.mean()\n\n        loss_vlb = self.get_loss(model_output, target, mean=False).mean(dim=(1, 2, 3))\n        loss_vlb = (self.lvlb_weights[t] * loss_vlb).mean()\n        loss_dict.update({f'{prefix}/loss_vlb': loss_vlb})\n        loss += (self.original_elbo_weight * loss_vlb)\n        loss_dict.update({f'{prefix}/loss': loss})\n\n        return loss, loss_dict",
+          "source_start_line": 1012,
+          "file_path": "ldm/models/diffusion/ddpm.py",
+          "annotations": [
+            {
+              "start_line": 1012,
+              "end_line": 1015,
+              "explanation": "The core training step: sample noise ε, add it to the latent z at timestep t via q_sample, then ask the U-Net to predict it back. apply_model routes x_noisy + t + conditioning through the U-Net and returns the predicted noise.",
+              "concept_tag": "other:diffusion"
+            },
+            {
+              "start_line": 1020,
+              "end_line": 1025,
+              "explanation": "Epsilon parameterization: the U-Net predicts the noise ε that was added, not the original x₀. This is the standard DDPM training target. The simpler 'eps' mode consistently outperforms 'x0' prediction in practice.",
+              "concept_tag": "loss"
+            },
+            {
+              "start_line": 1030,
+              "end_line": 1031,
+              "explanation": "Learned logvar weighting: loss = L_simple / exp(logvar_t) + logvar_t. This is a per-timestep uncertainty term — the model can learn that some timesteps have inherently higher loss variance and down-weight them. logvar is a 1000-element learnable vector.",
+              "concept_tag": "loss"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "putting-it-together",
+      "title": "Putting It All Together: From Noise to Image",
+      "narrative": "At inference, LDM works backwards through everything we've described:\n\n1. **Text encoding**: the prompt is tokenized and passed through the frozen CLIP encoder to produce a 77×768 conditioning sequence c.\n\n2. **Initialize noise**: sample a random Gaussian latent z_T ~ N(0, I) at 64×64×4 resolution.\n\n3. **Reverse diffusion** (1000 steps, or fewer with DDIM): at each step t from T down to 1, run the U-Net with inputs (z_t, t, c). The U-Net predicts the noise ε_θ, which is used to compute z_{t-1} via the reverse process equation. The SpatialTransformers inside the U-Net attend to c at every level.\n\n4. **Decode**: pass the final clean latent z_0 through the frozen VAE decoder to get the 512×512×3 pixel image. Multiply by 1/scale_factor before decoding to undo the normalization applied at encode time.\n\nFor classifier-free guidance (the standard at inference): the U-Net is called twice per step — once conditioned on c and once unconditioned (empty string) — and the outputs are interpolated: ε_guided = ε_uncond + guidance_scale * (ε_cond − ε_uncond). Higher guidance_scale (typically 7.5) makes the output more faithful to the prompt at the cost of diversity.\n\nThe entire generation happens in latent space. Only the final decode step touches pixels. This is the architectural insight that made high-resolution text-to-image generation practical on consumer hardware, and that every subsequent text-to-image model (SDXL, FLUX, Stable Diffusion 3) has preserved.",
+      "code_blocks": []
+    }
+  ],
+  "summary": "Latent Diffusion Models (LDM) — the architecture behind Stable Diffusion — solve the compute problem of pixel-space diffusion by separating image generation into two stages: a pretrained VAE that compresses images 8× into a compact latent space, and a U-Net denoiser that runs the expensive 1000-step diffusion entirely in that compressed space. Text conditioning is injected via SpatialTransformer blocks at each U-Net resolution level, where spatial feature tokens attend to CLIP text embeddings via cross-attention. Only the U-Net is trained; the VAE and CLIP encoder are frozen. This ~48× compute reduction compared to pixel-space diffusion is what made high-resolution text-to-image generation practical."
+}

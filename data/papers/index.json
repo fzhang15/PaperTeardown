@@ -150,6 +150,16 @@
     "ingested_at": "2026-03-30T00:00:00Z"
   },
   {
+    "id": "stable-diffusion",
+    "title": "High-Resolution Image Synthesis with Latent Diffusion Models",
+    "authors": ["Robin Rombach", "Andreas Blattmann", "Dominik Lorenz", "Patrick Esser", "Björn Ommer"],
+    "arxiv_url": "https://arxiv.org/abs/2112.10752",
+    "repo_url": "https://github.com/CompVis/latent-diffusion",
+    "abstract": "By decomposing the image formation process into a sequential application of denoising autoencoders, diffusion models achieve state-of-the-art synthesis results on image data. We apply them in the latent space of powerful pretrained autoencoders, enabling DM training on limited computational resources while retaining quality and flexibility. Cross-attention layers turn diffusion models into powerful generators for general conditioning inputs such as text or bounding boxes.",
+    "chapter_count": 7,
+    "ingested_at": "2026-04-15T00:00:00Z"
+  },
+  {
     "id": "MAE",
     "title": "Masked Autoencoders Are Scalable Vision Learners",
     "authors": ["Kaiming He", "Xinlei Chen", "Saining Xie", "Yanghao Li", "Piotr Dollár", "Ross Girshick"],

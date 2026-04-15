@@ -23,6 +23,7 @@ const DISPLAY_NAMES: Record<string, string> = {
   '3d-vla': '3D-VLA',
   sonic: 'SONIC',
   MAE: 'MAE',
+  'stable-diffusion': 'Stable Diff.',
 }
 
 const PAPER_YEAR: Record<string, number> = {
@@ -31,6 +32,7 @@ const PAPER_YEAR: Record<string, number> = {
   CLIP: 2021,
   MAE: 2021,
   dit: 2022,
+  'stable-diffusion': 2022,
   rt1: 2022,
   act: 2023,
   'diffusion-policy': 2023,
@@ -88,6 +90,7 @@ const PAPER_POSITIONS: Record<string, CellPos> = {
   CLIP:               { lane: 0, col: 2, sub: 0 },
   MAE:                { lane: 0, col: 2, sub: 1 },
   dit:                { lane: 0, col: 3, sub: 0 },
+  'stable-diffusion': { lane: 0, col: 3, sub: 1 },
   dinov3:             { lane: 0, col: 6, sub: 0 },
   sam3:               { lane: 0, col: 6, sub: 1 },
   rt1:                { lane: 1, col: 3, sub: 0 },
@@ -113,7 +116,11 @@ const EDGES: Edge[] = [
   { from: 'rt1',   to: 'rt2' },
   { from: 'pi0',   to: 'groot' },
   { from: 'groot',  to: 'sonic' },
+  // Solid — direct lineage (always visible)
+  { from: 'unet', to: 'stable-diffusion' },
   // Dashed — borrows architecture (visible on hover only)
+  { from: 'CLIP', to: 'stable-diffusion', dashed: true },
+  { from: 'stable-diffusion', to: 'dit',  dashed: true },
   { from: 'ViT',  to: 'CLIP',             dashed: true },
   { from: 'ViT',  to: 'sam3',             dashed: true },
   { from: 'ViT',  to: 'rt1',              dashed: true },
