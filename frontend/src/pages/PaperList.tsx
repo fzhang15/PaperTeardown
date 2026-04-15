@@ -134,7 +134,7 @@ const EDGES: Edge[] = [
   { from: 'rt2',  to: 'pi0',              dashed: true },
   { from: 'rt2',  to: '3d-vla',           dashed: true },
   { from: 'diffusion-policy', to: 'pi0',  dashed: true },
-  { from: 'act',  to: 'mobile-aloha',     dashed: true },
+  { from: 'act',  to: 'mobile-aloha' },
 ]
 
 // Pre-compute which papers are connected by ANY edge to each paper
